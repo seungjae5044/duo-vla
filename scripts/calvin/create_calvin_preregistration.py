@@ -109,11 +109,13 @@ _require_imported_local_module(
 )
 
 from evaluate_calvin import (
-    _CELL_FIELDS,
+    _CELL_CREATOR_FIELDS,
     _POLICY_CREATOR_FIELDS,
+    DEFAULT_POLICY_WARMUP_CALLS,
     EVALUATION_SEED,
     FINAL_CHECKPOINT_UPDATE,
     INFERENCE_SEED_DOMAIN,
+    MIN_POLICY_WARMUP_CALLS,
     NUM_SEQUENCES,
     OFFICIAL_DIRECT_NFE,
     OFFICIAL_FLOW_NFES,
@@ -124,12 +126,15 @@ from evaluate_calvin import (
     SUBTASKS_PER_SEQUENCE,
     SUPPORTED_EXECUTION_HORIZONS,
     _read_strict_json,
+    capture_official_output_roots,
     canonical_json_bytes,
     canonical_sha256,
+    derive_output_claim,
     publish_bytes_and_sha256_exclusive,
     regenerate_official_sequences,
     selected_policy_contract,
     validate_preregistration_manifest,
+    validate_official_output_roots,
 )
 
 import preflight as _preflight
@@ -230,11 +235,17 @@ def build_manifest(
     aggregator_sha256: str,
     attestation_sha256: str,
     final_freeze_token: str,
+    official_output_roots: Mapping[str, Any],
     sequences: List[Any],
+    policy_warmup_calls: int = DEFAULT_POLICY_WARMUP_CALLS,
 ) -> Dict[str, Any]:
     """Derive serving-policy identities and validate the complete manifest."""
 
     require(bool(final_freeze_token.strip()), "final freeze token must be non-empty")
+    require(
+        type(policy_warmup_calls) is int and policy_warmup_calls >= MIN_POLICY_WARMUP_CALLS,
+        f"policy warm-up calls must be at least {MIN_POLICY_WARMUP_CALLS}",
+    )
     require(
         isinstance(aggregator_sha256, str)
         and len(aggregator_sha256) == 64
@@ -247,13 +258,15 @@ def build_manifest(
         and all(character in "0123456789abcdef" for character in attestation_sha256),
         "runtime/data attestation SHA-256 is invalid",
     )
+    roots = validate_official_output_roots(official_output_roots)
+    freeze_token_sha256 = hashlib.sha256(final_freeze_token.encode("utf-8")).hexdigest()
     _require_exact_keys(cells_document, {"cells"}, "CALVIN cell document")
     input_cells = cells_document["cells"]
     require(isinstance(input_cells, list), 'cell document "cells" must be a list')
     cells = []  # type: List[Dict[str, Any]]
     for index, candidate in enumerate(input_cells):
         require(isinstance(candidate, dict), f"input cell {index} must be an object")
-        _require_exact_keys(candidate, _CELL_FIELDS, f"input cell {index}")
+        _require_exact_keys(candidate, _CELL_CREATOR_FIELDS, f"input cell {index}")
         policy = candidate["policy"]
         require(isinstance(policy, dict), f"input cell {index} policy must be an object")
         _require_exact_keys(policy, _POLICY_CREATOR_FIELDS, f"input cell {index} policy")
@@ -261,6 +274,7 @@ def build_manifest(
         cells.append(
             {
                 **candidate,
+                "output_claim": derive_output_claim(candidate["cell_id"], roots, freeze_token_sha256),
                 "policy": {
                     **policy,
                     "identity_sha256": canonical_sha256(contract),
@@ -277,9 +291,11 @@ def build_manifest(
         "evaluation_seed": EVALUATION_SEED,
         "execution_horizons": list(SUPPORTED_EXECUTION_HORIZONS),
         "final_checkpoint_update": FINAL_CHECKPOINT_UPDATE,
-        "final_freeze_token_sha256": hashlib.sha256(final_freeze_token.encode("utf-8")).hexdigest(),
+        "final_freeze_token_sha256": freeze_token_sha256,
         "flow_nfes": list(OFFICIAL_FLOW_NFES),
         "inference_seed_domain": INFERENCE_SEED_DOMAIN,
+        "policy_warmup_calls": policy_warmup_calls,
+        "official_output_roots": roots,
         "runtime_attestation_sha256": attestation_sha256,
         "schema": PREREGISTRATION_SCHEMA,
         "sequence_count": NUM_SEQUENCES,
@@ -312,6 +328,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runtime-attestation", type=Path, required=True, help="full CALVIN preflight JSON report")
     parser.add_argument("--evaluation-seed", type=int, default=EVALUATION_SEED)
     parser.add_argument("--final-freeze-token", required=True)
+    parser.add_argument(
+        "--official-output-root",
+        type=Path,
+        required=True,
+        help="dedicated existing empty canonical directory that will contain the 24 run directories",
+    )
+    parser.add_argument(
+        "--official-claim-root",
+        type=Path,
+        required=True,
+        help="dedicated existing empty canonical directory that will contain immutable attempt claims",
+    )
+    parser.add_argument(
+        "--policy-warmup-calls",
+        type=int,
+        default=DEFAULT_POLICY_WARMUP_CALLS,
+        help=f"discarded synthetic policy calls before scoring (minimum {MIN_POLICY_WARMUP_CALLS})",
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -333,12 +367,19 @@ def main() -> None:
     attestation = load_preflight_attestation(args.runtime_attestation.resolve())
     generated = regenerate_official_sequences(EVALUATION_SEED)
     sequences = json.loads(canonical_json_bytes(generated).decode("ascii"))
+    roots = capture_official_output_roots(
+        args.official_output_root.absolute(),
+        args.official_claim_root.absolute(),
+        require_empty=True,
+    )
     manifest = build_manifest(
         cells_document,
         aggregator_sha256=aggregator_sha256,
         attestation_sha256=attestation["attestation_sha256"],
         final_freeze_token=args.final_freeze_token,
+        official_output_roots=roots,
         sequences=sequences,
+        policy_warmup_calls=args.policy_warmup_calls,
     )
     output = args.output.resolve()
 
@@ -349,6 +390,15 @@ def main() -> None:
             "aggregate_calvin_official.py changed while creating the pre-registration",
         )
         _require_live_evaluator_sources(attestation)
+        require(
+            capture_official_output_roots(
+                Path(roots["runs"]["path"]),
+                Path(roots["claims"]["path"]),
+                require_empty=True,
+            )
+            == roots,
+            "official output root identity changed while creating the pre-registration",
+        )
 
     commit_guard()
     digest = _write_exclusive_json(output, manifest, commit_guard=commit_guard)

@@ -98,6 +98,7 @@ _require_imported_local_module(
 )
 
 from evaluate_calvin import (
+    COMPLETION_SCHEMA,
     EPISODE_SCHEMA,
     EVALUATION_SEED,
     MAX_ACTIONS_PER_SUBTASK,
@@ -120,7 +121,10 @@ from evaluate_calvin import (
     publish_bytes_and_sha256_exclusive,
     summarize_sequences,
     validate_policy_health,
+    validate_policy_warmup,
     validate_preregistration_manifest,
+    validate_claim_record,
+    validate_official_output_roots,
 )
 
 import preflight as _preflight
@@ -133,13 +137,14 @@ _require_imported_local_module(
 
 from preflight import ATTESTATION_SCHEMA, PYTHON_VERSION, validate_official_dataset_identity
 
-RUN_INVENTORY_SCHEMA = "duovla-calvin-official-run-inventory-v2"
-MATRIX_SUMMARY_SCHEMA = "duovla-calvin-official-matrix-summary-v3"
+RUN_INVENTORY_SCHEMA = "duovla-calvin-official-run-inventory-v3"
+MATRIX_SUMMARY_SCHEMA = "duovla-calvin-official-matrix-summary-v5"
 _INVENTORY_FIELDS = {"preregistration_sha256", "runs", "schema"}
 _INVENTORY_RUN_FIELDS = {
     "cell_id",
+    "claim_json_sha256",
+    "completion_json_sha256",
     "episodes_jsonl_sha256",
-    "output_dir",
     "run_json_sha256",
     "summary_json_sha256",
 }
@@ -148,6 +153,7 @@ _COMPLETE_RUN_FIELDS = {
     "attestation",
     "attestation_sha256",
     "cell",
+    "claim_json_sha256",
     "created_utc",
     "environment",
     "episodes_jsonl_sha256",
@@ -156,9 +162,11 @@ _COMPLETE_RUN_FIELDS = {
     "final_freeze_token_sha256",
     "finished_utc",
     "mode",
+    "output_claim",
     "oracle",
     "policy_health",
     "policy_socket",
+    "policy_warmup",
     "preregistration_manifest",
     "preregistration_sha256",
     "protocol",
@@ -255,12 +263,53 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON constant {value}")
 
 
+def _read_single_link_regular_bytes(path: Path, *, name: str) -> bytes:
+    """Read stable bytes without following symlinks and reject hard links."""
+
+    require(hasattr(os, "O_NOFOLLOW"), "official aggregation requires O_NOFOLLOW")
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        descriptor = os.open(str(path), flags)
+    except OSError as exc:
+        raise RuntimeError(f"cannot open {name}: {path}") from exc
+    chunks = []  # type: List[bytes]
+    try:
+        before = os.fstat(descriptor)
+        require(stat.S_ISREG(before.st_mode), f"{name} is not a regular file")
+        require(before.st_nlink == 1, f"{name} must have exactly one hard link")
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = -1
+            while True:
+                block = source.read(1024 * 1024)
+                if not block:
+                    break
+                chunks.append(block)
+            after = os.fstat(source.fileno())
+        stable_fields = ("st_dev", "st_ino", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+        require(
+            all(getattr(before, field) == getattr(after, field) for field in stable_fields),
+            f"{name} changed while being read",
+        )
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    raw = b"".join(chunks)
+    require(len(raw) == after.st_size, f"{name} size changed while being read")
+    return raw
+
+
+def _validate_sha256_sidecar(path: Path, digest: str, *, name: str) -> None:
+    _require_sha256(digest, f"{name} SHA-256")
+    companion = path.with_suffix(path.suffix + ".sha256")
+    raw = _read_single_link_regular_bytes(companion, name=f"{name} SHA-256 companion")
+    require(raw == f"{digest}  {path.name}\n".encode("ascii"), f"{name} SHA-256 companion mismatch")
+
+
 def _read_json_object(path: Path, *, name: str, expected_sha256: str) -> Tuple[Dict[str, Any], str]:
     _require_sha256(expected_sha256, f"expected {name} SHA-256")
-    try:
-        raw = path.read_bytes()
-    except OSError as exc:
-        raise RuntimeError(f"cannot read {name}: {path}") from exc
+    raw = _read_single_link_regular_bytes(path, name=name)
     digest = hashlib.sha256(raw).hexdigest()
     require(hmac.compare_digest(digest, expected_sha256), f"{name} differs from its externally supplied SHA-256")
     try:
@@ -423,16 +472,20 @@ def validate_sequence_records(
                 calls=calls,
                 name="server",
             )
+            require(
+                all(
+                    float(subtask["policy_latency_seconds"][index]) >= float(subtask["server_latency_seconds"][index])
+                    for index in range(calls)
+                ),
+                "server latency exceeds its enclosing client latency",
+            )
         checked.append(dict(record))
     return checked
 
 
 def _load_jsonl(path: Path, *, expected_sha256: str) -> List[Dict[str, Any]]:
     _require_sha256(expected_sha256, "expected episodes JSONL SHA-256")
-    try:
-        raw = path.read_bytes()
-    except OSError as exc:
-        raise RuntimeError(f"cannot read episodes JSONL: {path}") from exc
+    raw = _read_single_link_regular_bytes(path, name="episodes JSONL")
     require(hmac.compare_digest(hashlib.sha256(raw).hexdigest(), expected_sha256), "episodes JSONL SHA-256 mismatch")
     require(raw.endswith(b"\n"), "episodes JSONL must end with a newline")
     records = []  # type: List[Dict[str, Any]]
@@ -481,10 +534,59 @@ def _validate_attestation(
     return dict(attestation)
 
 
+def _require_exact_output_inventories(
+    preregistration: Mapping[str, Any],
+    registered_cells: Sequence[Mapping[str, Any]],
+) -> None:
+    """Reject missing, extra, linked, or alternate paths under both frozen roots."""
+
+    roots = validate_official_output_roots(preregistration["official_output_roots"], require_live=True)
+    cell_ids = {cell["cell_id"] for cell in registered_cells}
+    runs_root = Path(roots["runs"]["path"])
+    claims_root = Path(roots["claims"]["path"])
+    try:
+        run_entries = list(os.scandir(str(runs_root)))
+        claim_entries = list(os.scandir(str(claims_root)))
+    except OSError as exc:
+        raise RuntimeError("cannot enumerate official output roots") from exc
+    require({entry.name for entry in run_entries} == cell_ids, "official run root inventory is not exact")
+    for entry in run_entries:
+        require(entry.is_dir(follow_symlinks=False), f"official run root entry is not a real directory: {entry.name}")
+        expected = Path(
+            next(cell["output_claim"]["output_dir"] for cell in registered_cells if cell["cell_id"] == entry.name)
+        )
+        require(Path(entry.path) == expected, f"official run directory is not the pre-registered path: {entry.name}")
+    expected_claim_names = {name for cell_id in cell_ids for name in (f"{cell_id}.json", f"{cell_id}.json.sha256")}
+    require(
+        {entry.name for entry in claim_entries} == expected_claim_names,
+        "official claim root inventory is not exact",
+    )
+    for entry in claim_entries:
+        require(entry.is_file(follow_symlinks=False), f"official claim root entry is not a regular file: {entry.name}")
+        opened = os.stat(entry.path, follow_symlinks=False)
+        require(opened.st_nlink == 1, f"official claim root entry is hard-linked: {entry.name}")
+    validate_official_output_roots(roots, require_live=True)
+
+
+def _require_exact_run_directory(output_dir: Path) -> None:
+    require(output_dir.is_absolute() and output_dir.resolve(strict=True) == output_dir, "official run path is not real")
+    observed = os.lstat(str(output_dir))
+    require(stat.S_ISDIR(observed.st_mode), "official run path is not a directory")
+    try:
+        entries = list(os.scandir(str(output_dir)))
+    except OSError as exc:
+        raise RuntimeError(f"cannot enumerate official run directory: {output_dir}") from exc
+    expected = {"completion.json", "completion.json.sha256", "episodes.jsonl", "run.json", "summary.json"}
+    require({entry.name for entry in entries} == expected, "official run directory inventory is not exact")
+    for entry in entries:
+        require(entry.is_file(follow_symlinks=False), f"official run artifact is not a regular file: {entry.name}")
+        opened = os.stat(entry.path, follow_symlinks=False)
+        require(opened.st_nlink == 1, f"official run artifact is hard-linked: {entry.name}")
+
+
 def validate_run_artifact(
     entry: Mapping[str, Any],
     *,
-    inventory_dir: Path,
     preregistration: Mapping[str, Any],
     preregistration_sha256: str,
     registered_cell: Mapping[str, Any],
@@ -493,15 +595,33 @@ def validate_run_artifact(
     """Authenticate one complete run and recompute its official summary."""
 
     _require_exact_keys(entry, _INVENTORY_RUN_FIELDS, "run inventory entry")
-    for name in ("run_json_sha256", "episodes_jsonl_sha256", "summary_json_sha256"):
+    for name in (
+        "claim_json_sha256",
+        "completion_json_sha256",
+        "run_json_sha256",
+        "episodes_jsonl_sha256",
+        "summary_json_sha256",
+    ):
         _require_sha256(entry[name], f"inventory {name}")
     require(entry["cell_id"] == registered_cell["cell_id"], "run inventory cell ID mismatch")
-    require(isinstance(entry["output_dir"], str) and bool(entry["output_dir"]), "run output_dir is invalid")
-    output_dir = Path(entry["output_dir"])
-    if not output_dir.is_absolute():
-        output_dir = inventory_dir / output_dir
-    output_dir = output_dir.resolve()
+    output_claim = registered_cell["output_claim"]
+    output_dir = Path(output_claim["output_dir"])
     require(output_dir.is_dir(), f"official run directory is missing: {output_dir}")
+    _require_exact_run_directory(output_dir)
+    claim_path = Path(output_claim["claim_path"])
+    claim, claim_sha256 = _read_json_object(
+        claim_path,
+        name="official claim JSON",
+        expected_sha256=entry["claim_json_sha256"],
+    )
+    _validate_sha256_sidecar(claim_path, claim_sha256, name="official claim JSON")
+    validate_claim_record(
+        claim,
+        output_claim=output_claim,
+        cell_id=registered_cell["cell_id"],
+        preregistration_sha256=preregistration_sha256,
+        final_freeze_token_sha256=preregistration["final_freeze_token_sha256"],
+    )
     run, run_sha256 = _read_json_object(
         output_dir / "run.json",
         name="official run.json",
@@ -525,6 +645,11 @@ def validate_run_artifact(
         "official run record count mismatch",
     )
     require(run["sequence_sha256"] == SEQUENCE_SHA256, "official run sequence digest mismatch")
+    require(run["claim_json_sha256"] == claim_sha256, "run/claim digest binding mismatch")
+    require(
+        canonical_json_bytes(run["output_claim"]) == canonical_json_bytes(output_claim),
+        "run output claim differs from pre-registration",
+    )
     require(run["preregistration_sha256"] == preregistration_sha256, "run pre-registration digest mismatch")
     require(
         run["final_freeze_token_sha256"] == preregistration["final_freeze_token_sha256"],
@@ -540,6 +665,7 @@ def validate_run_artifact(
         "run execution horizon differs from its cell",
     )
     require(isinstance(run["created_utc"], str) and bool(run["created_utc"]), "run creation timestamp is invalid")
+    require(claim["created_utc"] == run["created_utc"], "claim/run creation timestamps differ")
     require(isinstance(run["finished_utc"], str) and bool(run["finished_utc"]), "run finish timestamp is invalid")
     require(isinstance(run["policy_socket"], str) and bool(run["policy_socket"]), "run policy socket is invalid")
     require(
@@ -588,11 +714,19 @@ def validate_run_artifact(
         and str(Path(environment["merged_config_path"]).parent.parent) == environment["validation_path"],
         "run validation environment path is inconsistent",
     )
-    validate_policy_health(
+    health = validate_policy_health(
         run["policy_health"],
         execution_horizon=execution_horizon,
         expected_cell=registered_cell,
         expected_calvin_identity=attestation["dataset"]["calvin_identity"],
+    )
+    warmup = validate_policy_warmup(
+        run["policy_warmup"],
+        count=preregistration["policy_warmup_calls"],
+        sequences=preregistration["sequences"],
+        language_annotations=annotations,
+        execution_horizon=execution_horizon,
+        policy=health,
     )
     require(run["episodes_jsonl_sha256"] == entry["episodes_jsonl_sha256"], "run/inventory episode digest mismatch")
     require(run["summary_json_sha256"] == entry["summary_json_sha256"], "run/inventory summary digest mismatch")
@@ -618,6 +752,42 @@ def validate_run_artifact(
         canonical_json_bytes(summary) == canonical_json_bytes(expected_summary),
         "official summary does not match episodes",
     )
+    completion_path = output_dir / "completion.json"
+    completion, completion_sha256 = _read_json_object(
+        completion_path,
+        name="official completion JSON",
+        expected_sha256=entry["completion_json_sha256"],
+    )
+    _validate_sha256_sidecar(completion_path, completion_sha256, name="official completion JSON")
+    _require_exact_keys(
+        completion,
+        {
+            "cell_id",
+            "claim_json_sha256",
+            "episodes_jsonl_sha256",
+            "preregistration_sha256",
+            "run_json_sha256",
+            "schema",
+            "sequence_records",
+            "summary_json_sha256",
+        },
+        "official completion record",
+    )
+    require(completion["schema"] == COMPLETION_SCHEMA, "official completion schema mismatch")
+    expected_completion = {
+        "cell_id": registered_cell["cell_id"],
+        "claim_json_sha256": claim_sha256,
+        "episodes_jsonl_sha256": entry["episodes_jsonl_sha256"],
+        "preregistration_sha256": preregistration_sha256,
+        "run_json_sha256": run_sha256,
+        "schema": COMPLETION_SCHEMA,
+        "sequence_records": NUM_SEQUENCES,
+        "summary_json_sha256": summary_sha256,
+    }
+    require(
+        canonical_json_bytes(completion) == canonical_json_bytes(expected_completion),
+        "official completion record binding mismatch",
+    )
     policy = registered_cell["policy"]
     return {
         "AvgLen": summary["AvgLen"],
@@ -626,17 +796,34 @@ def validate_run_artifact(
         "SR3": summary["SR3"],
         "SR4": summary["SR4"],
         "SR5": summary["SR5"],
+        "attempted_subtasks": summary["attempted_subtasks"],
         "cell_id": registered_cell["cell_id"],
         "checkpoint_sha256": registered_cell["checkpoint"]["sha256"],
+        "claim_json_sha256": claim_sha256,
+        "completion_json_sha256": completion_sha256,
         "episodes_jsonl_sha256": entry["episodes_jsonl_sha256"],
         "execution_horizon": execution_horizon,
+        "environment_actions": summary["environment_actions"],
         "inference_seed_behavior": policy["inference_seed_behavior"],
         "nfe": policy["nfe"],
         "objective": policy["objective"],
         "policy_identity_sha256": policy["identity_sha256"],
+        "policy_calls": summary["policy_calls"],
+        "policy_warmup_actions_sha256": [report["actions_sha256"] for report in warmup["reports"]],
+        "policy_warmup_calls": warmup["count"],
+        "policy_latency_p50_seconds": summary["policy_latency_p50_seconds"],
+        "policy_latency_p95_seconds": summary["policy_latency_p95_seconds"],
+        "policy_latency_total_seconds": summary["policy_latency_total_seconds"],
+        "policy_throughput_calls_per_second": summary["policy_throughput_calls_per_second"],
+        "rollout_elapsed_seconds": summary["rollout_elapsed_seconds"],
+        "rollout_environment_actions_per_second": summary["rollout_environment_actions_per_second"],
         "run_json_sha256": run_sha256,
         "sampler": policy["sampler"],
         "serving_runtime_sha256": registered_cell["serving_runtime_sha256"],
+        "server_latency_p50_seconds": summary["server_latency_p50_seconds"],
+        "server_latency_p95_seconds": summary["server_latency_p95_seconds"],
+        "server_latency_total_seconds": summary["server_latency_total_seconds"],
+        "server_throughput_calls_per_second": summary["server_throughput_calls_per_second"],
         "summary_json_sha256": summary_sha256,
         "train_seed": policy["train_seed"],
     }
@@ -662,7 +849,6 @@ def aggregate_matrix(
     inventory: Mapping[str, Any],
     inventory_sha256: str,
     *,
-    inventory_dir: Path,
     aggregation_sources: Mapping[str, Any] = _STARTUP_AGGREGATION_SOURCE_IDENTITIES,
 ) -> Dict[str, Any]:
     """Reject incomplete/off-matrix inventories and aggregate three training seeds."""
@@ -694,25 +880,23 @@ def aggregate_matrix(
     for entry in runs:
         _require_exact_keys(entry, _INVENTORY_RUN_FIELDS, "run inventory entry")
         require(isinstance(entry["cell_id"], str) and bool(entry["cell_id"]), "run inventory cell ID is invalid")
-        require(isinstance(entry["output_dir"], str) and bool(entry["output_dir"]), "run output_dir is invalid")
-        for name in ("run_json_sha256", "episodes_jsonl_sha256", "summary_json_sha256"):
+        for name in (
+            "claim_json_sha256",
+            "completion_json_sha256",
+            "run_json_sha256",
+            "episodes_jsonl_sha256",
+            "summary_json_sha256",
+        ):
             _require_sha256(entry[name], f"inventory {name}")
     inventory_ids = [entry.get("cell_id") for entry in runs]
     require(len(inventory_ids) == len(set(inventory_ids)), "official run inventory contains duplicate cell IDs")
     cells_by_id = {cell["cell_id"]: cell for cell in registered_cells}
     require(set(inventory_ids) == set(cells_by_id), "official run inventory has missing or off-matrix cells")
-    resolved_dirs = []  # type: List[str]
-    for entry in runs:
-        path = Path(entry["output_dir"])
-        if not path.is_absolute():
-            path = inventory_dir / path
-        resolved_dirs.append(str(path.resolve()))
-    require(len(resolved_dirs) == len(set(resolved_dirs)), "official run inventory reuses an output directory")
+    _require_exact_output_inventories(preregistration, registered_cells)
 
     cell_results = [
         validate_run_artifact(
             entry,
-            inventory_dir=inventory_dir,
             preregistration=preregistration,
             preregistration_sha256=preregistration_sha256,
             registered_cell=cells_by_id[entry["cell_id"]],
@@ -727,6 +911,24 @@ def aggregate_matrix(
         (value["train_seed"], value["objective"], value["nfe"], value["execution_horizon"]) for value in cell_results
     }
     require(observed_factors == official_factor_matrix(), "validated run factors do not form the canonical matrix")
+    serving_runtime_sha256s = {cell["serving_runtime_sha256"] for cell in registered_cells}
+    require(len(serving_runtime_sha256s) == 1, "official cells do not share one evaluation serving runtime")
+    for train_seed in OFFICIAL_TRAIN_SEEDS:
+        for objective, nfes in (
+            ("rectified_flow", OFFICIAL_FLOW_NFES),
+            ("direct_regression", (OFFICIAL_DIRECT_NFE,)),
+        ):
+            for nfe in nfes:
+                paired = [
+                    value
+                    for value in cell_results
+                    if value["train_seed"] == train_seed and value["objective"] == objective and value["nfe"] == nfe
+                ]
+                require(len(paired) == len(SUPPORTED_EXECUTION_HORIZONS), "cross-K warm-up pair is incomplete")
+                require(
+                    len({canonical_json_bytes(value["policy_warmup_actions_sha256"]) for value in paired}) == 1,
+                    "cross-K warm-up policy outputs are not deterministic",
+                )
 
     comparisons = []  # type: List[Dict[str, Any]]
     for objective, nfes in (
@@ -750,13 +952,28 @@ def aggregate_matrix(
                         "execution_horizon": execution_horizon,
                         "metrics": {
                             metric: _metric_aggregate(group, metric)
-                            for metric in ("AvgLen", "SR1", "SR2", "SR3", "SR4", "SR5")
+                            for metric in (
+                                "AvgLen",
+                                "SR1",
+                                "SR2",
+                                "SR3",
+                                "SR4",
+                                "SR5",
+                                "policy_latency_p50_seconds",
+                                "policy_latency_p95_seconds",
+                                "policy_throughput_calls_per_second",
+                                "rollout_environment_actions_per_second",
+                                "server_latency_p50_seconds",
+                                "server_latency_p95_seconds",
+                                "server_throughput_calls_per_second",
+                            )
                         },
                         "nfe": nfe,
                         "objective": objective,
                     }
                 )
     require_aggregation_sources_unchanged(aggregation_sources)
+    _require_exact_output_inventories(preregistration, registered_cells)
     result = {
         "aggregation_python_version": preregistration["aggregation_python_version"],
         "aggregation_source_identities": json.loads(canonical_json_bytes(aggregation_sources).decode("ascii")),
@@ -768,10 +985,13 @@ def aggregate_matrix(
         "comparisons": comparisons,
         "evaluation_seed": EVALUATION_SEED,
         "preregistration_sha256": preregistration_sha256,
+        "policy_warmup_calls": preregistration["policy_warmup_calls"],
+        "official_output_roots": preregistration["official_output_roots"],
         "run_inventory_sha256": inventory_sha256,
         "schema": MATRIX_SUMMARY_SCHEMA,
         "sequence_count_per_cell": NUM_SEQUENCES,
         "sequence_sha256": SEQUENCE_SHA256,
+        "serving_runtime_sha256": next(iter(serving_runtime_sha256s)),
         "subtasks_per_sequence": SUBTASKS_PER_SEQUENCE,
         "training_seeds": list(OFFICIAL_TRAIN_SEEDS),
     }
@@ -787,6 +1007,21 @@ def _write_exclusive(
 ) -> str:
     payload = (json.dumps(value, allow_nan=False, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode("ascii")
     return publish_bytes_and_sha256_exclusive(path, payload, commit_guard=commit_guard)
+
+
+def _validate_matrix_output_path(path: Path, preregistration: Mapping[str, Any]) -> Path:
+    """Keep the aggregate payload outside both exact official artifact roots."""
+
+    candidate = path.absolute()
+    require(candidate.is_absolute() and candidate.resolve() == candidate, "matrix output path must be canonical")
+    roots = validate_official_output_roots(preregistration["official_output_roots"], require_live=True)
+    for key in ("runs", "claims"):
+        root = roots[key]["path"]
+        require(
+            os.path.commonpath((str(candidate), root)) != root,
+            f"matrix output must be outside the official {key} root",
+        )
+    return candidate
 
 
 def parse_args() -> argparse.Namespace:
@@ -811,24 +1046,30 @@ def main() -> None:
         name="CALVIN pre-registration",
         expected_sha256=args.preregistration_sha256,
     )
+    output = _validate_matrix_output_path(args.output, preregistration)
     inventory_path = args.run_inventory.resolve()
     inventory, inventory_sha256 = _read_json_object(
         inventory_path,
         name="CALVIN official run inventory",
         expected_sha256=args.run_inventory_sha256,
     )
+    registered_cells = validate_preregistration_manifest(
+        preregistration,
+        preregistration["sequences"],
+        runtime_attestation_sha256=preregistration["runtime_attestation_sha256"],
+    )
     result = aggregate_matrix(
         preregistration,
         preregistration_sha256,
         inventory,
         inventory_sha256,
-        inventory_dir=inventory_path.parent,
         aggregation_sources=_STARTUP_AGGREGATION_SOURCE_IDENTITIES,
     )
-    output = args.output.resolve()
 
     def commit_guard() -> None:
         require_aggregation_sources_unchanged(_STARTUP_AGGREGATION_SOURCE_IDENTITIES)
+        _validate_matrix_output_path(output, preregistration)
+        _require_exact_output_inventories(preregistration, registered_cells)
 
     commit_guard()
     digest = _write_exclusive(output, result, commit_guard=commit_guard)

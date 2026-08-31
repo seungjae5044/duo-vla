@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Persistent TP=2 Duo-VLA policy server for the isolated CALVIN evaluator."""
 
+# ruff: noqa: E402 -- authenticate local import roots before importing project code.
+
 from __future__ import annotations
 
 import argparse
@@ -12,6 +14,7 @@ import json
 import os
 import platform
 import site
+import stat
 import subprocess
 import sys
 import time
@@ -19,6 +22,118 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _activate_project_source_root() -> Path:
+    source_root = _SCRIPT_DIR.parents[1] / "src"
+    if source_root.resolve(strict=True) != source_root or not stat.S_ISDIR(os.lstat(source_root).st_mode):
+        raise RuntimeError("project src import root must be a canonical real directory")
+    identity_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns", "st_nlink")
+
+    def same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+        return all(getattr(left, name) == getattr(right, name) for name in identity_fields)
+
+    def walk(directory: int, prefix: tuple[str, ...]) -> None:
+        before = os.fstat(directory)
+        names = sorted(os.listdir(directory))
+        for name in names:
+            context = "/".join((*prefix, name))
+            observed = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if stat.S_ISDIR(observed.st_mode):
+                if name == "__pycache__":
+                    continue
+                child = os.open(
+                    name,
+                    os.O_RDONLY | os.O_NONBLOCK | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=directory,
+                )
+                try:
+                    if not same_identity(observed, os.fstat(child)):
+                        raise RuntimeError(f"project source directory changed while opening: {context}")
+                    walk(child, (*prefix, name))
+                finally:
+                    os.close(child)
+            elif not (stat.S_ISREG(observed.st_mode) and name.endswith(".py")):
+                raise RuntimeError(f"project source import entry is unsafe: {context}")
+        if names != sorted(os.listdir(directory)) or not same_identity(before, os.fstat(directory)):
+            raise RuntimeError(f"project source directory changed during inventory: {'/'.join(prefix) or '.'}")
+
+    root_descriptor = os.open(
+        source_root,
+        os.O_RDONLY | os.O_NONBLOCK | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    try:
+        if sorted(os.listdir(root_descriptor)) != ["duo_vla"]:
+            raise RuntimeError("project src import root must contain only the real duo_vla package directory")
+        package_descriptor = os.open(
+            "duo_vla",
+            os.O_RDONLY | os.O_NONBLOCK | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=root_descriptor,
+        )
+        try:
+            walk(package_descriptor, ("duo_vla",))
+        finally:
+            os.close(package_descriptor)
+    finally:
+        os.close(root_descriptor)
+    source_text = str(source_root)
+    sys.path[:] = [source_text] + [
+        entry for entry in sys.path if str(Path(entry or os.getcwd()).resolve()) != source_text
+    ]
+    return source_root
+
+
+_PROJECT_SOURCE_ROOT = _activate_project_source_root()
+
+
+def _validate_project_module_origins(required_modules: set[str]) -> dict[str, str]:
+    package_root = (_PROJECT_SOURCE_ROOT / "duo_vla").resolve(strict=True)
+    loaded = {name: module for name, module in sys.modules.items() if name == "duo_vla" or name.startswith("duo_vla.")}
+    missing = sorted(required_modules - set(loaded))
+    if missing:
+        raise RuntimeError(f"required checkout modules are not loaded: {missing}")
+    origins: dict[str, str] = {}
+    for name, module in sorted(loaded.items()):
+        origin = getattr(getattr(module, "__spec__", None), "origin", None)
+        module_file = getattr(module, "__file__", None)
+        if not isinstance(origin, str) or not isinstance(module_file, str):
+            raise RuntimeError(f"checkout module has no file origin: {name}")
+        resolved_origin = Path(origin).resolve(strict=True)
+        resolved_file = Path(module_file).resolve(strict=True)
+        if resolved_origin != resolved_file or not resolved_file.is_relative_to(package_root):
+            raise RuntimeError(f"checkout module origin escapes authenticated source root: {name}")
+        origins[name] = str(resolved_file)
+    return origins
+
+
+def _load_local_module(name: str, path: Path) -> Any:
+    expected = path.resolve(strict=True)
+    existing = sys.modules.get(name)
+    if existing is not None:
+        module_file = getattr(existing, "__file__", None)
+        origin = getattr(getattr(existing, "__spec__", None), "origin", None)
+        if not isinstance(module_file, str) or not isinstance(origin, str):
+            raise RuntimeError(f"existing local module {name} has no file origin")
+        if Path(module_file).resolve() != expected or Path(origin).resolve() != expected:
+            raise RuntimeError(f"existing local module {name} has an unexpected origin")
+        return existing
+    specification = importlib.util.spec_from_file_location(name, expected)
+    if specification is None or specification.loader is None:
+        raise RuntimeError(f"cannot construct import specification for {expected}")
+    module = importlib.util.module_from_spec(specification)
+    sys.modules[name] = module
+    try:
+        specification.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+_calvin_bridge = _load_local_module("calvin_bridge", _SCRIPT_DIR / "calvin_bridge.py")
+
 from calvin_bridge import (
     ACTION_DIM,
     ACTION_HORIZON,
@@ -31,6 +146,15 @@ from calvin_bridge import (
     make_success_response,
     serve_unix_policy,
 )
+
+from duo_vla.runtime_integrity import (
+    content_address_train_venv,
+    require_matching_train_venv,
+    static_environment_identity,
+    validate_torchrun_rank_environment,
+)
+
+_validate_project_module_origins({"duo_vla", "duo_vla.runtime_integrity"})
 
 MODEL_ID = "google/diffusiongemma-26B-A4B-it"
 ARCHIVE_SHA256 = "c2036c67eb4c06966af1d1e1665bdb572c69e1404f5e77ffd46b384ff2b79f74"
@@ -68,34 +192,37 @@ EXPECTED_TRAIN_PACKAGES = {
     "transformers": "5.15.0",
 }
 REQUIRED_TRAIN_ENVIRONMENT = {
+    "BLIS_NUM_THREADS": "1",
     "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
     "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
     "CUDA_VISIBLE_DEVICES": "0,1",
+    "HF_HUB_DISABLE_PROGRESS_BARS": "1",
     "HF_HUB_OFFLINE": "1",
+    "HOME": "/root",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
     "MKL_NUM_THREADS": "1",
     "NUMEXPR_NUM_THREADS": "1",
     "OMP_DYNAMIC": "FALSE",
     "OMP_NUM_THREADS": "1",
     "OPENBLAS_NUM_THREADS": "1",
-    "PYTHONNOUSERSITE": "1",
-    "TOKENIZERS_PARALLELISM": "false",
-    "TRANSFORMERS_OFFLINE": "1",
-}
-REQUIRED_SERVING_ENVIRONMENT = {
-    **REQUIRED_TRAIN_ENVIRONMENT,
-    "BLIS_NUM_THREADS": "1",
-    "LANG": "C.UTF-8",
-    "LC_ALL": "C.UTF-8",
     "PATH": "/usr/bin:/bin",
-    "PYTHONHASHSEED": "0",
+    "PYTHONNOUSERSITE": "1",
+    "PYTHONPYCACHEPREFIX": "/dev/null",
     "PYTHONSAFEPATH": "1",
     "PYTHONDONTWRITEBYTECODE": "1",
     "RAYON_NUM_THREADS": "1",
+    "TOKENIZERS_PARALLELISM": "false",
     "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
+    "TRANSFORMERS_OFFLINE": "1",
     "TZ": "UTC",
     "VECLIB_MAXIMUM_THREADS": "1",
 }
-SERVING_RUNTIME_SCHEMA = "duo-vla-calvin-serving-runtime-v3"
+REQUIRED_SERVING_ENVIRONMENT = {
+    **REQUIRED_TRAIN_ENVIRONMENT,
+    "PYTHONHASHSEED": "0",
+}
+SERVING_RUNTIME_SCHEMA = "duo-vla-calvin-serving-runtime-v5"
 _RELEVANT_ENVIRONMENT_PREFIXES = (
     "BASH_",
     "BLIS_",
@@ -497,6 +624,8 @@ def _validated_serving_process_environment(
 ) -> tuple[dict[str, Any], Path]:
     """Require the canonical wrapper environment before any scored CUDA work."""
 
+    _activate_project_source_root()
+    _validate_project_module_origins({"duo_vla", "duo_vla.runtime_integrity"})
     require(
         platform.python_version() == EXPECTED_TRAIN_PYTHON,
         f"policy server requires Python {EXPECTED_TRAIN_PYTHON}",
@@ -504,6 +633,7 @@ def _validated_serving_process_environment(
     require(not site.ENABLE_USER_SITE and sys.flags.no_user_site == 1, "policy server requires the user site disabled")
     require(sys.flags.safe_path, "policy server requires Python safe-path mode")
     require(sys.flags.dont_write_bytecode, "policy server requires bytecode writes disabled")
+    require(sys.pycache_prefix == "/dev/null", "policy server requires an impossible pycache lookup prefix")
 
     canonical_project = project_root.resolve()
     cache_value = os.environ.get("DUO_VLA_CACHE_ROOT")
@@ -519,18 +649,22 @@ def _validated_serving_process_environment(
         Path(sys.prefix).resolve() == expected_prefix,
         f"policy server requires the pinned train venv: {expected_prefix}",
     )
+    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    compact_version = f"python{sys.version_info.major}{sys.version_info.minor}"
+    expected_sys_path = [
+        str((canonical_project / "src").resolve()),
+        str(Path(sys.base_prefix) / "lib" / f"{compact_version}.zip"),
+        str(Path(sys.base_prefix) / "lib" / version),
+        str(Path(sys.base_exec_prefix) / "lib" / version / "lib-dynload"),
+        str(expected_prefix / "lib" / version / "site-packages"),
+    ]
+    require(sys.path == expected_sys_path, f"policy server import search path differs: {sys.path}")
 
     expected_paths = {
         "DUO_VLA_CACHE_ROOT": str(cache_root),
         "DUO_VLA_PROJECT_ROOT": str(canonical_project),
         "DUO_VLA_TRAIN_VENV": str(expected_prefix),
         "HF_HOME": str(hf_home),
-        "PYTHONPATH": os.pathsep.join(
-            (
-                str((canonical_project / "src").resolve()),
-                str((canonical_project / "scripts/calvin").resolve()),
-            )
-        ),
     }
     expected_environment = {**REQUIRED_SERVING_ENVIRONMENT, **expected_paths}
     observed_environment = {name: os.environ.get(name) for name in expected_environment}
@@ -542,20 +676,12 @@ def _validated_serving_process_environment(
     unexpected = sorted(relevant_names - set(expected_environment))
     require(not unexpected, f"policy server environment contains unpinned overrides: {unexpected}")
 
-    if require_tp_launch:
-        require(os.environ.get("WORLD_SIZE") == "2", "policy server requires WORLD_SIZE=2")
-        require(os.environ.get("LOCAL_WORLD_SIZE") == "2", "policy server requires LOCAL_WORLD_SIZE=2")
-        rank = os.environ.get("RANK")
-        local_rank = os.environ.get("LOCAL_RANK")
-        require(rank in {"0", "1"} and local_rank == rank, "policy server requires one local rank for each TP rank")
+    rank_environment = validate_torchrun_rank_environment(os.environ, required=require_tp_launch)
     return (
         {
-            "distributed": {
-                "local_rank_equals_rank": require_tp_launch,
-                "local_world_size": 2 if require_tp_launch else None,
-                "world_size": 2 if require_tp_launch else None,
-            },
+            "distributed": rank_environment,
             "environment": dict(sorted(expected_environment.items())),
+            "static_environment_sha256": static_environment_identity(expected_environment)["sha256"],
         },
         expected_prefix,
     )
@@ -612,13 +738,16 @@ def _verified_distribution_identity(name: str, expected_version: str, venv_root:
     }
 
 
-def _serving_process_identity(project_root: Path, package_versions: dict[str, str]) -> dict[str, Any]:
+def _serving_process_identity(
+    project_root: Path,
+    package_versions: dict[str, str],
+    train_venv_identity: dict[str, Any],
+) -> dict[str, Any]:
     """Authenticate process paths, imports, and installed distribution bytes."""
 
     environment, venv_root = _validated_serving_process_environment(project_root)
     project_root = project_root.resolve()
     project_src = (project_root / "src").resolve()
-    project_calvin = (project_root / "scripts/calvin").resolve()
     expected_prefix = venv_root.resolve()
     site_packages = expected_prefix / f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
 
@@ -627,16 +756,13 @@ def _serving_process_identity(project_root: Path, package_versions: dict[str, st
         require(bool(entry), "policy server sys.path contains the current working directory")
         resolved = Path(entry).resolve()
         require(
-            resolved in {project_src, project_calvin}
+            resolved == project_src
             or _is_relative_to(resolved, Path(sys.base_prefix).resolve())
             or _is_relative_to(resolved, expected_prefix),
             f"policy server sys.path contains an untrusted entry: {resolved}",
         )
         effective_sys_path.append(str(resolved))
-    require(
-        effective_sys_path[:2] == [str(project_src), str(project_calvin)],
-        "policy server project import roots are not first and canonical",
-    )
+    require(effective_sys_path == sys.path, "policy server import search path identity changed")
     require(
         len(effective_sys_path) == len(set(effective_sys_path)),
         "policy server sys.path contains duplicate entries",
@@ -644,7 +770,7 @@ def _serving_process_identity(project_root: Path, package_versions: dict[str, st
     require(str(site_packages.resolve()) in effective_sys_path, "policy server train-venv site-packages is absent")
 
     expected_module_roots = {
-        "calvin_bridge": project_calvin,
+        "calvin_bridge": (project_root / "scripts/calvin").resolve(),
         "duo_vla": project_src,
         **{module: site_packages for module in _DISTRIBUTION_IMPORT_NAMES.values()},
     }
@@ -677,6 +803,7 @@ def _serving_process_identity(project_root: Path, package_versions: dict[str, st
         },
         "site_packages_pth": pth_files,
         "sys_path": effective_sys_path,
+        "train_venv": train_venv_identity,
     }
 
 
@@ -1009,7 +1136,18 @@ def _validate_checkpoint_training_environment(
     runtime = execution.get("authenticated_runtime")
     require(isinstance(runtime, dict), "checkpoint has no authenticated training runtime")
     require(
-        set(runtime) == {"environment", "lock_sha256", "module_origins", "packages", "python", "sys_path"},
+        set(runtime)
+        == {
+            "environment",
+            "lock_sha256",
+            "module_origins",
+            "packages",
+            "python",
+            "static_environment_sha256",
+            "sys_path",
+            "torchrun",
+            "train_venv",
+        },
         "checkpoint authenticated training-runtime fields differ",
     )
     require(runtime.get("lock_sha256") == TRAIN_LOCK_SHA256, "checkpoint training lock identity mismatch")
@@ -1017,11 +1155,32 @@ def _validate_checkpoint_training_environment(
     require(runtime.get("python") == EXPECTED_TRAIN_PYTHON, "checkpoint training Python identity mismatch")
 
     project_root = project_root.resolve()
-    expected_pythonpath = str((project_root / "src").resolve())
-    expected_environment = {**REQUIRED_TRAIN_ENVIRONMENT, "PYTHONPATH": expected_pythonpath}
-    require(runtime.get("environment") == expected_environment, "checkpoint training process environment mismatch")
     cache_root = Path(os.environ.get("DUO_VLA_CACHE_ROOT", "/root/.cache/duo-vla")).resolve()
     train_prefix = (cache_root / "venvs/train").resolve()
+    expected_environment = {
+        **REQUIRED_TRAIN_ENVIRONMENT,
+        "DUO_VLA_CACHE_ROOT": str(cache_root),
+        "DUO_VLA_PROJECT_ROOT": str(project_root),
+        "DUO_VLA_TRAIN_VENV": str(train_prefix),
+        "HF_HOME": str(Path(os.environ.get("HF_HOME", "/root/.cache/huggingface")).resolve()),
+        "PYTHONHASHSEED": str(run_seed),
+    }
+    require(runtime.get("environment") == expected_environment, "checkpoint training process environment mismatch")
+    require(
+        runtime.get("static_environment_sha256") == static_environment_identity(expected_environment)["sha256"],
+        "checkpoint training static-environment identity mismatch",
+    )
+    train_venv_identity = runtime.get("train_venv")
+    live_train_venv_identity = content_address_train_venv(train_prefix)
+    require_matching_train_venv(train_venv_identity, live_train_venv_identity)
+    torchrun_identity = runtime.get("torchrun")
+    require(
+        isinstance(torchrun_identity, dict)
+        and torchrun_identity.get("local_rank_equals_rank") is True
+        and torchrun_identity.get("local_world_size") == 2
+        and torchrun_identity.get("world_size") == 2,
+        "checkpoint training torchrun identity is invalid",
+    )
     site_packages = train_prefix / f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
     expected_origins = {
         "duo_vla": str((project_root / "src/duo_vla/__init__.py").resolve()),
@@ -1045,16 +1204,16 @@ def _validate_checkpoint_training_environment(
             f"checkpoint training module {module!r} resolved outside {expected_root}",
         )
 
-    recorded_sys_path = runtime.get("sys_path")
-    safe_roots = (project_root / "scripts", project_root / "src", Path(sys.base_prefix), train_prefix)
-    require(isinstance(recorded_sys_path, list) and bool(recorded_sys_path), "checkpoint training sys.path is invalid")
-    for entry in recorded_sys_path:
-        require(isinstance(entry, str) and bool(entry), "checkpoint training sys.path contains an empty entry")
-        resolved = Path(entry).resolve()
-        require(
-            any(_is_relative_to(resolved, root.resolve()) for root in safe_roots),
-            f"checkpoint training sys.path contains an untrusted entry: {resolved}",
-        )
+    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    compact_version = f"python{sys.version_info.major}{sys.version_info.minor}"
+    expected_sys_path = [
+        str((project_root / "src").resolve()),
+        str(Path(sys.base_prefix) / "lib" / f"{compact_version}.zip"),
+        str(Path(sys.base_prefix) / "lib" / version),
+        str(Path(sys.base_exec_prefix) / "lib" / version / "lib-dynload"),
+        str(train_prefix / "lib" / version / "site-packages"),
+    ]
+    require(runtime.get("sys_path") == expected_sys_path, "checkpoint training sys.path differs")
 
     expected_values = {
         "cublas_workspace_config": REQUIRED_TRAIN_ENVIRONMENT["CUBLAS_WORKSPACE_CONFIG"],
@@ -1439,6 +1598,7 @@ def resolve_checkpoint(
         "train_seed": recorded_seed,
         "training_execution_environment": training_execution_environment,
         "training_execution_environment_sha256": manifest["execution_environment_sha256"],
+        "train_venv": training_execution_environment["authenticated_runtime"]["train_venv"],
     }
     identities: dict[str, Any] = {
         "calvin_identity": normalization_dataset_identity,
@@ -1504,7 +1664,11 @@ def configure_and_identify_serving_runtime(torch: Any, preflight_report: dict[st
     """Enable deterministic inference and bind the exact software/hardware runtime used for scoring."""
 
     project_root = Path(__file__).resolve().parents[2]
-    process_identity = _serving_process_identity(project_root, preflight_report["packages"])
+    process_identity = _serving_process_identity(
+        project_root,
+        preflight_report["packages"],
+        preflight_report["checkpoint"]["train_venv"],
+    )
     torch.use_deterministic_algorithms(True, warn_only=False)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
@@ -1606,7 +1770,6 @@ def configure_and_identify_serving_runtime(torch: Any, preflight_report: dict[st
             "source_revisions": preflight_report["source_revisions"],
             "source_tree_sha256": checkpoint_report["source_tree_sha256"],
             "train_launcher_sha256": sha256_file(project_root / "scripts/run_calvin_train.sh"),
-            "training_execution_environment_sha256": checkpoint_report["training_execution_environment_sha256"],
         },
         "determinism": {
             "cublas_workspace_config": os.environ["CUBLAS_WORKSPACE_CONFIG"],

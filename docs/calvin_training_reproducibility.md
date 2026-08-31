@@ -60,8 +60,8 @@ byte-exact, and every checkpoint copy must equal its own root copy.
 
 ## Exact smoke launch sequence
 
-Use the same config, seed, data/normalization/prefix artifacts, and
-`--checkpoint-interval 1` for all three invocations. The flow example below
+Use the same config, seed, data/normalization/prefix artifacts,
+`--checkpoint-interval 1`, and `--permanent-checkpoint-interval 1` for all three invocations. The flow example below
 uses seed zero; repeat the qualification independently for every required
 objective/seed pair. `--stop-after-updates` is invocation-local and therefore
 does not alter the 30,000-update run contract.
@@ -76,6 +76,7 @@ bash scripts/run_calvin_train.sh \
   --prefix-geometry-artifact /path/to/calvin-prefix-geometry.json \
   --seed 0 \
   --checkpoint-interval 1 \
+  --permanent-checkpoint-interval 1 \
   --stop-after-updates 1
 
 # Interrupted run, invocation 2: authenticate update 1, resume, then update 2.
@@ -87,6 +88,7 @@ bash scripts/run_calvin_train.sh \
   --prefix-geometry-artifact /path/to/calvin-prefix-geometry.json \
   --seed 0 \
   --checkpoint-interval 1 \
+  --permanent-checkpoint-interval 1 \
   --resume checkpoints/update-000001 \
   --stop-after-updates 1
 
@@ -99,6 +101,7 @@ bash scripts/run_calvin_train.sh \
   --prefix-geometry-artifact /path/to/calvin-prefix-geometry.json \
   --seed 0 \
   --checkpoint-interval 1 \
+  --permanent-checkpoint-interval 1 \
   --stop-after-updates 2
 ```
 
@@ -141,6 +144,13 @@ environment; the comparator is not Python-3.8-compatible and does not need to
 be. A passing report records the isolated/no-site/safe-path/ignore-environment/
 no-bytecode flags, the bootstrap module inventory, exact venv identity, and
 complete `sys.path`.
+
+Production training and real policy serving have a separate fail-closed gate:
+their launchers use an `env -i` allowlist, and the trainer records an exact
+no-follow identity of every train-venv regular file, symlink, and `.pth` hook.
+Resume and serving recompute that identity; `sitecustomize` and
+`usercustomize` are forbidden. See
+[Training and policy runtime integrity](runtime_integrity.md).
 
 Before importing torch or the six directly used production modules, the
 comparator snapshots itself, the launcher, those modules, and the same

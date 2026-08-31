@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import shutil
 import sys
 import types
 from pathlib import Path
@@ -156,7 +157,7 @@ class FakePolicyClient:
         response = {
             "evaluation_seed": kwargs["evaluation_seed"],
             "execution_horizon": kwargs["execution_horizon"],
-            "policy_seconds": 0.001,
+            "policy_seconds": 0.0,
             "replan_idx": kwargs["replan_idx"],
             "sequence_idx": kwargs["sequence_idx"],
             "sequence_sha256": kwargs["sequence_sha256"],
@@ -379,10 +380,19 @@ def test_official_metrics_are_avg_len_and_sr1_through_sr5() -> None:
     for sequence_idx, length in enumerate(range(6)):
         records.append(
             {
+                "elapsed_seconds": 2.0,
                 "sequence_idx": sequence_idx,
                 "successful_subtasks": length,
                 "subtasks": [
-                    {"subtask_name": TASKS[index % 5], "success": index < length} for index in range(min(length + 1, 5))
+                    {
+                        "environment_actions": 1,
+                        "policy_calls": 1,
+                        "policy_latency_seconds": [0.2],
+                        "server_latency_seconds": [0.1],
+                        "subtask_name": TASKS[index % 5],
+                        "success": index < length,
+                    }
+                    for index in range(min(length + 1, 5))
                 ],
             }
         )
@@ -392,6 +402,19 @@ def test_official_metrics_are_avg_len_and_sr1_through_sr5() -> None:
     assert summary["AvgLen"] == pytest.approx(2.5)
     assert [summary[f"SR{depth}"] for depth in range(1, 6)] == pytest.approx([5 / 6, 4 / 6, 3 / 6, 2 / 6, 1 / 6])
     assert summary["AvgLen"] == pytest.approx(sum(summary[f"SR{depth}"] for depth in range(1, 6)))
+    assert summary["attempted_subtasks"] == 20
+    assert summary["environment_actions"] == 20
+    assert summary["policy_calls"] == 20
+    assert summary["policy_latency_p50_seconds"] == pytest.approx(0.2)
+    assert summary["policy_latency_p95_seconds"] == pytest.approx(0.2)
+    assert summary["policy_latency_total_seconds"] == pytest.approx(4.0)
+    assert summary["policy_throughput_calls_per_second"] == pytest.approx(5.0)
+    assert summary["rollout_elapsed_seconds"] == pytest.approx(12.0)
+    assert summary["rollout_environment_actions_per_second"] == pytest.approx(20 / 12)
+    assert summary["server_latency_p50_seconds"] == pytest.approx(0.1)
+    assert summary["server_latency_p95_seconds"] == pytest.approx(0.1)
+    assert summary["server_latency_total_seconds"] == pytest.approx(2.0)
+    assert summary["server_throughput_calls_per_second"] == pytest.approx(10.0)
 
 
 def _execution_geometry() -> dict[str, Any]:
@@ -460,6 +483,84 @@ def _health() -> dict[str, Any]:
     }
 
 
+def test_policy_warmups_are_canonical_recorded_and_outside_episode_latency() -> None:
+    client = FakePolicyClient()
+    sequences = [({"initial": 0}, list(TASKS))]
+    health = _health()
+    callback_events: list[tuple[str, int]] = []
+
+    warmup = EVALUATOR.run_policy_warmups(
+        client,
+        health,
+        count=EVALUATOR.DEFAULT_POLICY_WARMUP_CALLS,
+        sequences=sequences,
+        language_annotations=ANNOTATIONS,
+        execution_horizon=4,
+        attempt_callback=lambda index, _intent: callback_events.append(("attempt", index)),
+        report_callback=lambda reports: callback_events.append(("complete", len(reports))),
+    )
+
+    assert warmup["count"] == 2
+    assert warmup["included_in_episode_latency"] is False
+    assert [report["warmup_index"] for report in warmup["reports"]] == [0, 1]
+    assert [call["replan_idx"] for call in client.calls] == [
+        EVALUATOR.POLICY_WARMUP_REPLAN_BASE,
+        EVALUATOR.POLICY_WARMUP_REPLAN_BASE + 1,
+    ]
+    assert all(call["replan_idx"] >= EVALUATOR.MAX_ACTIONS_PER_SUBTASK for call in client.calls)
+    assert all(call["sequence_idx"] == 0 and call["subtask_idx"] == 0 for call in client.calls)
+    assert all(call["subtask_name"] == TASKS[0] for call in client.calls)
+    assert all(call["instruction"] == ANNOTATIONS[TASKS[0]][0] for call in client.calls)
+    assert all(call["state"][-1] == -1.0 for call in client.calls)
+    assert callback_events == [("attempt", 0), ("complete", 1), ("attempt", 1), ("complete", 2)]
+    EVALUATOR.validate_policy_warmup(
+        warmup,
+        count=2,
+        sequences=sequences,
+        language_annotations=ANNOTATIONS,
+        execution_horizon=4,
+        policy=health,
+    )
+
+    contaminated = copy.deepcopy(warmup)
+    contaminated["included_in_episode_latency"] = True
+    with pytest.raises(RuntimeError, match="entered episode latency"):
+        EVALUATOR.validate_policy_warmup(
+            contaminated,
+            count=2,
+            sequences=sequences,
+            language_annotations=ANNOTATIONS,
+            execution_horizon=4,
+            policy=health,
+        )
+
+    wrong_identity_type = copy.deepcopy(warmup)
+    wrong_identity_type["reports"][0]["discarded"] = 1
+    with pytest.raises(RuntimeError, match="discarded drifted"):
+        EVALUATOR.validate_policy_warmup(
+            wrong_identity_type,
+            count=2,
+            sequences=sequences,
+            language_annotations=ANNOTATIONS,
+            execution_horizon=4,
+            policy=health,
+        )
+
+    impossible_latency = copy.deepcopy(warmup)
+    impossible_latency["reports"][0]["server_latency_seconds"] = (
+        impossible_latency["reports"][0]["policy_latency_seconds"] + 1.0
+    )
+    with pytest.raises(RuntimeError, match="server latency exceeds"):
+        EVALUATOR.validate_policy_warmup(
+            impossible_latency,
+            count=2,
+            sequences=sequences,
+            language_annotations=ANNOTATIONS,
+            execution_horizon=4,
+            policy=health,
+        )
+
+
 def test_evaluator_health_inventory_matches_ipc_v4_exactly() -> None:
     assert EVALUATOR.SCHEMA == "duovla-calvin-policy-ipc-v4"
     assert EVALUATOR._HEALTH_FIELDS == EVALUATOR._calvin_bridge._HEALTH_RESPONSE_FIELDS
@@ -467,18 +568,36 @@ def test_evaluator_health_inventory_matches_ipc_v4_exactly() -> None:
     assert EVALUATOR._CALVIN_MEMBER_INDEX_FIELDS == EVALUATOR._calvin_bridge._CALVIN_MEMBER_INDEX_FIELDS
 
 
-def _official_cells() -> list[dict[str, Any]]:
+def _synthetic_output_roots(base: Path = Path("/official")) -> dict[str, Any]:
+    return {
+        "claims": {"device": 1, "inode": 2, "path": str(base / "claims")},
+        "runs": {"device": 1, "inode": 1, "path": str(base / "runs")},
+        "schema": EVALUATOR.OUTPUT_ROOTS_SCHEMA,
+    }
+
+
+def _official_cells(
+    roots: dict[str, Any] | None = None,
+    final_freeze_token_sha256: str | None = None,
+) -> list[dict[str, Any]]:
+    roots = _synthetic_output_roots() if roots is None else roots
+    final_freeze_token_sha256 = "f" * 64 if final_freeze_token_sha256 is None else final_freeze_token_sha256
     cells = []
+    runtime = hashlib.sha256(b"evaluation-runtime").hexdigest()
     for seed, objective, nfe, execution_horizon in sorted(EVALUATOR.official_factor_matrix()):
         contract = EVALUATOR.selected_policy_contract(objective, nfe)
         checkpoint = hashlib.sha256(f"checkpoint:{seed}:{objective}".encode()).hexdigest()
-        runtime = hashlib.sha256(f"runtime:{seed}:{objective}".encode()).hexdigest()
         cells.append(
             {
                 "cell_id": EVALUATOR.official_cell_id(seed, objective, nfe, execution_horizon),
                 "checkpoint": {"sha256": checkpoint},
                 "execution_geometry": _execution_geometry(),
                 "execution_horizon": execution_horizon,
+                "output_claim": EVALUATOR.derive_output_claim(
+                    EVALUATOR.official_cell_id(seed, objective, nfe, execution_horizon),
+                    roots,
+                    final_freeze_token_sha256,
+                ),
                 "policy": {
                     "identity_sha256": EVALUATOR.canonical_sha256(contract),
                     "inference_seed_behavior": contract["inference_seed_behavior"],
@@ -493,19 +612,22 @@ def _official_cells() -> list[dict[str, Any]]:
     return cells
 
 
-def _preregistration(sequences: list[Any], digest: str, token: str) -> dict[str, Any]:
+def _preregistration(sequences: list[Any], digest: str, token: str, roots: dict[str, Any]) -> dict[str, Any]:
+    token_sha256 = hashlib.sha256(token.encode()).hexdigest()
     return {
         "aggregation_python_version": EVALUATOR.PYTHON_VERSION,
         "aggregator_sha256": "a" * 64,
         "benchmark_protocol": EVALUATOR.PROTOCOL,
-        "cells": _official_cells(),
+        "cells": _official_cells(roots, token_sha256),
         "direct_nfe": EVALUATOR.OFFICIAL_DIRECT_NFE,
         "evaluation_seed": EVALUATOR.EVALUATION_SEED,
         "execution_horizons": list(EVALUATOR.SUPPORTED_EXECUTION_HORIZONS),
         "final_checkpoint_update": EVALUATOR.FINAL_CHECKPOINT_UPDATE,
-        "final_freeze_token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+        "final_freeze_token_sha256": token_sha256,
         "flow_nfes": list(EVALUATOR.OFFICIAL_FLOW_NFES),
         "inference_seed_domain": EVALUATOR.INFERENCE_SEED_DOMAIN,
+        "policy_warmup_calls": EVALUATOR.DEFAULT_POLICY_WARMUP_CALLS,
+        "official_output_roots": roots,
         "runtime_attestation_sha256": "c" * 64,
         "schema": EVALUATOR.PREREGISTRATION_SCHEMA,
         "sequence_count": len(sequences),
@@ -587,7 +709,12 @@ def test_preregistration_binds_full_sequences_cell_k_and_explicit_token(
     token = "this cell is frozen before final evaluation"
     monkeypatch.setattr(EVALUATOR, "NUM_SEQUENCES", 1)
     monkeypatch.setattr(EVALUATOR, "SEQUENCE_SHA256", digest)
-    manifest = _preregistration(sequences, digest, token)
+    runs_root = tmp_path / "runs"
+    claims_root = tmp_path / "claims"
+    runs_root.mkdir()
+    claims_root.mkdir()
+    roots = EVALUATOR.capture_official_output_roots(runs_root.resolve(), claims_root.resolve())
+    manifest = _preregistration(sequences, digest, token, roots)
     cell_id = EVALUATOR.official_cell_id(0, "rectified_flow", 5, 4)
     path = tmp_path / "preregistered.json"
     path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -605,6 +732,22 @@ def test_preregistration_binds_full_sequences_cell_k_and_explicit_token(
 
     assert cell["checkpoint"]["sha256"] == hashlib.sha256(b"checkpoint:0:rectified_flow").hexdigest()
     assert len(manifest_sha) == 64
+    invalid_warmup = copy.deepcopy(manifest)
+    invalid_warmup["policy_warmup_calls"] = 0
+    with pytest.raises(RuntimeError, match="warm-up count"):
+        EVALUATOR.validate_preregistration_manifest(
+            invalid_warmup,
+            sequences,
+            runtime_attestation_sha256="c" * 64,
+        )
+    changed_runtime = copy.deepcopy(manifest)
+    changed_runtime["cells"][0]["serving_runtime_sha256"] = "f" * 64
+    with pytest.raises(RuntimeError, match="one evaluation serving runtime"):
+        EVALUATOR.validate_preregistration_manifest(
+            changed_runtime,
+            sequences,
+            runtime_attestation_sha256="c" * 64,
+        )
     with pytest.raises(RuntimeError, match="freeze token"):
         EVALUATOR.load_preregistration(
             path,
@@ -770,6 +913,7 @@ def test_validation_environment_instantiates_authenticated_config_without_path_r
 
 
 def test_official_score_attests_and_binds_preregistration_before_yaml_or_policy(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
@@ -797,11 +941,27 @@ def test_official_score_attests_and_binds_preregistration_before_yaml_or_policy(
         events.append("sequences")
         return [({"initial": 0}, TASKS)]
 
+    runs_root = tmp_path / "runs"
+    claims_root = tmp_path / "claims"
+    runs_root.mkdir()
+    claims_root.mkdir()
+    roots = EVALUATOR.capture_official_output_roots(runs_root.resolve(), claims_root.resolve())
+    token_sha256 = hashlib.sha256(b"frozen").hexdigest()
+    output_claim = EVALUATOR.derive_output_claim("cell", roots, token_sha256)
+
     def preregister(*_args: Any, **kwargs: Any) -> tuple[dict[str, Any], dict[str, Any], str]:
         events.append("preregistration")
         assert kwargs["preregistration_sha256"] == "a" * 64
         assert kwargs["runtime_attestation_sha256"] == "c" * 64
-        return {}, {}, "a" * 64
+        return (
+            {
+                "final_freeze_token_sha256": token_sha256,
+                "official_output_roots": roots,
+                "policy_warmup_calls": EVALUATOR.DEFAULT_POLICY_WARMUP_CALLS,
+            },
+            {"cell_id": "cell", "output_claim": output_claim},
+            "a" * 64,
+        )
 
     class StopBeforeYaml(RuntimeError):
         pass
@@ -826,8 +986,12 @@ def test_official_score_attests_and_binds_preregistration_before_yaml_or_policy(
         evaluation_seed=0,
         execution_horizon=4,
         final_freeze_token="frozen",
+        output_dir=Path(output_claim["output_dir"]),
+        policy_timeout_seconds=1.0,
         preregistration_manifest=Path("/preregistration.json"),
         preregistration_sha256="a" * 64,
+        policy_warmup_calls=EVALUATOR.DEFAULT_POLICY_WARMUP_CALLS,
+        socket=Path("/policy.sock"),
         source_root=Path("/source"),
     )
 
@@ -835,6 +999,473 @@ def test_official_score_attests_and_binds_preregistration_before_yaml_or_policy(
         EVALUATOR.run_official_score_mode(args)
 
     assert events == ["attestation", "sequences", "preregistration", "yaml"]
+
+
+def _stub_official_setup_before_policy(monkeypatch: pytest.MonkeyPatch, output_dir: Path) -> None:
+    attestation = {
+        "attestation_sha256": "c" * 64,
+        "dataset": {
+            "calvin_identity": {},
+            "validation_critical_files": {
+                "validation/.hydra/merged_config.yaml": {"bytes": 1, "path": "/config", "sha256": "d" * 64}
+            },
+        },
+        "runtime": {
+            "official_yaml": {
+                "task_oracle": {"bytes": 1, "path": "/oracle", "sha256": "e" * 64},
+                "validation_annotations": {"bytes": 1, "path": "/annotations", "sha256": "f" * 64},
+            },
+            "sources": EVALUATOR._IMPORT_EVALUATOR_SOURCE_IDENTITIES,
+        },
+    }
+    monkeypatch.setattr(EVALUATOR, "build_official_attestation", lambda *_args, **_kwargs: attestation)
+    monkeypatch.setattr(EVALUATOR, "regenerate_official_sequences", lambda _seed: [({"initial": 0}, TASKS)])
+    output_dir.parent.mkdir()
+    claims_root = output_dir.parent.parent / f"claims-{output_dir.name}"
+    claims_root.mkdir()
+    roots = EVALUATOR.capture_official_output_roots(output_dir.parent.resolve(), claims_root.resolve())
+    token_sha256 = hashlib.sha256(b"frozen").hexdigest()
+    output_claim = EVALUATOR.derive_output_claim(output_dir.name, roots, token_sha256)
+    monkeypatch.setattr(
+        EVALUATOR,
+        "load_preregistration",
+        lambda *_args, **_kwargs: (
+            {
+                "final_freeze_token_sha256": token_sha256,
+                "official_output_roots": roots,
+                "policy_warmup_calls": EVALUATOR.DEFAULT_POLICY_WARMUP_CALLS,
+            },
+            {"cell_id": output_dir.name, "output_claim": output_claim},
+            "a" * 64,
+        ),
+    )
+    monkeypatch.setattr(EVALUATOR, "load_validation_annotations", lambda _identity: (ANNOTATIONS, {"sha256": "f" * 64}))
+
+
+def _official_score_args(output_dir: Path) -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        cell_id=output_dir.name,
+        dataset_root=Path("/dataset"),
+        evaluation_seed=0,
+        execution_horizon=4,
+        final_freeze_token="frozen",
+        output_dir=output_dir,
+        policy_timeout_seconds=1.0,
+        policy_warmup_calls=EVALUATOR.DEFAULT_POLICY_WARMUP_CALLS,
+        preregistration_manifest=Path("/preregistration.json"),
+        preregistration_sha256="a" * 64,
+        socket=Path("/policy.sock"),
+        source_root=Path("/source"),
+    )
+
+
+def test_existing_output_directory_prevents_any_policy_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "runs" / "existing"
+    _stub_official_setup_before_policy(monkeypatch, output_dir)
+    output_dir.mkdir()
+    connections = 0
+
+    def forbidden_client(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal connections
+        connections += 1
+        raise AssertionError("policy connection occurred before output ownership")
+
+    monkeypatch.setattr(EVALUATOR, "PolicyClient", forbidden_client)
+    with pytest.raises(FileExistsError):
+        EVALUATOR.run_official_score_mode(_official_score_args(output_dir))
+    assert connections == 0
+
+
+def test_alternate_output_directory_is_rejected_before_policy_or_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical_output = tmp_path / "runs" / "canonical"
+    _stub_official_setup_before_policy(monkeypatch, canonical_output)
+    calls = 0
+
+    def forbidden_client(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("alternate output reached policy")
+
+    monkeypatch.setattr(EVALUATOR, "PolicyClient", forbidden_client)
+    args = _official_score_args(canonical_output)
+    args.output_dir = tmp_path / "alternate"
+    with pytest.raises(RuntimeError, match="canonical output directory"):
+        EVALUATOR.run_official_score_mode(args)
+    assert calls == 0
+    assert not canonical_output.exists()
+    assert not any((tmp_path / "claims-canonical").iterdir())
+
+
+def test_failed_attempt_cannot_be_replaced_and_surviving_claim_blocks_deleted_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "runs" / "one-attempt"
+    _stub_official_setup_before_policy(monkeypatch, output_dir)
+    connections = 0
+
+    class FailingClient:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            nonlocal connections
+            connections += 1
+
+        def __enter__(self) -> Any:
+            raise RuntimeError("first attempt failed")
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+    monkeypatch.setattr(EVALUATOR, "PolicyClient", FailingClient)
+    args = _official_score_args(output_dir)
+    with pytest.raises(RuntimeError, match="first attempt failed"):
+        EVALUATOR.run_official_score_mode(args)
+    claim_path = tmp_path / "claims-one-attempt" / "one-attempt.json"
+    claim_before = claim_path.read_bytes()
+
+    with pytest.raises(FileExistsError):
+        EVALUATOR.run_official_score_mode(args)
+    assert connections == 1
+    assert claim_path.read_bytes() == claim_before
+
+    shutil.rmtree(output_dir)
+    with pytest.raises(FileExistsError):
+        EVALUATOR.run_official_score_mode(args)
+    assert connections == 1
+    assert claim_path.read_bytes() == claim_before
+    replacement = json.loads((output_dir / "run.json").read_text())
+    assert replacement["status"] == "failed"
+
+
+def test_output_root_identity_drift_is_rejected_before_policy_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "runs" / "drift"
+    _stub_official_setup_before_policy(monkeypatch, output_dir)
+    claim_root = tmp_path / "claims-drift"
+    claim_root.rename(tmp_path / "claims-drift-original")
+    claim_root.mkdir()
+    connections = 0
+
+    def forbidden_client(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal connections
+        connections += 1
+        raise AssertionError("root drift reached policy")
+
+    monkeypatch.setattr(EVALUATOR, "PolicyClient", forbidden_client)
+    with pytest.raises(RuntimeError, match="root identity drifted"):
+        EVALUATOR.run_official_score_mode(_official_score_args(output_dir))
+    assert connections == 0
+    assert not output_dir.exists()
+
+
+def test_policy_connection_failure_leaves_a_durable_failed_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "runs" / "failed-attempt"
+    _stub_official_setup_before_policy(monkeypatch, output_dir)
+
+    class FailingClient:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> Any:
+            raise RuntimeError("simulated policy connection failure")
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+    monkeypatch.setattr(EVALUATOR, "PolicyClient", FailingClient)
+    with pytest.raises(RuntimeError, match="simulated policy connection failure"):
+        EVALUATOR.run_official_score_mode(_official_score_args(output_dir))
+
+    run = json.loads((output_dir / "run.json").read_text())
+    assert run["status"] == "failed"
+    assert run["sequence_records"] == 0
+    assert run["policy_warmup"] == {
+        "attempted_count": 0,
+        "completed_count": 0,
+        "current_request": None,
+        "expected_count": EVALUATOR.DEFAULT_POLICY_WARMUP_CALLS,
+        "included_in_episode_latency": False,
+        "reports": [],
+        "status": "pending",
+    }
+    assert (output_dir / "episodes.jsonl").read_bytes() == b""
+
+
+def test_journal_start_failure_after_directory_claim_records_failed_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "failed-start"
+    journal = EVALUATOR.EvaluationJournal(output_dir, {"schema": EVALUATOR.RUN_SCHEMA})
+    original_write = EVALUATOR.write_json_atomic
+    writes = 0
+
+    def fail_after_first_publication(path: Path, value: dict[str, Any]) -> dict[str, Any]:
+        nonlocal writes
+        writes += 1
+        identity = original_write(path, value)
+        if writes == 1:
+            raise RuntimeError("simulated post-claim start failure")
+        return identity
+
+    monkeypatch.setattr(EVALUATOR, "write_json_atomic", fail_after_first_publication)
+    with pytest.raises(RuntimeError, match="simulated post-claim start failure"):
+        journal.start()
+
+    run = json.loads((output_dir / "run.json").read_text())
+    assert run["status"] == "failed"
+    assert run["error"]["type"] == "RuntimeError"
+    assert "simulated post-claim start failure" in run["error"]["message"]
+    assert run["sequence_records"] == 0
+    assert not (output_dir / "episodes.jsonl").exists()
+
+
+def test_failed_warmup_dispatch_records_intent_before_predict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "runs" / "failed-warmup"
+    _stub_official_setup_before_policy(monkeypatch, output_dir)
+
+    class BrokenClient:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def health(self) -> dict[str, Any]:
+            return {}
+
+        def predict(self, **_kwargs: Any) -> Any:
+            raise TimeoutError("simulated warm-up timeout")
+
+    monkeypatch.setattr(EVALUATOR, "PolicyClient", BrokenClient)
+    monkeypatch.setattr(EVALUATOR, "validate_policy_health", lambda *_args, **_kwargs: _health())
+    with pytest.raises(TimeoutError, match="simulated warm-up timeout"):
+        EVALUATOR.run_official_score_mode(_official_score_args(output_dir))
+
+    run = json.loads((output_dir / "run.json").read_text())
+    assert run["status"] == "failed"
+    assert run["policy_warmup"]["attempted_count"] == 1
+    assert run["policy_warmup"]["completed_count"] == 0
+    assert run["policy_warmup"]["current_request"]["warmup_index"] == 0
+    assert run["policy_warmup"]["current_request"]["replan_idx"] == EVALUATOR.POLICY_WARMUP_REPLAN_BASE
+
+
+def test_second_warmup_failure_preserves_first_report_and_second_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "runs" / "failed-second-warmup"
+    _stub_official_setup_before_policy(monkeypatch, output_dir)
+
+    class SecondWarmupFails(FakePolicyClient):
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def health(self) -> dict[str, Any]:
+            return {}
+
+        def predict(self, **kwargs: Any) -> tuple[np.ndarray, dict[str, Any]]:
+            self.attempts += 1
+            if self.attempts == 2:
+                raise TimeoutError("simulated second warm-up timeout")
+            return super().predict(**kwargs)
+
+    monkeypatch.setattr(EVALUATOR, "PolicyClient", SecondWarmupFails)
+    monkeypatch.setattr(EVALUATOR, "validate_policy_health", lambda *_args, **_kwargs: _health())
+    with pytest.raises(TimeoutError, match="simulated second warm-up timeout"):
+        EVALUATOR.run_official_score_mode(_official_score_args(output_dir))
+
+    run = json.loads((output_dir / "run.json").read_text())
+    warmup = run["policy_warmup"]
+    assert run["status"] == "failed"
+    assert warmup["attempted_count"] == 2
+    assert warmup["completed_count"] == 1
+    assert len(warmup["reports"]) == 1
+    assert warmup["reports"][0]["warmup_index"] == 0
+    assert warmup["current_request"]["warmup_index"] == 1
+    assert warmup["current_request"]["replan_idx"] == EVALUATOR.POLICY_WARMUP_REPLAN_BASE + 1
+
+
+def test_official_orchestration_warms_policy_before_oracle_environment_and_episodes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "runs" / "ordered"
+    _stub_official_setup_before_policy(monkeypatch, output_dir)
+    monkeypatch.setattr(EVALUATOR, "NUM_SEQUENCES", 1)
+    events: list[str] = []
+    health = {"nfe": 5, "objective": "rectified_flow", "sampler": "euler_uniform", "train_seed": 0}
+
+    class Client:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            events.append("connect")
+
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            events.append("disconnect")
+
+        def health(self) -> dict[str, Any]:
+            events.append("health")
+            return {}
+
+    def validate_health(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        events.append("validate-health")
+        return health
+
+    def warmups(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        events.extend(["warmup-0", "warmup-1"])
+        reports = [{"warmup_index": 0}, {"warmup_index": 1}]
+        kwargs["report_callback"](reports)
+        return {"count": 2, "included_in_episode_latency": False, "reports": reports}
+
+    def load_oracle(_identity: Any) -> tuple[object, dict[str, str]]:
+        events.append("oracle")
+        return object(), {"sha256": "e" * 64}
+
+    environment = object()
+
+    def construct_environment(*_args: Any, **_kwargs: Any) -> tuple[object, dict[str, Any]]:
+        events.append("environment")
+        return environment, {"scene": EVALUATOR.VALIDATION_SCENE}
+
+    def evaluate(*_args: Any, **kwargs: Any) -> list[dict[str, int]]:
+        events.append("episodes")
+        record = {"sequence_idx": 0}
+        kwargs["episode_callback"](record)
+        return [record]
+
+    monkeypatch.setattr(EVALUATOR, "PolicyClient", Client)
+    monkeypatch.setattr(EVALUATOR, "validate_policy_health", validate_health)
+    monkeypatch.setattr(EVALUATOR, "run_policy_warmups", warmups)
+    monkeypatch.setattr(EVALUATOR, "load_task_oracle", load_oracle)
+    monkeypatch.setattr(EVALUATOR, "construct_validation_environment", construct_environment)
+    monkeypatch.setattr(EVALUATOR, "evaluate_official_sequences", evaluate)
+    monkeypatch.setattr(EVALUATOR, "summarize_sequences", lambda _records: {"sequence_count": 1})
+    monkeypatch.setattr(EVALUATOR, "_close_environment", lambda _environment: events.append("close-environment"))
+    calvin_agent = types.ModuleType("calvin_agent")
+    evaluation = types.ModuleType("calvin_agent.evaluation")
+    utils = types.ModuleType("calvin_agent.evaluation.utils")
+    utils.get_env_state_for_initial_condition = object()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "calvin_agent", calvin_agent)
+    monkeypatch.setitem(sys.modules, "calvin_agent.evaluation", evaluation)
+    monkeypatch.setitem(sys.modules, "calvin_agent.evaluation.utils", utils)
+
+    result = EVALUATOR.run_official_score_mode(_official_score_args(output_dir))
+
+    assert result == {"sequence_count": 1}
+    assert events == [
+        "connect",
+        "health",
+        "validate-health",
+        "warmup-0",
+        "warmup-1",
+        "oracle",
+        "environment",
+        "episodes",
+        "close-environment",
+        "disconnect",
+    ]
+    run_bytes = (output_dir / "run.json").read_bytes()
+    run = json.loads(run_bytes)
+    assert run["status"] == "complete"
+    completion_path = output_dir / "completion.json"
+    completion = json.loads(completion_path.read_text())
+    assert completion["schema"] == EVALUATOR.COMPLETION_SCHEMA
+    assert completion["run_json_sha256"] == hashlib.sha256(run_bytes).hexdigest()
+    assert completion["claim_json_sha256"] == run["claim_json_sha256"]
+    assert completion_path.with_suffix(".json.sha256").read_text() == (
+        f"{hashlib.sha256(completion_path.read_bytes()).hexdigest()}  completion.json\n"
+    )
+
+
+def test_setup_failure_after_environment_construction_closes_and_demotes_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "runs" / "failed-environment-setup"
+    _stub_official_setup_before_policy(monkeypatch, output_dir)
+    environment = FakeEnvironment()
+
+    class Client:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def health(self) -> dict[str, Any]:
+            return {}
+
+    reports = [{"warmup_index": 0}, {"warmup_index": 1}]
+
+    def warmups(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        kwargs["report_callback"](reports)
+        return {"count": 2, "included_in_episode_latency": False, "reports": reports}
+
+    original_update = EVALUATOR.EvaluationJournal.update_running
+
+    def fail_environment_publication(
+        self: EVALUATOR.EvaluationJournal,
+        values: dict[str, Any],
+    ) -> None:
+        if "environment" in values:
+            raise RuntimeError("simulated environment setup journal failure")
+        original_update(self, values)
+
+    monkeypatch.setattr(EVALUATOR, "PolicyClient", Client)
+    monkeypatch.setattr(EVALUATOR, "validate_policy_health", lambda *_args, **_kwargs: _health())
+    monkeypatch.setattr(EVALUATOR, "run_policy_warmups", warmups)
+    monkeypatch.setattr(EVALUATOR, "load_task_oracle", lambda _identity: (object(), {"sha256": "e" * 64}))
+    monkeypatch.setattr(
+        EVALUATOR,
+        "construct_validation_environment",
+        lambda *_args, **_kwargs: (environment, {"scene": EVALUATOR.VALIDATION_SCENE}),
+    )
+    monkeypatch.setattr(EVALUATOR.EvaluationJournal, "update_running", fail_environment_publication)
+    calvin_agent = types.ModuleType("calvin_agent")
+    evaluation = types.ModuleType("calvin_agent.evaluation")
+    utils = types.ModuleType("calvin_agent.evaluation.utils")
+    utils.get_env_state_for_initial_condition = object()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "calvin_agent", calvin_agent)
+    monkeypatch.setitem(sys.modules, "calvin_agent.evaluation", evaluation)
+    monkeypatch.setitem(sys.modules, "calvin_agent.evaluation.utils", utils)
+
+    with pytest.raises(RuntimeError, match="simulated environment setup journal failure"):
+        EVALUATOR.run_official_score_mode(_official_score_args(output_dir))
+
+    run = json.loads((output_dir / "run.json").read_text())
+    assert environment.closed is True
+    assert run["status"] == "failed"
+    assert run["error"]["type"] == "RuntimeError"
+    assert "simulated environment setup journal failure" in run["error"]["message"]
 
 
 def test_infrastructure_mode_cannot_step_predict_or_query_oracle(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1030,6 +1661,25 @@ def test_journal_rejects_complete_run_inode_substitution_during_post_guard(
 def test_mode_arguments_make_official_score_opt_in() -> None:
     infrastructure = EVALUATOR.parse_args(["--mode", "infrastructure", "--dataset-root", "/dataset"])
     EVALUATOR.validate_mode_arguments(infrastructure)
+    assert infrastructure.policy_warmup_calls is None
+
+    scoring_argument = EVALUATOR.parse_args(
+        ["--mode", "infrastructure", "--dataset-root", "/dataset", "--policy-warmup-calls", "2"]
+    )
+    with pytest.raises(RuntimeError, match="must not receive policy warm-up"):
+        EVALUATOR.validate_mode_arguments(scoring_argument)
+
+    socket_argument = EVALUATOR.parse_args(
+        ["--mode", "infrastructure", "--dataset-root", "/dataset", "--socket", "/policy.sock"]
+    )
+    with pytest.raises(RuntimeError, match="must not receive a policy socket"):
+        EVALUATOR.validate_mode_arguments(socket_argument)
+
+    timeout_argument = EVALUATOR.parse_args(
+        ["--mode", "infrastructure", "--dataset-root", "/dataset", "--policy-timeout-seconds", "10"]
+    )
+    with pytest.raises(RuntimeError, match="must not receive a policy timeout"):
+        EVALUATOR.validate_mode_arguments(timeout_argument)
 
     missing_freeze = EVALUATOR.parse_args(
         [
@@ -1041,13 +1691,42 @@ def test_mode_arguments_make_official_score_opt_in() -> None:
             "4",
             "--output-dir",
             "/output",
+            "--socket",
+            "/policy.sock",
             "--preregistration-manifest",
             "/frozen.json",
             "--preregistration-sha256",
             "a" * 64,
             "--cell-id",
             "cell",
+            "--policy-warmup-calls",
+            "2",
         ]
     )
     with pytest.raises(RuntimeError, match="final-freeze-token"):
         EVALUATOR.validate_mode_arguments(missing_freeze)
+
+    missing_warmup = EVALUATOR.parse_args(
+        [
+            "--mode",
+            "official-score",
+            "--dataset-root",
+            "/dataset",
+            "--execution-horizon",
+            "4",
+            "--output-dir",
+            "/output",
+            "--socket",
+            "/policy.sock",
+            "--preregistration-manifest",
+            "/frozen.json",
+            "--preregistration-sha256",
+            "a" * 64,
+            "--cell-id",
+            "cell",
+            "--final-freeze-token",
+            "frozen",
+        ]
+    )
+    with pytest.raises(RuntimeError, match="policy warm-up calls"):
+        EVALUATOR.validate_mode_arguments(missing_warmup)

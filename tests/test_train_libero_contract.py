@@ -64,6 +64,79 @@ def test_libero_configs_pin_exact_fixed_batch_expert_execution() -> None:
         )
 
 
+def _dataset_snapshot_report() -> dict[str, object]:
+    return {
+        "content_inventory_sha256": TRAIN.LIBERO_DATASET_CONTENT_INVENTORY_SHA256,
+        "files_verified": TRAIN.LIBERO_DATASET_FILES_VERIFIED,
+        "revision": TRAIN.LIBERO_DATASET_REVISION,
+        "snapshot": f"/snapshot/{TRAIN.LIBERO_DATASET_REVISION}",
+        "total_bytes": TRAIN.LIBERO_DATASET_TOTAL_BYTES,
+        "tree_metadata_sha256": TRAIN.LIBERO_DATASET_TREE_SHA256,
+    }
+
+
+def test_libero_dataset_is_fully_authenticated_on_rank_zero_and_bound_on_every_rank(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[Path, str]] = []
+    broadcasts: list[object] = []
+    group = object()
+    report = _dataset_snapshot_report()
+    monkeypatch.setattr(TRAIN.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(TRAIN.dist, "new_group", lambda **kwargs: group)
+    monkeypatch.setattr(TRAIN.dist, "destroy_process_group", lambda observed: None)
+    monkeypatch.setattr(
+        TRAIN,
+        "verify_huggingface_snapshot",
+        lambda root, *, expected_revision: calls.append((root, expected_revision)) or report,
+    )
+    monkeypatch.setattr(
+        TRAIN.dist,
+        "broadcast_object_list",
+        lambda holder, *, src, group: broadcasts.append(copy.deepcopy(holder[0])),
+    )
+
+    observed = TRAIN._authenticate_dataset_snapshot_distributed(tmp_path)
+
+    assert observed == report
+    assert calls == [(tmp_path, TRAIN.LIBERO_DATASET_REVISION)]
+    assert broadcasts == [report]
+
+
+def test_libero_dataset_authentication_fails_closed_on_content_or_broadcast_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corrupted = _dataset_snapshot_report()
+    corrupted["content_inventory_sha256"] = "0" * 64
+    group = object()
+    monkeypatch.setattr(TRAIN.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(TRAIN.dist, "new_group", lambda **kwargs: group)
+    monkeypatch.setattr(TRAIN.dist, "destroy_process_group", lambda observed: None)
+    monkeypatch.setattr(TRAIN, "verify_huggingface_snapshot", lambda *_args, **_kwargs: corrupted)
+    monkeypatch.setattr(TRAIN.dist, "broadcast_object_list", lambda _holder, *, src, group: None)
+    with pytest.raises(RuntimeError, match="dataset authentication failed"):
+        TRAIN._authenticate_dataset_snapshot_distributed(tmp_path)
+
+    monkeypatch.setattr(TRAIN.dist, "get_rank", lambda: 1)
+
+    def inject_corrupt_broadcast(holder: list[object], *, src: int, group: object) -> None:
+        holder[0] = corrupted
+
+    monkeypatch.setattr(TRAIN.dist, "broadcast_object_list", inject_corrupt_broadcast)
+    with pytest.raises(RuntimeError, match="broadcast LIBERO dataset identity"):
+        TRAIN._authenticate_dataset_snapshot_distributed(tmp_path)
+
+
+def test_libero_trainer_authenticates_dataset_before_constructing_parquet_reader() -> None:
+    source = (PROJECT_ROOT / "scripts/train_libero.py").read_text(encoding="utf-8")
+    main_source = source[source.index("def main()") :]
+    assert main_source.index("_authenticate_dataset_snapshot_distributed(args.snapshot_root)") < main_source.index(
+        "LiberoParquetDataset(args.snapshot_root"
+    )
+
+
 def _set_canonical_train_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in tuple(TRAIN.os.environ):
         if name.startswith(TRAIN._ALGORITHM_ENVIRONMENT_PREFIXES):
@@ -72,7 +145,35 @@ def _set_canonical_train_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
     for name, value in TRAIN.REQUIRED_TRAIN_ENVIRONMENT.items():
         monkeypatch.setenv(name, value)
-    monkeypatch.setenv("PYTHONPATH", str(PROJECT_ROOT / "src"))
+    monkeypatch.setenv("DUO_VLA_CACHE_ROOT", "/root/.cache/duo-vla")
+    monkeypatch.setenv("DUO_VLA_PROJECT_ROOT", str(PROJECT_ROOT))
+    monkeypatch.setenv("DUO_VLA_TRAIN_VENV", "/root/.cache/duo-vla/venvs/train")
+    monkeypatch.setenv("HF_HOME", "/root/.cache/huggingface")
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.setattr(TRAIN.sys, "prefix", "/root/.cache/duo-vla/venvs/train")
+    monkeypatch.setattr(TRAIN.site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(
+        TRAIN.sys,
+        "flags",
+        SimpleNamespace(dont_write_bytecode=1, no_user_site=1, safe_path=1),
+    )
+    monkeypatch.setattr(TRAIN.sys, "dont_write_bytecode", True)
+    monkeypatch.setattr(TRAIN.sys, "pycache_prefix", "/dev/null")
+    version = f"python{TRAIN.sys.version_info.major}.{TRAIN.sys.version_info.minor}"
+    compact_version = f"python{TRAIN.sys.version_info.major}{TRAIN.sys.version_info.minor}"
+    monkeypatch.setattr(
+        TRAIN.sys,
+        "path",
+        [
+            str(PROJECT_ROOT / "src"),
+            str(Path(TRAIN.sys.base_prefix) / "lib" / f"{compact_version}.zip"),
+            str(Path(TRAIN.sys.base_prefix) / "lib" / version),
+            str(Path(TRAIN.sys.base_exec_prefix) / "lib" / version / "lib-dynload"),
+            f"/root/.cache/duo-vla/venvs/train/lib/{version}/site-packages",
+        ],
+    )
+    monkeypatch.setattr(TRAIN, "content_address_train_venv", lambda _root: {"root_sha256": "a" * 64})
 
 
 def test_libero_training_runtime_enables_strict_determinism_and_rejects_nccl_override(
@@ -86,7 +187,9 @@ def test_libero_training_runtime_enables_strict_determinism_and_rejects_nccl_ove
 
     assert calls == [TRAIN.torch]
     assert report["environment"]["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
-    assert report["environment"]["PYTHONPATH"] == str(PROJECT_ROOT / "src")
+    assert "PYTHONPATH" not in report["environment"]
+    assert report["static_environment_sha256"] == TRAIN.static_environment_identity(report["environment"])["sha256"]
+    assert report["train_venv"] == {"root_sha256": "a" * 64}
     assert report["algorithm_override_environment"] == {}
     assert report["nccl_environment"] == {}
 
@@ -109,15 +212,19 @@ def test_canonical_libero_training_launcher_pins_numeric_runtime_and_scrubs_nccl
     source = (PROJECT_ROOT / "scripts/run_libero_train.sh").read_text(encoding="utf-8")
 
     assert "--nproc-per-node=2" in source
-    assert 'export CUBLAS_WORKSPACE_CONFIG=":4096:8"' in source
-    assert 'export CUDA_DEVICE_ORDER="PCI_BUS_ID"' in source
-    assert 'export CUDA_VISIBLE_DEVICES="0,1"' in source
-    assert 'export PYTHONHASHSEED="${train_seed}"' in source
-    assert 'export TORCH_NCCL_ASYNC_ERROR_HANDLING="1"' in source
-    assert 'export PYTHONPATH="${project_dir}/src"' in source
+    assert "exec /usr/bin/env -i" in source
+    assert '"CUBLAS_WORKSPACE_CONFIG=:4096:8"' in source
+    assert '"CUDA_DEVICE_ORDER=PCI_BUS_ID"' in source
+    assert '"CUDA_VISIBLE_DEVICES=0,1"' in source
+    assert '"PYTHONHASHSEED=${train_seed}"' in source
+    assert '"PYTHONSAFEPATH=1"' in source
+    assert '"PYTHONDONTWRITEBYTECODE=1"' in source
+    assert '"TORCH_NCCL_ASYNC_ERROR_HANDLING=1"' in source
+    assert "PYTHONPATH" not in source
+    assert '"PYTHONPYCACHEPREFIX=/dev/null"' in source
+    assert "-P -B -X pycache_prefix=/dev/null" in source
     assert "${PYTHONPATH:+" not in source
-    assert "CUBLAS_*|CUDA_*|CUDNN_*|NCCL_*|PYTORCH_*|TORCH_*" in source
-    assert "unset LD_LIBRARY_PATH LD_PRELOAD PYTHONHOME PYTHONINSPECT PYTHONSTARTUP" in source
+    assert '"LANG=C.UTF-8"' in source and '"LC_ALL=C.UTF-8"' in source and '"TZ=UTC"' in source
 
 
 @pytest.mark.parametrize(
@@ -189,6 +296,20 @@ def test_libero_trainer_rejects_off_contract_interface_and_lora_hyperparameters(
     monkeypatch.setattr(TRAIN.dist, "get_world_size", lambda: 2)
 
     with pytest.raises(ValueError, match=f"{section}.{field}"):
+        TRAIN._validate_and_build_interface_config(config)
+
+
+def test_libero_checkpoint_retention_interval_must_be_a_positive_checkpoint_multiple(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_resolved_toml(PROJECT_ROOT / "configs/libero.toml")
+    monkeypatch.setattr(TRAIN.dist, "get_world_size", lambda: 2)
+
+    assert config["training"]["checkpoint_interval"] == 1000
+    assert config["training"]["permanent_checkpoint_interval"] == 5000
+    TRAIN._validate_and_build_interface_config(config)
+    config["training"]["permanent_checkpoint_interval"] = 1500
+    with pytest.raises(ValueError, match="positive multiple"):
         TRAIN._validate_and_build_interface_config(config)
 
 
@@ -277,3 +398,23 @@ def test_processor_path_requires_exact_b8_and_fixed_authenticated_width() -> Non
     }
     with pytest.raises(ValueError, match="requires physical batch 8"):
         TRAIN._processor_inputs(processor, samples[:-1], torch.device("cpu"), contract)
+
+
+def test_libero_checkpoint_manifest_binds_parent_and_retention_uses_authenticated_config() -> None:
+    source = (PROJECT_ROOT / "scripts/train_libero.py").read_text(encoding="utf-8")
+    parent = {
+        "relative_path": "checkpoints/update-001000",
+        "update": 1000,
+    }
+
+    assert '"checkpoint_retention": make_checkpoint_retention_contract(' in source
+    assert "retention = apply_checkpoint_retention(output_dir)" in source
+    assert "apply_checkpoint_retention(\n" not in source
+    assert '"manifest_sha256": parent_manifest_sha256' not in source
+    assert (
+        TRAIN.make_checkpoint_retention_contract(
+            permanent_checkpoint_interval=5000,
+            parent_checkpoint=parent,
+        )["parent_checkpoint"]
+        == parent
+    )

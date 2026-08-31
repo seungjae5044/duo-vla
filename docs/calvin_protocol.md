@@ -116,7 +116,7 @@ actions over local IPC. Source-only preflight, infrastructure checks, and scorin
 `run_official_evaluator.sh` `env -i` Python 3.8.20 contract; its fixed CUDA/EGL ordinal and headless renderer settings
 were qualified by the real source-only EGL smoke and have no fallback. This is the sole supported launcher and an
 ordinary direct Python invocation fails closed, though it is not an OS-level prohibition on manually reconstructing
-the identical closed environment. The repository's evaluator, v6 pre-registration
+the identical closed environment. The repository's evaluator, v8 pre-registration
 creator, and official aggregator CLIs implement the frozen protocol contract. The remaining operational work is obtaining sufficient external storage, downloading and
 authenticating ABC_D, and executing the real runs; it does not require replacing the supplied CLI contract.
 
@@ -134,7 +134,7 @@ constructing Hydra/OmegaConf, the oracle, or the environment, it verifies clean 
 and TACTO checkouts; exact module origins and all pinned package versions; Python/platform/runtime identity; fixed raw
 hashes for the validation-language and oracle YAML; the dataset v4 archive-direct manifest, exact v2 member-index
 schema/hash/metadata and every canonical row, the pinned live central directory/ZIP64 trailer, and current D projected
-metadata bytes; and raw hashes of the evaluator, IPC bridge, and preflight sources. The v6 frozen pre-registration
+metadata bytes; and raw hashes of the evaluator, IPC bridge, and preflight sources. The v8 frozen pre-registration
 contains this attestation hash, the raw official-aggregator hash, and the exact Python 3.8.20 aggregation runtime; its
 own raw file hash is supplied independently on the command line. Aggregation snapshots all four local source files
 before importing evaluator code, rejects end-of-run drift, and requires each run-attested source identity to match that
@@ -143,13 +143,31 @@ validation config are parsed directly from the stable authenticated bytes rather
 aggregator reloads the authenticated validation-language YAML and accepts only the exact first phrase for every
 recorded subtask instruction. Journal and exclusive payload/sidecar commit guards reopen targets without following
 symlinks and bind the created inode, exact bytes, and link count before and after the guard; target-entry substitution
-therefore fails the publication, and a completed journal is downgraded to failed. The selected cell also freezes
-`serving_runtime_sha256` and the exact execution-geometry
-object, which the evaluator compares with live policy health before any prediction.
+therefore fails the publication, and a completed journal is downgraded to failed. All 24 cells freeze one common
+evaluation-only `serving_runtime_sha256` (runtime schema v5) and one exact execution-geometry object, which the evaluator
+compares with live policy health before any prediction. The serving runtime binds current software, deterministic
+settings, driver, and physical devices; the selected checkpoint separately retains its authenticated training-runtime
+identity.
 Policy IPC v4 additionally carries the exact 15-field normalization `dataset` identity as nested `calvin_identity`;
 official scoring and final aggregation compare it byte-for-byte with the runtime/data attestation and reject any
 flat normalization-metadata mismatch.
 Any mismatch is a benchmark-blocking failure, not a warning.
+
+Official scoring explicitly selects the pre-registered warm-up count (two by default and at least one). The v8
+pre-registration binds dedicated canonical run/claim roots by absolute path and device/inode and derives every cell's
+only valid run directory and external claim path. Before constructing a policy client, scoring exclusively creates the
+run directory and immutable claim/sidecar. A collision permanently consumes the attempt even if its run directory is
+later deleted. The evaluator durably records partial setup and warm-up progress, and
+uses reserved replan indices beginning at 360 so warm-up requests cannot collide with scored request identities.
+Each request intent is committed before dispatch and its completed report is committed afterward. Synthetic warm-up
+outputs are discarded and excluded from episode latency. Aggregation requires their action hashes
+to be bitwise identical across the paired K=1/K=4 cells for each seed/objective/NFE and recomputes episode-only latency
+and throughput from the raw sequence records.
+
+A successful cell ends only when an exclusive completion JSON/sidecar binds the claim, final run, episodes, summary,
+pre-registration, cell, and 1,000-record count. Inventory v3 contains raw hashes but no caller-selected paths.
+Aggregation derives all paths from pre-registration, requires exact 24-directory and 48-file root inventories, rejects
+running/failed/missing-marker attempts and linked or extra paths, and publishes matrix-summary v5.
 
 Required gates include checksum/split/schema assertions, one-command scaling and gripper polarity, no input mutation,
 offline-vs-rollout observation parity, half-open annotation chunking, absence of `scene_obs` from RPC, fixed sequence

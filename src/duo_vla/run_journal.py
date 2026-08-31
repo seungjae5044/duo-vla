@@ -17,15 +17,24 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from duo_vla.run_config import load_verified_resolved_config
+
 RUN_JOURNAL_FILENAME = "run_journal.json"
 RUN_JOURNAL_SCHEMA = "duo-vla-run-journal-v1"
 RECOVERY_QUARANTINE_DIRNAME = "recovery_quarantine"
 RECOVERY_QUARANTINE_SCHEMA = "duo-vla-recovery-quarantine-v1"
+CHECKPOINT_RETENTION_DIRNAME = "checkpoint_retention"
+CHECKPOINT_RETIREMENT_SCHEMA = "duo-vla-checkpoint-retirement-v1"
+CHECKPOINT_RETENTION_CONTRACT_SCHEMA = "duo-vla-checkpoint-retention-contract-v1"
+CHECKPOINT_RETIRED_MANIFEST_FILENAME = "checkpoint-manifest.json"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _CHECKPOINT_DIRECTORY = re.compile(r"update-([0-9]{6,})")
+_RETIREMENT_DIRECTORY = re.compile(r"retire-update-([0-9]{6,})-([0-9a-f]{32})")
 _RANK_STATE_DIRECTORY = re.compile(r"\.rank-state-update-([0-9]{6,})")
 _RESOLVED_CONFIG_TEMP = re.compile(r"\.resolved_config\.json\.tmp-[0-9]+")
 _RUN_JOURNAL_TEMP = re.compile(r"\.run_journal\.json\.tmp-[0-9a-f]{32}")
+_RETIREMENT_MANIFEST_TEMP = re.compile(r"\.retirement\.json\.tmp-[0-9a-f]{32}")
+_RETIRED_CHECKPOINT_MANIFEST_TEMP = re.compile(r"\.checkpoint-manifest\.json\.tmp-[0-9a-f]{32}")
 _JOURNAL_KEYS = {"schema", "run_uuid", "config_sha256", "latest_checkpoint"}
 _CHECKPOINT_KEYS = {
     "relative_path",
@@ -34,6 +43,26 @@ _CHECKPOINT_KEYS = {
     "parent_manifest_sha256",
     "last_metrics",
 }
+_RETIREMENT_KEYS = {
+    "schema",
+    "status",
+    "run_uuid",
+    "config_sha256",
+    "checkpoint",
+    "authorized_tip",
+    "directory_device",
+    "directory_inode",
+    "permanent_checkpoint_interval",
+}
+_RETENTION_CONTRACT_KEYS = {"schema", "permanent_checkpoint_interval", "parent_checkpoint"}
+_RETENTION_PARENT_KEYS = {"relative_path", "update"}
+_DIRECTORY_OPEN_FLAGS = (
+    os.O_RDONLY
+    | os.O_NONBLOCK
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
 
 
 @dataclass(frozen=True)
@@ -98,6 +127,18 @@ class RecoveryQuarantine:
     @property
     def changed(self) -> bool:
         return bool(self.moved_paths)
+
+
+@dataclass(frozen=True)
+class CheckpointRetention:
+    """Result of recovering and enforcing bounded checkpoint retention."""
+
+    retired_paths: tuple[str, ...]
+    recovered_transactions: tuple[str, ...]
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.retired_paths or self.recovered_transactions)
 
 
 def _require_sha256(value: object, *, name: str, allow_none: bool = False) -> str | None:
@@ -412,6 +453,12 @@ def record_latest_checkpoint(
     previous = journal.latest_checkpoint
     if previous == record:
         return journal
+    if "checkpoint_retention" in manifest:
+        _retention_contract_from_manifest(
+            manifest,
+            expected_parent=previous,
+            expected_interval=_authenticated_retention_interval(output.resolve(), journal),
+        )
     expected_parent = None if previous is None else previous.manifest_sha256
     if checked_parent_sha != expected_parent:
         raise ValueError("checkpoint parent SHA does not match the journal latest checkpoint")
@@ -465,6 +512,895 @@ def validate_resume_checkpoint(
 
     record, _ = _validate_resume_checkpoint(Path(output_dir), selected_checkpoint)
     return record
+
+
+def _require_positive_interval(value: object, *, name: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _checkpoint_relative_path(update: int) -> str:
+    return f"checkpoints/update-{update:06d}"
+
+
+def _retention_parent_from_dict(value: object) -> dict[str, str | int]:
+    if not isinstance(value, dict) or set(value) != _RETENTION_PARENT_KEYS:
+        raise ValueError("checkpoint retention parent has an unsupported schema")
+    update = _require_update(value["update"], name="checkpoint retention parent update")
+    relative_path = _require_relative_path(value["relative_path"])
+    if relative_path != _checkpoint_relative_path(update):
+        raise ValueError("checkpoint retention parent path is not canonical for its update")
+    return {
+        "relative_path": relative_path,
+        "update": update,
+    }
+
+
+def make_checkpoint_retention_contract(
+    *,
+    permanent_checkpoint_interval: int,
+    parent_checkpoint: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Build the manifest contract that authenticates the checkpoint parent.
+
+    The returned value is embedded in the immutable child checkpoint manifest.
+    It preserves enough information to prove whether a missing parent was
+    eligible for retirement after its directory has been removed.
+    """
+
+    interval = _require_positive_interval(
+        permanent_checkpoint_interval,
+        name="permanent_checkpoint_interval",
+    )
+    parent = None if parent_checkpoint is None else _retention_parent_from_dict(dict(parent_checkpoint))
+    return {
+        "schema": CHECKPOINT_RETENTION_CONTRACT_SCHEMA,
+        "permanent_checkpoint_interval": interval,
+        "parent_checkpoint": parent,
+    }
+
+
+def _retention_contract_from_manifest(
+    manifest: Mapping[str, Any],
+    *,
+    expected_parent: CheckpointRecord | None,
+    expected_interval: int | None = None,
+    validate_parent: bool = True,
+) -> dict[str, Any]:
+    value = manifest.get("checkpoint_retention")
+    if not isinstance(value, dict) or set(value) != _RETENTION_CONTRACT_KEYS:
+        raise ValueError("checkpoint manifest has no exact checkpoint retention contract")
+    if value["schema"] != CHECKPOINT_RETENTION_CONTRACT_SCHEMA:
+        raise ValueError("checkpoint manifest retention contract schema is unsupported")
+    interval = _require_positive_interval(
+        value["permanent_checkpoint_interval"],
+        name="checkpoint manifest permanent_checkpoint_interval",
+    )
+    if expected_interval is not None and interval != expected_interval:
+        raise ValueError("checkpoint manifest retention interval differs from the authenticated resolved config")
+    parent_value = value["parent_checkpoint"]
+    parent = None if parent_value is None else _retention_parent_from_dict(parent_value)
+    expected = (
+        None
+        if expected_parent is None
+        else {
+            "relative_path": expected_parent.relative_path,
+            "update": expected_parent.update,
+        }
+    )
+    if validate_parent and parent != expected:
+        raise ValueError("checkpoint manifest retention parent differs from the run-journal parent")
+    return {
+        "schema": CHECKPOINT_RETENTION_CONTRACT_SCHEMA,
+        "permanent_checkpoint_interval": interval,
+        "parent_checkpoint": parent,
+    }
+
+
+def _authenticated_retention_interval(output: Path, journal: RunJournal) -> int:
+    config, _ = load_verified_resolved_config(
+        output / "resolved_config.json",
+        expected_sha256=journal.config_sha256,
+    )
+    training = config.get("training")
+    if not isinstance(training, dict):
+        raise ValueError("authenticated resolved config has no training table")
+    checkpoint_interval = _require_positive_interval(
+        training.get("checkpoint_interval"),
+        name="training.checkpoint_interval",
+    )
+    permanent_interval = _require_positive_interval(
+        training.get("permanent_checkpoint_interval"),
+        name="training.permanent_checkpoint_interval",
+    )
+    if permanent_interval % checkpoint_interval:
+        raise ValueError("authenticated permanent checkpoint interval must be a multiple of checkpoint_interval")
+    return permanent_interval
+
+
+def _retirement_manifest_from_dict(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != _RETIREMENT_KEYS:
+        raise ValueError("checkpoint retirement manifest has an unsupported schema")
+    if value["schema"] != CHECKPOINT_RETIREMENT_SCHEMA:
+        raise ValueError("unsupported checkpoint retirement schema version")
+    if value["status"] not in {"planned", "moved", "complete"}:
+        raise ValueError("checkpoint retirement status is invalid")
+    run_uuid = _require_uuid(value["run_uuid"])
+    config_sha256 = _require_sha256(value["config_sha256"], name="retirement config_sha256")
+    checkpoint = _checkpoint_record_from_dict(value["checkpoint"])
+    authorized_tip = _checkpoint_record_from_dict(value["authorized_tip"])
+    permanent_checkpoint_interval = _require_positive_interval(
+        value["permanent_checkpoint_interval"],
+        name="retirement permanent_checkpoint_interval",
+    )
+    device = value["directory_device"]
+    inode = value["directory_inode"]
+    if type(device) is not int or device < 0 or type(inode) is not int or inode <= 0:
+        raise ValueError("checkpoint retirement directory identity is invalid")
+    assert isinstance(config_sha256, str)
+    return {
+        "schema": CHECKPOINT_RETIREMENT_SCHEMA,
+        "status": value["status"],
+        "run_uuid": run_uuid,
+        "config_sha256": config_sha256,
+        "checkpoint": checkpoint,
+        "authorized_tip": authorized_tip,
+        "directory_device": device,
+        "directory_inode": inode,
+        "permanent_checkpoint_interval": permanent_checkpoint_interval,
+    }
+
+
+def _retirement_manifest_to_dict(value: Mapping[str, Any], *, status: str | None = None) -> dict[str, Any]:
+    checkpoint = value["checkpoint"]
+    authorized_tip = value["authorized_tip"]
+    if not isinstance(checkpoint, CheckpointRecord) or not isinstance(authorized_tip, CheckpointRecord):
+        raise TypeError("checkpoint retirement records are invalid")
+    result = {
+        "schema": CHECKPOINT_RETIREMENT_SCHEMA,
+        "status": value["status"] if status is None else status,
+        "run_uuid": value["run_uuid"],
+        "config_sha256": value["config_sha256"],
+        "checkpoint": checkpoint.to_dict(),
+        "authorized_tip": authorized_tip.to_dict(),
+        "directory_device": value["directory_device"],
+        "directory_inode": value["directory_inode"],
+        "permanent_checkpoint_interval": value["permanent_checkpoint_interval"],
+    }
+    return _retirement_manifest_from_dict(result) | {
+        "checkpoint": checkpoint,
+        "authorized_tip": authorized_tip,
+    }
+
+
+def _write_retirement_manifest(path: Path, value: Mapping[str, Any], *, exclusive: bool) -> None:
+    serialized = _retirement_manifest_to_dict(value)
+    payload = {
+        **serialized,
+        "checkpoint": serialized["checkpoint"].to_dict(),
+        "authorized_tip": serialized["authorized_tip"].to_dict(),
+    }
+    _atomic_write(
+        path,
+        _canonical_json_bytes(payload),
+        exclusive=exclusive,
+        mode=_file_mode(path, default=0o600),
+    )
+
+
+def _read_retirement_manifest(path: Path) -> dict[str, Any]:
+    try:
+        data = _read_private_regular_file(path, context="checkpoint retirement manifest")
+    except FileNotFoundError:
+        raise
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"checkpoint retirement manifest is not UTF-8: {path}") from exc
+    return _retirement_manifest_from_dict(_parse_json(text, source=str(path)))
+
+
+def _validate_retirement_transaction_entries(transaction: Path) -> None:
+    allowed_names = {"retirement.json", CHECKPOINT_RETIRED_MANIFEST_FILENAME, "checkpoint"}
+    for child in transaction.iterdir():
+        if child.name in allowed_names:
+            continue
+        if (
+            _RETIREMENT_MANIFEST_TEMP.fullmatch(child.name) is None
+            and _RETIRED_CHECKPOINT_MANIFEST_TEMP.fullmatch(child.name) is None
+        ):
+            raise ValueError(f"checkpoint retirement transaction contains an unknown entry: {child}")
+        observed = os.lstat(child)
+        if not stat.S_ISREG(observed.st_mode):
+            raise ValueError(f"checkpoint retirement temporary is not a regular file: {child}")
+
+
+def _real_directory_stat(path: Path, *, context: str) -> os.stat_result:
+    try:
+        observed = os.lstat(path)
+    except OSError as exc:
+        raise ValueError(f"cannot inspect {context}: {path}: {exc}") from exc
+    if not stat.S_ISDIR(observed.st_mode):
+        raise ValueError(f"{context} is not a real directory: {path}")
+    return observed
+
+
+def _checkpoint_record_at(
+    output: Path,
+    checkpoint_dir: Path,
+    *,
+    journal: RunJournal,
+    expected_manifest_sha256: str | None = None,
+) -> tuple[CheckpointRecord, os.stat_result]:
+    directory_stat = _real_directory_stat(checkpoint_dir, context="checkpoint retirement source")
+    try:
+        relative = checkpoint_dir.relative_to(output).as_posix()
+    except ValueError as exc:  # pragma: no cover - caller constructs contained paths
+        raise ValueError("checkpoint retirement source escapes the run directory") from exc
+    match = _CHECKPOINT_DIRECTORY.fullmatch(checkpoint_dir.name)
+    if checkpoint_dir.parent != output / "checkpoints" or match is None:
+        raise ValueError("checkpoint retirement source is not a canonical checkpoint directory")
+    manifest_path = checkpoint_dir / "manifest.json"
+    try:
+        manifest_stat = os.lstat(manifest_path)
+    except OSError as exc:
+        raise ValueError(f"cannot inspect checkpoint manifest: {manifest_path}: {exc}") from exc
+    if not stat.S_ISREG(manifest_stat.st_mode) or manifest_stat.st_nlink != 1:
+        raise ValueError("checkpoint retirement requires a private regular manifest")
+    manifest_sha256, manifest = _read_manifest(checkpoint_dir)
+    if expected_manifest_sha256 is not None and manifest_sha256 != expected_manifest_sha256:
+        raise ValueError("checkpoint retirement source manifest hash mismatch")
+    _validate_manifest_run_identity(manifest, journal)
+    record = _checkpoint_record_from_manifest(
+        relative_path=relative,
+        manifest_sha256=manifest_sha256,
+        manifest=manifest,
+        journal=journal,
+    )
+    if record.update != int(match.group(1)):
+        raise ValueError("checkpoint directory update differs from its canonical path")
+    return record, directory_stat
+
+
+def _checkpoint_record_from_manifest(
+    *,
+    relative_path: str,
+    manifest_sha256: str,
+    manifest: Mapping[str, Any],
+    journal: RunJournal,
+) -> CheckpointRecord:
+    relative = _require_relative_path(relative_path)
+    path = PurePosixPath(relative)
+    match = _CHECKPOINT_DIRECTORY.fullmatch(path.name)
+    if len(path.parts) != 2 or path.parts[0] != "checkpoints" or match is None:
+        raise ValueError("checkpoint record path is not a canonical checkpoint directory")
+    update = int(match.group(1))
+    if relative != _checkpoint_relative_path(update):
+        raise ValueError("checkpoint record path is not canonical for its update")
+    _validate_manifest_run_identity(manifest, journal)
+    metrics = _manifest_last_metrics(manifest, update=update)
+    parent_sha256 = _require_sha256(
+        manifest.get("parent_manifest_sha256"),
+        name="checkpoint parent_manifest_sha256",
+        allow_none=True,
+    )
+    trainer_state = manifest.get("trainer_state")
+    if not isinstance(trainer_state, Mapping) or trainer_state.get("next_update") != update:
+        raise ValueError("checkpoint trainer_state.next_update does not match its directory update")
+    checked_manifest_sha256 = _require_sha256(manifest_sha256, name="checkpoint manifest_sha256")
+    assert isinstance(checked_manifest_sha256, str)
+    assert parent_sha256 is None or isinstance(parent_sha256, str)
+    return CheckpointRecord(
+        relative_path=relative,
+        update=update,
+        manifest_sha256=checked_manifest_sha256,
+        parent_manifest_sha256=parent_sha256,
+        last_metrics=metrics,
+    )
+
+
+def _same_directory_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        stat.S_ISDIR(left.st_mode)
+        and stat.S_ISDIR(right.st_mode)
+        and (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+    )
+
+
+def _regular_file_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+        value.st_nlink,
+    )
+
+
+def _remove_directory_contents_fd(descriptor: int, *, context: str) -> None:
+    """Remove entries through an already-open, no-follow directory capability."""
+
+    for name in sorted(os.listdir(descriptor)):
+        before = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        child_context = f"{context}/{name}"
+        if stat.S_ISDIR(before.st_mode):
+            child_descriptor = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=descriptor)
+            try:
+                opened = os.fstat(child_descriptor)
+                if not _same_directory_identity(before, opened):
+                    raise ValueError(f"checkpoint retirement directory changed while opening: {child_context}")
+                _remove_directory_contents_fd(child_descriptor, context=child_context)
+                after_descriptor = os.fstat(child_descriptor)
+                after_path = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if not _same_directory_identity(opened, after_descriptor) or not _same_directory_identity(
+                    opened, after_path
+                ):
+                    raise ValueError(f"checkpoint retirement directory identity changed: {child_context}")
+            finally:
+                os.close(child_descriptor)
+            os.rmdir(name, dir_fd=descriptor)
+        else:
+            os.unlink(name, dir_fd=descriptor)
+    os.fsync(descriptor)
+
+
+def _remove_retired_tree(path: Path, *, device: int, inode: int) -> None:
+    """Delete only the inode authorized by the retirement transaction.
+
+    The parent and target are opened with ``O_NOFOLLOW`` and all recursive work
+    is descriptor-relative.  A replacement at the root name is detected before
+    the final ``rmdir`` and is never traversed.
+    """
+
+    parent_before = _real_directory_stat(path.parent, context="checkpoint retirement staging parent")
+    parent_descriptor = os.open(path.parent, _DIRECTORY_OPEN_FLAGS)
+    target_descriptor: int | None = None
+    try:
+        parent_opened = os.fstat(parent_descriptor)
+        if not _same_directory_identity(parent_before, parent_opened):
+            raise ValueError("checkpoint retirement staging parent identity changed")
+        target_before = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if not stat.S_ISDIR(target_before.st_mode) or (target_before.st_dev, target_before.st_ino) != (device, inode):
+            raise ValueError(f"checkpoint retirement staging directory identity changed: {path}")
+        target_descriptor = os.open(path.name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_descriptor)
+        target_opened = os.fstat(target_descriptor)
+        if not _same_directory_identity(target_before, target_opened):
+            raise ValueError(f"checkpoint retirement staging directory changed while opening: {path}")
+        _remove_directory_contents_fd(target_descriptor, context=str(path))
+        target_after = os.fstat(target_descriptor)
+        path_after = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if not _same_directory_identity(target_opened, target_after) or not _same_directory_identity(
+            target_opened, path_after
+        ):
+            raise ValueError(f"checkpoint retirement staging directory identity changed: {path}")
+        os.rmdir(path.name, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+    finally:
+        if target_descriptor is not None:
+            os.close(target_descriptor)
+        os.close(parent_descriptor)
+
+
+def _read_private_regular_file(path: Path, *, context: str) -> bytes:
+    try:
+        before = os.lstat(path)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"cannot inspect {context}: {path}: {exc}") from exc
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise ValueError(f"{context} is not a private regular file: {path}")
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino) or not stat.S_ISREG(opened.st_mode):
+            raise ValueError(f"{context} changed while opening: {path}")
+        blocks: list[bytes] = []
+        while block := os.read(descriptor, 1024 * 1024):
+            blocks.append(block)
+        after_descriptor = os.fstat(descriptor)
+        after_path = os.lstat(path)
+        if _regular_file_identity(opened) != _regular_file_identity(after_descriptor) or _regular_file_identity(
+            opened
+        ) != _regular_file_identity(after_path):
+            raise ValueError(f"{context} changed while reading: {path}")
+        data = b"".join(blocks)
+        if len(data) != opened.st_size:
+            raise ValueError(f"{context} size changed while reading: {path}")
+        return data
+    finally:
+        os.close(descriptor)
+
+
+def _retired_checkpoint_record(
+    transaction: Path,
+    value: Mapping[str, Any],
+    *,
+    journal: RunJournal,
+) -> CheckpointRecord:
+    checkpoint = value["checkpoint"]
+    if not isinstance(checkpoint, CheckpointRecord):
+        raise TypeError("checkpoint retirement record is invalid")
+    path = transaction / CHECKPOINT_RETIRED_MANIFEST_FILENAME
+    data = _read_private_regular_file(path, context="preserved retired checkpoint manifest")
+    manifest_sha256 = _sha256_bytes(data)
+    if manifest_sha256 != checkpoint.manifest_sha256:
+        raise ValueError("preserved retired checkpoint manifest SHA-256 mismatch")
+    try:
+        manifest = _parse_json(data.decode("utf-8"), source=str(path))
+    except UnicodeDecodeError as exc:
+        raise ValueError("preserved retired checkpoint manifest is not UTF-8") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("preserved retired checkpoint manifest must be a JSON object")
+    try:
+        authenticated = _checkpoint_record_from_manifest(
+            relative_path=checkpoint.relative_path,
+            manifest_sha256=manifest_sha256,
+            manifest=manifest,
+            journal=journal,
+        )
+    except ValueError as exc:
+        raise ValueError(f"preserved retired checkpoint manifest is invalid: {exc}") from exc
+    if authenticated != checkpoint:
+        raise ValueError("preserved retired checkpoint manifest differs from its retirement record")
+    return authenticated
+
+
+def _preserve_retired_checkpoint_manifest(
+    transaction: Path,
+    staged: Path,
+    *,
+    checkpoint: CheckpointRecord,
+) -> None:
+    source = staged / "manifest.json"
+    data = _read_private_regular_file(source, context="retired checkpoint manifest")
+    if _sha256_bytes(data) != checkpoint.manifest_sha256:
+        raise ValueError("retired checkpoint manifest changed before preservation")
+    destination = transaction / CHECKPOINT_RETIRED_MANIFEST_FILENAME
+    if os.path.lexists(destination):
+        if _read_private_regular_file(destination, context="preserved retired checkpoint manifest") != data:
+            raise ValueError("preserved retired checkpoint manifest bytes changed")
+        return
+    _atomic_write(destination, data, exclusive=True)
+
+
+def _cleanup_retirement_temporaries(transaction: Path) -> None:
+    changed = False
+    for child in transaction.iterdir():
+        if (
+            _RETIREMENT_MANIFEST_TEMP.fullmatch(child.name) is None
+            and _RETIRED_CHECKPOINT_MANIFEST_TEMP.fullmatch(child.name) is None
+        ):
+            continue
+        observed = os.lstat(child)
+        if not stat.S_ISREG(observed.st_mode):
+            raise ValueError(f"checkpoint retirement temporary is not a regular file: {child}")
+        child.unlink()
+        changed = True
+    if changed:
+        _fsync_directory(transaction)
+
+
+def _retention_root(output: Path, *, create: bool) -> Path | None:
+    root = output / CHECKPOINT_RETENTION_DIRNAME
+    if create:
+        root.mkdir(mode=0o700, exist_ok=True)
+        _fsync_directory(output)
+    elif not os.path.lexists(root):
+        return None
+    _real_directory_stat(root, context="checkpoint retention root")
+    return root
+
+
+def _retirement_authorized(
+    value: Mapping[str, Any],
+    *,
+    journal: RunJournal,
+    permanent_checkpoint_interval: int,
+) -> tuple[CheckpointRecord, CheckpointRecord]:
+    if value["run_uuid"] != journal.run_uuid or value["config_sha256"] != journal.config_sha256:
+        raise ValueError("checkpoint retirement transaction belongs to another run")
+    if value["permanent_checkpoint_interval"] != permanent_checkpoint_interval:
+        raise ValueError("checkpoint retirement interval differs from the authenticated resolved config")
+    checkpoint = value["checkpoint"]
+    authorized_tip = value["authorized_tip"]
+    if not isinstance(checkpoint, CheckpointRecord) or not isinstance(authorized_tip, CheckpointRecord):
+        raise TypeError("checkpoint retirement records are invalid")
+    if checkpoint.update % permanent_checkpoint_interval == 0:
+        raise ValueError("a permanent checkpoint cannot be retired")
+    if authorized_tip.update <= checkpoint.update:
+        raise ValueError("checkpoint retirement tip does not supersede its checkpoint")
+    if authorized_tip.parent_manifest_sha256 != checkpoint.manifest_sha256:
+        raise ValueError("checkpoint retirement is not authorized by the next journal tip")
+    return checkpoint, authorized_tip
+
+
+def _finish_retirement_transaction(
+    output: Path,
+    transaction: Path,
+    value: dict[str, Any],
+    *,
+    journal: RunJournal,
+    permanent_checkpoint_interval: int,
+) -> bool:
+    checkpoint, authorized_tip = _retirement_authorized(
+        value,
+        journal=journal,
+        permanent_checkpoint_interval=permanent_checkpoint_interval,
+    )
+    source = output / checkpoint.relative_path
+    staged = transaction / "checkpoint"
+    source_exists = os.path.lexists(source)
+    staged_exists = os.path.lexists(staged)
+    if value["status"] == "complete":
+        if source_exists or staged_exists:
+            raise ValueError("completed checkpoint retirement still has a live checkpoint path")
+        _retired_checkpoint_record(transaction, value, journal=journal)
+        _cleanup_retirement_temporaries(transaction)
+        return False
+    if journal.latest_checkpoint != authorized_tip:
+        raise ValueError("pending checkpoint retirement is not authorized by the current journal tip")
+    if source_exists and staged_exists:
+        raise ValueError("checkpoint retirement has both source and staging paths")
+    if value["status"] == "planned" and not source_exists and not staged_exists:
+        raise ValueError("planned checkpoint retirement lost both source and staging paths")
+    if value["status"] == "moved" and source_exists:
+        raise ValueError("moved checkpoint retirement unexpectedly retained its source path")
+    device = int(value["directory_device"])
+    inode = int(value["directory_inode"])
+    if source_exists:
+        authenticated, observed = _checkpoint_record_at(
+            output,
+            source,
+            journal=journal,
+            expected_manifest_sha256=checkpoint.manifest_sha256,
+        )
+        if authenticated != checkpoint or (observed.st_dev, observed.st_ino) != (device, inode):
+            raise ValueError("checkpoint retirement source identity changed")
+        os.replace(source, staged)
+        _fsync_directory(transaction)
+        _fsync_directory(source.parent)
+        staged_exists = True
+    if staged_exists:
+        if os.path.lexists(staged / "manifest.json"):
+            staged_record, staged_stat = _checkpoint_record_in_staging(
+                staged,
+                checkpoint=checkpoint,
+                journal=journal,
+                expected_device=device,
+                expected_inode=inode,
+            )
+            _preserve_retired_checkpoint_manifest(transaction, staged, checkpoint=checkpoint)
+        else:
+            staged_stat = _real_directory_stat(staged, context="checkpoint retirement staging")
+            if (staged_stat.st_dev, staged_stat.st_ino) != (device, inode):
+                raise ValueError("checkpoint retirement staging directory identity changed")
+            staged_record = _retired_checkpoint_record(transaction, value, journal=journal)
+        if staged_record != checkpoint or (staged_stat.st_dev, staged_stat.st_ino) != (device, inode):
+            raise ValueError("checkpoint retirement staging identity changed")
+        value = {**value, "status": "moved"}
+        _write_retirement_manifest(transaction / "retirement.json", value, exclusive=False)
+        _remove_retired_tree(staged, device=device, inode=inode)
+    else:
+        _retired_checkpoint_record(transaction, value, journal=journal)
+    _cleanup_retirement_temporaries(transaction)
+    value = {**value, "status": "complete"}
+    _write_retirement_manifest(transaction / "retirement.json", value, exclusive=False)
+    return True
+
+
+def _checkpoint_record_in_staging(
+    staged: Path,
+    *,
+    checkpoint: CheckpointRecord,
+    journal: RunJournal,
+    expected_device: int,
+    expected_inode: int,
+) -> tuple[CheckpointRecord, os.stat_result]:
+    observed = _real_directory_stat(staged, context="checkpoint retirement staging")
+    if (observed.st_dev, observed.st_ino) != (expected_device, expected_inode):
+        raise ValueError("checkpoint retirement staging directory identity changed")
+    data = _read_private_regular_file(staged / "manifest.json", context="checkpoint retirement staging manifest")
+    manifest_sha256 = _sha256_bytes(data)
+    try:
+        manifest = _parse_json(data.decode("utf-8"), source=str(staged / "manifest.json"))
+    except UnicodeDecodeError as exc:
+        raise ValueError("checkpoint retirement staging manifest is not UTF-8") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("checkpoint retirement staging manifest must be a JSON object")
+    record = _checkpoint_record_from_manifest(
+        relative_path=checkpoint.relative_path,
+        manifest_sha256=manifest_sha256,
+        manifest=manifest,
+        journal=journal,
+    )
+    return record, observed
+
+
+def _recover_checkpoint_retirements(
+    output: Path,
+    *,
+    journal: RunJournal,
+    permanent_checkpoint_interval: int,
+) -> tuple[str, ...]:
+    root = _retention_root(output, create=False)
+    if root is None:
+        return ()
+    recovered: list[str] = []
+    for transaction in sorted(root.iterdir(), key=lambda path: path.name):
+        match = _RETIREMENT_DIRECTORY.fullmatch(transaction.name)
+        if match is None or transaction.is_symlink() or not transaction.is_dir():
+            raise ValueError(f"checkpoint retention root contains an unknown entry: {transaction}")
+        manifest_path = transaction / "retirement.json"
+        try:
+            value = _read_retirement_manifest(manifest_path)
+        except FileNotFoundError:
+            children = list(transaction.iterdir())
+            if any(child.name in {"checkpoint", CHECKPOINT_RETIRED_MANIFEST_FILENAME} for child in children) or any(
+                _RETIREMENT_MANIFEST_TEMP.fullmatch(child.name) is None
+                and _RETIRED_CHECKPOINT_MANIFEST_TEMP.fullmatch(child.name) is None
+                for child in children
+            ):
+                raise ValueError(f"incomplete checkpoint retirement requires manual recovery: {transaction}") from None
+            observed = _real_directory_stat(transaction, context="empty checkpoint retirement transaction")
+            _remove_retired_tree(transaction, device=observed.st_dev, inode=observed.st_ino)
+            recovered.append(transaction.relative_to(output).as_posix())
+            continue
+        _validate_retirement_transaction_entries(transaction)
+        checkpoint = value["checkpoint"]
+        if not isinstance(checkpoint, CheckpointRecord) or int(match.group(1)) != checkpoint.update:
+            raise ValueError("checkpoint retirement directory update differs from its manifest")
+        if _finish_retirement_transaction(
+            output,
+            transaction,
+            value,
+            journal=journal,
+            permanent_checkpoint_interval=permanent_checkpoint_interval,
+        ):
+            recovered.append(transaction.relative_to(output).as_posix())
+    return tuple(recovered)
+
+
+def _completed_retirement_for_parent(
+    output: Path,
+    *,
+    journal: RunJournal,
+    tip: CheckpointRecord,
+    parent_anchor: Mapping[str, Any],
+    permanent_checkpoint_interval: int,
+) -> CheckpointRecord | None:
+    root = _retention_root(output, create=False)
+    if root is None:
+        return None
+    matches: list[CheckpointRecord] = []
+    for transaction in root.iterdir():
+        if _RETIREMENT_DIRECTORY.fullmatch(transaction.name) is None or not transaction.is_dir():
+            raise ValueError(f"checkpoint retention root contains an unknown entry: {transaction}")
+        try:
+            value = _read_retirement_manifest(transaction / "retirement.json")
+        except FileNotFoundError as exc:
+            raise ValueError(f"checkpoint retirement manifest is missing: {transaction}") from exc
+        checkpoint = value["checkpoint"]
+        if value["status"] != "complete" or not isinstance(checkpoint, CheckpointRecord):
+            continue
+        _retirement_authorized(
+            value,
+            journal=journal,
+            permanent_checkpoint_interval=permanent_checkpoint_interval,
+        )
+        authenticated = _retired_checkpoint_record(transaction, value, journal=journal)
+        if (
+            value["authorized_tip"] == tip
+            and authenticated.relative_path == parent_anchor["relative_path"]
+            and authenticated.update == parent_anchor["update"]
+            and authenticated.manifest_sha256 == tip.parent_manifest_sha256
+        ):
+            matches.append(authenticated)
+    if len(matches) > 1:
+        raise ValueError("multiple completed retirements claim the current journal parent")
+    return None if not matches else matches[0]
+
+
+def _active_checkpoint_records(
+    output: Path,
+    *,
+    journal: RunJournal,
+) -> tuple[CheckpointRecord, ...]:
+    checkpoints = output / "checkpoints"
+    if not checkpoints.exists():
+        return ()
+    _real_directory_stat(checkpoints, context="checkpoint parent")
+    records: list[CheckpointRecord] = []
+    for child in checkpoints.iterdir():
+        if _CHECKPOINT_DIRECTORY.fullmatch(child.name) is None:
+            continue
+        record, _ = _checkpoint_record_at(output, child, journal=journal)
+        records.append(record)
+    hashes = [record.manifest_sha256 for record in records]
+    updates = [record.update for record in records]
+    if len(set(hashes)) != len(hashes) or len(set(updates)) != len(updates):
+        raise ValueError("active checkpoint inventory contains duplicate hashes or updates")
+    return tuple(records)
+
+
+def _validate_active_checkpoint_bound(
+    records: tuple[CheckpointRecord, ...],
+    *,
+    tip: CheckpointRecord,
+    parent_anchor: Mapping[str, Any] | None,
+    permanent_checkpoint_interval: int,
+    allow_retiring_parent: bool,
+) -> CheckpointRecord | None:
+    tip_matches = [record for record in records if record.manifest_sha256 == tip.manifest_sha256]
+    if tip_matches != [tip]:
+        raise ValueError("active checkpoint inventory does not contain the exact journal tip")
+    parent: CheckpointRecord | None = None
+    for record in records:
+        if record == tip:
+            continue
+        if record.update >= tip.update:
+            raise ValueError("active checkpoint inventory contains an uncommitted future or peer checkpoint")
+        is_parent = (
+            parent_anchor is not None
+            and record.relative_path == parent_anchor["relative_path"]
+            and record.update == parent_anchor["update"]
+            and record.manifest_sha256 == tip.parent_manifest_sha256
+        )
+        if is_parent:
+            parent = record
+        if record.update % permanent_checkpoint_interval and not (allow_retiring_parent and is_parent):
+            raise ValueError("active checkpoint inventory contains a non-permanent backlog checkpoint")
+    return parent
+
+
+def _begin_checkpoint_retirement(
+    output: Path,
+    *,
+    journal: RunJournal,
+    checkpoint: CheckpointRecord,
+    permanent_checkpoint_interval: int,
+) -> str:
+    tip = journal.latest_checkpoint
+    if tip is None:
+        raise ValueError("checkpoint retention requires a committed journal tip")
+    value = {
+        "schema": CHECKPOINT_RETIREMENT_SCHEMA,
+        "status": "planned",
+        "run_uuid": journal.run_uuid,
+        "config_sha256": journal.config_sha256,
+        "checkpoint": checkpoint,
+        "authorized_tip": tip,
+        "directory_device": -1,
+        "directory_inode": -1,
+        "permanent_checkpoint_interval": permanent_checkpoint_interval,
+    }
+    _retirement_authorized(
+        value,
+        journal=journal,
+        permanent_checkpoint_interval=permanent_checkpoint_interval,
+    )
+    source = output / checkpoint.relative_path
+    authenticated, observed = _checkpoint_record_at(
+        output,
+        source,
+        journal=journal,
+        expected_manifest_sha256=checkpoint.manifest_sha256,
+    )
+    if authenticated != checkpoint:
+        raise ValueError("checkpoint retirement source record changed")
+    value["directory_device"] = observed.st_dev
+    value["directory_inode"] = observed.st_ino
+    root = _retention_root(output, create=True)
+    assert root is not None
+    transaction = root / f"retire-update-{checkpoint.update:06d}-{uuid.uuid4().hex}"
+    transaction.mkdir(mode=0o700, exist_ok=False)
+    _fsync_directory(root)
+    _write_retirement_manifest(transaction / "retirement.json", value, exclusive=True)
+    _finish_retirement_transaction(
+        output,
+        transaction,
+        value,
+        journal=journal,
+        permanent_checkpoint_interval=permanent_checkpoint_interval,
+    )
+    return transaction.relative_to(output).as_posix()
+
+
+def apply_checkpoint_retention(
+    output_dir: str | Path,
+) -> CheckpointRetention:
+    """Retain permanent multiples and the current journal tip.
+
+    Only the checkpoint named by the current tip's authenticated parent hash can
+    be retired.  Retirement starts after the new tip is durable, atomically
+    moves the superseded directory into a transaction, then removes it with
+    descriptor-relative symlink-safe traversal.  Durable transaction records
+    let the next invocation finish a crash between any of those steps.
+    """
+
+    output = Path(output_dir).resolve()
+    journal = load_run_journal(output)
+    interval = _authenticated_retention_interval(output, journal)
+    tip = journal.latest_checkpoint
+    if tip is None:
+        return CheckpointRetention(retired_paths=(), recovered_transactions=())
+    authenticated_tip, tip_manifest = _validate_resume_checkpoint(output, output / tip.relative_path)
+    if authenticated_tip != tip:
+        raise ValueError("authenticated checkpoint tip differs from the run journal")
+    retention_contract = _retention_contract_from_manifest(
+        tip_manifest,
+        expected_parent=None,
+        expected_interval=interval,
+        validate_parent=False,
+    )
+    parent_anchor = retention_contract["parent_checkpoint"]
+    if tip.parent_manifest_sha256 is None:
+        if parent_anchor is not None:
+            raise ValueError("first checkpoint retention contract unexpectedly names a parent")
+    elif parent_anchor is None:
+        raise ValueError("checkpoint retention contract omits the journal parent anchor")
+    recovered = _recover_checkpoint_retirements(
+        output,
+        journal=journal,
+        permanent_checkpoint_interval=interval,
+    )
+    active = _active_checkpoint_records(
+        output,
+        journal=journal,
+    )
+    parent = _validate_active_checkpoint_bound(
+        active,
+        tip=tip,
+        parent_anchor=parent_anchor,
+        permanent_checkpoint_interval=interval,
+        allow_retiring_parent=True,
+    )
+    if parent_anchor is None:
+        _validate_active_checkpoint_bound(
+            active,
+            tip=tip,
+            parent_anchor=None,
+            permanent_checkpoint_interval=interval,
+            allow_retiring_parent=False,
+        )
+        return CheckpointRetention(retired_paths=(), recovered_transactions=recovered)
+    if int(parent_anchor["update"]) % interval == 0:
+        if parent is None:
+            raise ValueError("permanent journal parent checkpoint is missing")
+        return CheckpointRetention(retired_paths=(), recovered_transactions=recovered)
+    if parent is None:
+        completed = _completed_retirement_for_parent(
+            output,
+            journal=journal,
+            tip=tip,
+            parent_anchor=parent_anchor,
+            permanent_checkpoint_interval=interval,
+        )
+        if completed is None:
+            raise ValueError("journal parent checkpoint is absent without an authenticated completed retirement")
+        return CheckpointRetention(retired_paths=(), recovered_transactions=recovered)
+    _begin_checkpoint_retirement(
+        output,
+        journal=journal,
+        checkpoint=parent,
+        permanent_checkpoint_interval=interval,
+    )
+    remaining = _active_checkpoint_records(output, journal=journal)
+    _validate_active_checkpoint_bound(
+        remaining,
+        tip=tip,
+        parent_anchor=parent_anchor,
+        permanent_checkpoint_interval=interval,
+        allow_retiring_parent=False,
+    )
+    return CheckpointRetention(
+        retired_paths=(parent.relative_path,),
+        recovered_transactions=recovered,
+    )
 
 
 def quarantine_uncommitted_training_artifacts(

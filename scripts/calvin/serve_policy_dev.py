@@ -42,7 +42,7 @@ from duo_vla.data.calvin_dev_states import (
 )
 
 DEVELOPMENT_STATUS = "heldout_abc_development_only_not_official_calvin_abc_to_d"
-DEVELOPMENT_RUNTIME_SCHEMA = "duo-vla-calvin-heldout-abc-serving-runtime-v3"
+DEVELOPMENT_RUNTIME_SCHEMA = "duo-vla-calvin-heldout-abc-serving-runtime-v4"
 TRAINING_PROTOCOL = official_policy.PROTOCOL
 MAX_CANONICAL_UPDATES = 30_000
 

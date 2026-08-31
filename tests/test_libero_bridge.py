@@ -188,8 +188,9 @@ def test_fake_policy_persistent_socket_is_private_and_deterministic(tmp_path: Pa
             second, second_response = client.predict(**request)
             assert health["mode"] == "fake"
             assert health["train_seed"] == 17
-            assert health["schema"] == "duo-vla-libero-policy-ipc-v4"
+            assert health["schema"] == "duo-vla-libero-policy-ipc-v5"
             assert health["execution_geometry"] is None
+            assert health["latency_runtime_sha256"] is None
             assert health["serving_runtime_sha256"] is None
             assert health["objective"] == "test_fake"
             assert health["sampler"] == "seeded_test_normal"
@@ -218,6 +219,13 @@ def test_policy_warmups_are_recorded_but_separate_from_episode_metrics(tmp_path:
         PolicyClient(socket_path, timeout_seconds=2.0) as client,
     ):
         health = client.health()
+        k1_reports = run_policy_warmups(
+            client,
+            health,
+            count=2,
+            execution_horizon=1,
+            evaluation_seed=101,
+        )
         reports = run_policy_warmups(
             client,
             health,
@@ -232,6 +240,8 @@ def test_policy_warmups_are_recorded_but_separate_from_episode_metrics(tmp_path:
     assert all("health" not in report for report in reports)
     assert reports[0]["actions_sha256"] == reports[1]["actions_sha256"]
     assert reports[0]["inference_seed"] == reports[1]["inference_seed"]
+    assert reports[0]["actions_sha256"] == k1_reports[0]["actions_sha256"]
+    assert reports[0]["inference_seed"] == k1_reports[0]["inference_seed"]
     with pytest.raises(RuntimeError, match="at least one"):
         run_policy_warmups(
             client,
@@ -262,6 +272,7 @@ def test_evaluator_requires_content_addressed_runtime_for_real_policy() -> None:
         },
         "dataset_revision": "86958911c0f959db2bbbdb107eb3e17c5f9c798e",
         "execution_geometry": LIBERO_EXECUTION_GEOMETRY,
+        "latency_runtime_sha256": "e" * 64,
         "mode": "real",
         "model_revision": "f7f5b7f5fa82ffc52addd066915886d497f5517b",
         "normalization_content_sha256": "a972b5d95a8aaa8ae7582bafcbc071261979cb46c2a3515b4da7a7cf0156ac73",
@@ -274,12 +285,15 @@ def test_evaluator_requires_content_addressed_runtime_for_real_policy() -> None:
     changed_scope = dict(health, prefix_cache_scope="episode")
     with pytest.raises(RuntimeError, match="prefix cache scope"):
         validate_policy_health(changed_scope, allow_fake_policy=False)
+    changed_latency_runtime = dict(health, latency_runtime_sha256=None)
+    with pytest.raises(RuntimeError, match="latency runtime hash"):
+        validate_policy_health(changed_latency_runtime, allow_fake_policy=False)
     health["serving_runtime_sha256"] = None
     with pytest.raises(RuntimeError, match="runtime hash"):
         validate_policy_health(health, allow_fake_policy=False)
 
 
-def test_v4_rejects_v3_request_schema() -> None:
+def test_v5_rejects_v3_request_schema() -> None:
     agentview, wrist = _images()
     request = make_predict_request(
         request_id="request",
@@ -302,7 +316,7 @@ def test_v4_rejects_v3_request_schema() -> None:
         validate_request(request)
 
 
-def test_v4_execution_geometry_is_exact() -> None:
+def test_v5_execution_geometry_is_exact() -> None:
     assert validate_execution_geometry(LIBERO_EXECUTION_GEOMETRY) == LIBERO_EXECUTION_GEOMETRY
     changed = dict(LIBERO_EXECUTION_GEOMETRY, physical_batch_size=1)
     with pytest.raises(BridgeProtocolError, match="execution geometry differs"):
@@ -311,7 +325,7 @@ def test_v4_execution_geometry_is_exact() -> None:
         validate_execution_geometry({**LIBERO_EXECUTION_GEOMETRY, "extra": True})
 
 
-def test_v4_prediction_response_rejects_contract_and_echo_drift() -> None:
+def test_v5_prediction_response_rejects_contract_and_echo_drift() -> None:
     contract = {
         "objective": "direct_regression",
         "sampler": "single_forward",
@@ -452,6 +466,40 @@ class _FakeEnvironment:
         return self.total_steps >= 10 + self.success_after_policy_steps
 
 
+class _ImpossibleLatencyClient:
+    def predict(self, **request: Any) -> tuple[np.ndarray, dict[str, Any]]:
+        actions = np.zeros((8, 7), dtype=np.float32)
+        return actions, {
+            "evaluation_seed": request["evaluation_seed"],
+            "normalized_clip_fraction": 0.0,
+            "policy_seconds": 100.0,
+            "reset_id": request["reset_id"],
+            "reset_source": request["reset_source"],
+            "reset_state_sha256": request["reset_state_sha256"],
+        }
+
+
+def test_episode_rejects_server_latency_above_client_round_trip(monkeypatch: pytest.MonkeyPatch) -> None:
+    import evaluate_libero
+
+    monkeypatch.setattr(evaluate_libero, "libero_state", lambda _: np.zeros(8, dtype=np.float32))
+    with pytest.raises(RuntimeError, match="at least the server latency"):
+        run_episode(
+            _FakeEnvironment(success_after_policy_steps=1),
+            initial_state=np.zeros(1, dtype=np.float32),
+            client=_ImpossibleLatencyClient(),
+            train_seed=0,
+            evaluation_seed=101,
+            suite="libero_spatial",
+            task_id=0,
+            task_name="test_task",
+            instruction="test instruction",
+            init_state_id=0,
+            execution_horizon=1,
+            policy_budget=20,
+        )
+
+
 @pytest.mark.parametrize(("execution_horizon", "expected_calls"), [(1, 5), (4, 2)])
 def test_episode_queueing_and_success_accounting(
     tmp_path: Path,
@@ -548,6 +596,7 @@ def test_selection_wilson_and_summary_keep_k_separate() -> None:
                 "action_clipped_channels": 0,
                 "action_clip_fraction": 0.0,
                 "action_continuous_channels": 30,
+                "elapsed_seconds": 1.0,
                 "execution_horizon": 4,
                 "normalized_action_clip_fraction": 0.0,
                 "policy_calls": 2,
@@ -565,4 +614,7 @@ def test_selection_wilson_and_summary_keep_k_separate() -> None:
     assert summary["suites"][0]["suite_task_macro_success"] == 0.5
     assert summary["overall_40_task_macro_success"] is None
     assert summary["policy_latency_p95_seconds"] == pytest.approx(0.2, abs=0.02)
+    assert summary["episode_elapsed_seconds"] == 2.0
+    assert summary["episode_throughput_per_hour"] == 3600.0
+    assert summary["policy_call_throughput_per_second"] == 2.0
     assert math.isfinite(summary["steps_to_success_mean"])

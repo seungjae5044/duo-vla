@@ -48,6 +48,12 @@ task/reset trees to frozen content hashes. The full report also records the Open
 pixel SHA-256 values before and after the smoke step. An imports-only report cannot be used to create an official
 pre-registration.
 
+The full attestation is also an authenticated input to the separate
+[40-task expert replay qualification](libero_expert_replay_qualification.md). That gate is stronger than the one-task
+preflight smoke: it requires regenerated successful evidence for every canonical task plus alignment, camera,
+controller, reset, and pre-dispatch integrity evidence. The pinned inventory and two-stage collector/binder now exist;
+the 31.47-GiB original-HDF5 corpus is not locally materialized and a real 40-task report is still outstanding.
+
 Every simulator subprocess must set `LIBERO_CONFIG_PATH`, `MUJOCO_GL=egl`, `PYOPENGL_PLATFORM=egl`, and
 `MUJOCO_EGL_DEVICE_ID` before importing MuJoCo, robosuite, or LIBERO. Keep policy inference in the training environment
 and exchange copied raw RGB/state arrays and `float32[7]` actions over the eventual lossless local IPC boundary, as

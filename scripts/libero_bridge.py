@@ -19,7 +19,7 @@ from typing import Any
 
 import numpy as np
 
-SCHEMA = "duo-vla-libero-policy-ipc-v4"
+SCHEMA = "duo-vla-libero-policy-ipc-v5"
 PROTOCOL = "duovla-libero-v1"
 SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
 RESET_SOURCES = ("official", "clean-dev")
@@ -117,7 +117,7 @@ def _exact_keys(value: Mapping[str, Any], expected: set[str], name: str) -> None
 
 
 def validate_wire_policy_contract(value: Mapping[str, Any], *, allow_fake: bool = False) -> dict[str, Any]:
-    """Validate the policy identity repeated by every v4 health/prediction response."""
+    """Validate the policy identity repeated by every v5 health/prediction response."""
 
     contract = {name: value.get(name) for name in _WIRE_POLICY_KEYS}
     objective = contract["objective"]
@@ -578,6 +578,7 @@ class PolicyClient:
                 "dataset_revision",
                 "execution_geometry",
                 "inference_seed_behavior",
+                "latency_runtime_sha256",
                 "mode",
                 "model_revision",
                 "nfe",
@@ -608,6 +609,7 @@ class PolicyClient:
         require(response.get("mode") in {"fake", "real"}, "policy health response has an invalid mode")
         mode = response["mode"]
         runtime_sha256 = response.get("serving_runtime_sha256")
+        latency_runtime_sha256 = response.get("latency_runtime_sha256")
         if mode == "real":
             require(response["train_seed"] in {0, 1, 2}, "real policy health has a noncanonical train_seed")
             checkpoint = response.get("checkpoint")
@@ -648,6 +650,12 @@ class PolicyClient:
                 and all(character in "0123456789abcdef" for character in runtime_sha256),
                 "real policy health has an invalid serving runtime SHA-256",
             )
+            require(
+                isinstance(latency_runtime_sha256, str)
+                and len(latency_runtime_sha256) == 64
+                and all(character in "0123456789abcdef" for character in latency_runtime_sha256),
+                "real policy health has an invalid latency runtime SHA-256",
+            )
             execution_geometry = validate_execution_geometry(response.get("execution_geometry"))
             require(
                 checkpoint.get("execution_geometry") == execution_geometry,
@@ -657,6 +665,7 @@ class PolicyClient:
             for name in (
                 "checkpoint",
                 "execution_geometry",
+                "latency_runtime_sha256",
                 "model_revision",
                 "normalization_content_sha256",
                 "serving_runtime_sha256",
@@ -670,7 +679,7 @@ class PolicyClient:
 
     def predict(self, **request_fields: Any) -> tuple[np.ndarray, dict[str, Any]]:
         if self._policy_contract is None:
-            raise RuntimeError("call health() before predict() to bind the v4 policy contract")
+            raise RuntimeError("call health() before predict() to bind the v5 policy contract")
         request_id = self._request_id("predict")
         request = make_predict_request(request_id=request_id, **request_fields)
         response = self._exchange(request)

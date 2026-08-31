@@ -30,4 +30,3 @@ evaluation_seed = 0
 
 [training]
 data_loader_workers_per_rank = 0
-permanent_checkpoint_interval = 1000

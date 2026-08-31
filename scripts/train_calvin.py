@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Resumable TP=2 Duo-VLA trainer for pinned CALVIN ABC-to-D data."""
 
+# ruff: noqa: E402 -- authenticate project sources before importing project code.
+
 from __future__ import annotations
 
 import argparse
@@ -15,6 +17,7 @@ import platform
 import random
 import re
 import site
+import stat
 import sys
 import time
 from collections.abc import Sequence
@@ -27,6 +30,92 @@ import torch
 import torch.distributed as dist
 from PIL import Image
 from transformers import AutoProcessor
+
+
+def _inventory_project_source_root() -> Path:
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    if source_root.resolve(strict=True) != source_root or not stat.S_ISDIR(os.lstat(source_root).st_mode):
+        raise RuntimeError("project src import root must be a canonical real directory")
+    identity_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns", "st_nlink")
+
+    def same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+        return all(getattr(left, name) == getattr(right, name) for name in identity_fields)
+
+    def walk(directory: int, prefix: tuple[str, ...]) -> None:
+        before = os.fstat(directory)
+        names = sorted(os.listdir(directory))
+        for name in names:
+            context = "/".join((*prefix, name))
+            observed = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if stat.S_ISDIR(observed.st_mode):
+                if name == "__pycache__":
+                    continue
+                child = os.open(
+                    name,
+                    os.O_RDONLY | os.O_NONBLOCK | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=directory,
+                )
+                try:
+                    if not same_identity(observed, os.fstat(child)):
+                        raise RuntimeError(f"project source directory changed while opening: {context}")
+                    walk(child, (*prefix, name))
+                finally:
+                    os.close(child)
+            elif not (stat.S_ISREG(observed.st_mode) and name.endswith(".py")):
+                raise RuntimeError(f"project source import entry is unsafe: {context}")
+        if names != sorted(os.listdir(directory)) or not same_identity(before, os.fstat(directory)):
+            raise RuntimeError(f"project source directory changed during inventory: {'/'.join(prefix) or '.'}")
+
+    root_descriptor = os.open(
+        source_root,
+        os.O_RDONLY | os.O_NONBLOCK | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    try:
+        if sorted(os.listdir(root_descriptor)) != ["duo_vla"]:
+            raise RuntimeError("project src import root must contain only the real duo_vla package directory")
+        package_descriptor = os.open(
+            "duo_vla",
+            os.O_RDONLY | os.O_NONBLOCK | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=root_descriptor,
+        )
+        try:
+            walk(package_descriptor, ("duo_vla",))
+        finally:
+            os.close(package_descriptor)
+    finally:
+        os.close(root_descriptor)
+    source_text = str(source_root)
+    resolved_entries = [str(Path(entry or os.getcwd()).resolve()) for entry in sys.path]
+    if source_text not in resolved_entries:
+        raise RuntimeError("sealed editable install does not expose the canonical project src import root")
+    sys.path[:] = [source_text] + [
+        entry for entry in sys.path if str(Path(entry or os.getcwd()).resolve()) != source_text
+    ]
+    return source_root
+
+
+_PROJECT_SOURCE_ROOT = _inventory_project_source_root()
+
+
+def _validate_project_module_origins(required_modules: set[str]) -> dict[str, str]:
+    package_root = (_PROJECT_SOURCE_ROOT / "duo_vla").resolve(strict=True)
+    loaded = {name: module for name, module in sys.modules.items() if name == "duo_vla" or name.startswith("duo_vla.")}
+    missing = sorted(required_modules - set(loaded))
+    if missing:
+        raise RuntimeError(f"required checkout modules are not loaded: {missing}")
+    origins: dict[str, str] = {}
+    for name, module in sorted(loaded.items()):
+        origin = getattr(getattr(module, "__spec__", None), "origin", None)
+        module_file = getattr(module, "__file__", None)
+        if not isinstance(origin, str) or not isinstance(module_file, str):
+            raise RuntimeError(f"checkout module has no file origin: {name}")
+        resolved_origin = Path(origin).resolve(strict=True)
+        resolved_file = Path(module_file).resolve(strict=True)
+        if resolved_origin != resolved_file or not resolved_file.is_relative_to(package_root):
+            raise RuntimeError(f"checkout module origin escapes authenticated source root: {name}")
+        origins[name] = str(resolved_file)
+    return origins
+
 
 from duo_vla.action_interface import ActionInputProjector, VelocityHead
 from duo_vla.backbones.diffusion_gemma import (
@@ -107,12 +196,19 @@ from duo_vla.run_config import (
     save_resolved_config,
 )
 from duo_vla.run_journal import (
+    apply_checkpoint_retention,
     create_run_journal,
     load_run_journal,
+    make_checkpoint_retention_contract,
     quarantine_uncommitted_training_artifacts,
     reconcile_metrics_jsonl,
     record_latest_checkpoint,
     validate_resume_checkpoint,
+)
+from duo_vla.runtime_integrity import (
+    content_address_train_venv,
+    static_environment_identity,
+    validate_torchrun_rank_environment,
 )
 from duo_vla.training import TrainerState, make_microbatch_plan, make_update_plan, masked_element_count, masked_sse
 from duo_vla.training_checkpoint import (
@@ -124,6 +220,8 @@ from duo_vla.training_checkpoint import (
     save_training_rank_state,
     validate_training_progress,
 )
+
+_validate_project_module_origins({"duo_vla", "duo_vla.runtime_integrity"})
 
 CALVIN_PROTOCOL = "duovla-calvin-abc-to-d-v1"
 CALVIN_EXPECTED_SCENES = ("calvin_scene_A", "calvin_scene_B", "calvin_scene_C")
@@ -151,19 +249,56 @@ EXPECTED_TRAIN_PACKAGES = {
     "transformers": "5.15.0",
 }
 REQUIRED_TRAIN_ENVIRONMENT = {
+    "BLIS_NUM_THREADS": "1",
     "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
     "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
     "CUDA_VISIBLE_DEVICES": "0,1",
+    "HF_HUB_DISABLE_PROGRESS_BARS": "1",
     "HF_HUB_OFFLINE": "1",
+    "HOME": "/root",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
     "MKL_NUM_THREADS": "1",
     "NUMEXPR_NUM_THREADS": "1",
     "OMP_DYNAMIC": "FALSE",
     "OMP_NUM_THREADS": "1",
     "OPENBLAS_NUM_THREADS": "1",
+    "PATH": "/usr/bin:/bin",
     "PYTHONNOUSERSITE": "1",
+    "PYTHONPYCACHEPREFIX": "/dev/null",
+    "PYTHONSAFEPATH": "1",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "RAYON_NUM_THREADS": "1",
     "TOKENIZERS_PARALLELISM": "false",
+    "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
     "TRANSFORMERS_OFFLINE": "1",
+    "TZ": "UTC",
+    "VECLIB_MAXIMUM_THREADS": "1",
 }
+_RELEVANT_TRAIN_ENVIRONMENT_PREFIXES = (
+    "BLIS_",
+    "CUBLAS_",
+    "CUDA_",
+    "CUDNN_",
+    "GCONV_PATH",
+    "GLIBC_",
+    "GOMP_",
+    "KMP_",
+    "LD_",
+    "LOCPATH",
+    "MALLOC_",
+    "MKL_",
+    "NCCL_",
+    "NIX_",
+    "NVIDIA_",
+    "NUMEXPR_",
+    "OMP_",
+    "OPENBLAS_",
+    "PYTORCH_",
+    "RAYON_",
+    "TORCH_",
+    "VECLIB_",
+)
 CALVIN_CAMERA_SHAPES = {"rgb_static": [200, 200, 3], "rgb_gripper": [84, 84, 3]}
 CALVIN_STATE_ADAPTER = "robot_obs[0:7]+robot_obs[14:15]"
 CALVIN_ACTION_ADAPTER = "identity_official_scaled_rel_actions"
@@ -608,36 +743,84 @@ def _validate_training_instruction_coverage(
 def _configure_and_validate_training_runtime(project_root: Path) -> dict[str, Any]:
     """Fail closed on the canonical launcher, lock, imports, and deterministic flags."""
 
+    _inventory_project_source_root()
+    _validate_project_module_origins({"duo_vla", "duo_vla.runtime_integrity"})
     if platform.python_version() != EXPECTED_TRAIN_PYTHON:
         raise RuntimeError(
             f"CALVIN training requires Python {EXPECTED_TRAIN_PYTHON}, found {platform.python_version()}"
         )
+    project_root = project_root.resolve()
     cache_root = Path(os.environ.get("DUO_VLA_CACHE_ROOT", "/root/.cache/duo-vla")).resolve()
     expected_prefix = (cache_root / "venvs/train").resolve()
     if Path(sys.prefix).resolve() != expected_prefix:
         raise RuntimeError(f"CALVIN training requires the pinned train venv: {expected_prefix}")
-    if site.ENABLE_USER_SITE:
+    if sys.flags.safe_path != 1:
+        raise RuntimeError("CALVIN training requires Python safe-path mode")
+    if sys.flags.dont_write_bytecode != 1 or not sys.dont_write_bytecode:
+        raise RuntimeError("CALVIN training requires -B")
+    if sys.flags.no_user_site != 1 or site.ENABLE_USER_SITE:
         raise RuntimeError("CALVIN training requires the user site to be disabled")
-    forbidden = ("LD_LIBRARY_PATH", "LD_PRELOAD", "PYTHONHOME", "PYTHONINSPECT", "PYTHONSTARTUP")
+    if sys.pycache_prefix != "/dev/null":
+        raise RuntimeError("CALVIN training requires an impossible pycache lookup prefix")
+    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    compact_version = f"python{sys.version_info.major}{sys.version_info.minor}"
+    expected_sys_path = [
+        str((project_root / "src").resolve()),
+        str(Path(sys.base_prefix) / "lib" / f"{compact_version}.zip"),
+        str(Path(sys.base_prefix) / "lib" / version),
+        str(Path(sys.base_exec_prefix) / "lib" / version / "lib-dynload"),
+        str(expected_prefix / "lib" / version / "site-packages"),
+    ]
+    if sys.path != expected_sys_path:
+        raise RuntimeError(f"CALVIN training import search path differs: {sys.path}")
+    python_hash_seed = os.environ.get("PYTHONHASHSEED")
+    if python_hash_seed not in {"0", "1", "2"}:
+        raise RuntimeError("CALVIN training requires PYTHONHASHSEED in {0,1,2}")
+    expected_environment = {
+        **REQUIRED_TRAIN_ENVIRONMENT,
+        "DUO_VLA_CACHE_ROOT": str(cache_root),
+        "DUO_VLA_PROJECT_ROOT": str(project_root),
+        "DUO_VLA_TRAIN_VENV": str(expected_prefix),
+        "HF_HOME": str(Path(os.environ.get("HF_HOME", "/root/.cache/huggingface")).resolve()),
+        "PYTHONHASHSEED": python_hash_seed,
+    }
+    forbidden = (
+        "BASH_ENV",
+        "ENV",
+        "GLOBIGNORE",
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "PYTHONHOME",
+        "PYTHONINSPECT",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+    )
     present_forbidden = [name for name in forbidden if os.environ.get(name)]
-    present_nccl = sorted(name for name in os.environ if name.startswith("NCCL_"))
-    if present_forbidden or present_nccl:
+    allowed_relevant = set(expected_environment)
+    unexpected_overrides = sorted(
+        name
+        for name in os.environ
+        if name.startswith(_RELEVANT_TRAIN_ENVIRONMENT_PREFIXES) and name not in allowed_relevant
+    )
+    if present_forbidden or unexpected_overrides:
         raise RuntimeError(
             f"CALVIN training environment contains injection/algorithm overrides: "
-            f"forbidden={present_forbidden}, nccl={present_nccl}"
+            f"forbidden={present_forbidden}, overrides={unexpected_overrides}"
         )
-    observed_environment = {name: os.environ.get(name) for name in REQUIRED_TRAIN_ENVIRONMENT}
-    if observed_environment != REQUIRED_TRAIN_ENVIRONMENT:
+    observed_environment = {name: os.environ.get(name) for name in expected_environment}
+    if observed_environment != expected_environment:
         raise RuntimeError(f"CALVIN training environment differs from the canonical launcher: {observed_environment}")
-    expected_pythonpath = str((project_root / "src").resolve())
-    if os.environ.get("PYTHONPATH") != expected_pythonpath:
-        raise RuntimeError(f"CALVIN training requires PYTHONPATH={expected_pythonpath}")
     lock_path = project_root / "uv.lock"
     if not lock_path.is_file() or file_sha256(lock_path) != TRAIN_LOCK_SHA256:
         raise RuntimeError("CALVIN training lockfile SHA-256 mismatch")
     packages = {name: importlib.metadata.version(name) for name in EXPECTED_TRAIN_PACKAGES}
     if packages != EXPECTED_TRAIN_PACKAGES:
         raise RuntimeError(f"CALVIN training package pin mismatch: {packages}")
+    rank_environment = validate_torchrun_rank_environment(
+        os.environ,
+        required=any(name in os.environ for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE")),
+    )
+    venv_identity = content_address_train_venv(expected_prefix)
 
     site_packages = expected_prefix / f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
     expected_module_roots = {
@@ -686,12 +869,15 @@ def _configure_and_validate_training_runtime(project_root: Path) -> dict[str, An
     if not torch.are_deterministic_algorithms_enabled() or torch.is_deterministic_algorithms_warn_only_enabled():
         raise RuntimeError("CALVIN training could not enable strict deterministic algorithms")
     return {
-        "environment": {**observed_environment, "PYTHONPATH": expected_pythonpath},
+        "environment": dict(sorted(observed_environment.items())),
         "lock_sha256": TRAIN_LOCK_SHA256,
         "module_origins": module_origins,
         "packages": packages,
         "python": platform.python_version(),
+        "static_environment_sha256": static_environment_identity(observed_environment)["sha256"],
         "sys_path": effective_sys_path,
+        "torchrun": rank_environment,
+        "train_venv": venv_identity,
     }
 
 
@@ -793,10 +979,6 @@ def _validate_and_build_interface_config(config: dict[str, Any]) -> ActionInterf
         ),
         "optimization.ema_decay": (float(optimization["ema_decay"]), 0.0),
         "training.data_loader_workers_per_rank": (int(training["data_loader_workers_per_rank"]), 0),
-        "training.permanent_checkpoint_interval": (
-            int(training["permanent_checkpoint_interval"]),
-            int(training["checkpoint_interval"]),
-        ),
         "training.image_augmentation": (training["image_augmentation"], "none"),
         "training.seeds": (list(training["seeds"]), [0, 1, 2]),
         "reproducibility.deterministic_evaluation": (
@@ -812,6 +994,18 @@ def _validate_and_build_interface_config(config: dict[str, Any]) -> ActionInterf
     if mismatches:
         details = {name: required[name] for name in mismatches}
         raise ValueError(f"resolved config is unsupported by this trainer: {details}")
+    checkpoint_interval = training.get("checkpoint_interval")
+    permanent_checkpoint_interval = training.get("permanent_checkpoint_interval")
+    if (
+        type(checkpoint_interval) is not int
+        or checkpoint_interval <= 0
+        or type(permanent_checkpoint_interval) is not int
+        or permanent_checkpoint_interval <= 0
+        or permanent_checkpoint_interval % checkpoint_interval
+    ):
+        raise ValueError(
+            "training.permanent_checkpoint_interval must be a positive multiple of training.checkpoint_interval"
+        )
     prefix_sha256 = benchmark["prefix_geometry_content_sha256"]
     fixed_width = benchmark["fixed_physical_prefix_width"]
     if not (
@@ -935,6 +1129,7 @@ def _initialize_run_journal(
                 )
                 record = validate_resume_checkpoint(output_dir, resume)
                 recovery = quarantine_uncommitted_training_artifacts(output_dir)
+                retention = apply_checkpoint_retention(output_dir)
                 reconcile_metrics_jsonl(output_dir)
                 latest_manifest_sha256 = record.manifest_sha256
                 if recovery.changed:
@@ -943,6 +1138,17 @@ def _initialize_run_journal(
                             {
                                 "recovery_quarantine": recovery.directory,
                                 "moved_paths": recovery.moved_paths,
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                if retention.changed:
+                    print(
+                        json.dumps(
+                            {
+                                "checkpoint_retention_recovered": retention.recovered_transactions,
+                                "checkpoint_retention_retired": retention.retired_paths,
                             },
                             sort_keys=True,
                         ),
@@ -1481,6 +1687,18 @@ def _commit_training_checkpoint(
                 parent_manifest_sha256=parent_manifest_sha256,
                 last_metrics=last_metrics,
             )
+            retention = apply_checkpoint_retention(output_dir)
+            if retention.changed:
+                print(
+                    json.dumps(
+                        {
+                            "checkpoint_retention_recovered": retention.recovered_transactions,
+                            "checkpoint_retention_retired": retention.retired_paths,
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
             result[0] = {"manifest_sha256": manifest_sha256}
         except Exception as exc:
             result[0] = {"error": f"{type(exc).__name__}: {exc}"}
@@ -1574,6 +1792,7 @@ def main() -> None:
     parser.add_argument("--validation-interval", type=int)
     parser.add_argument("--validation-samples", type=int)
     parser.add_argument("--checkpoint-interval", type=int)
+    parser.add_argument("--permanent-checkpoint-interval", type=int)
     parser.add_argument("--log-interval", type=int)
     parser.add_argument("--max-cached-frames", type=int, default=512)
     parser.add_argument(
@@ -1676,6 +1895,11 @@ def main() -> None:
         checkpoint_interval = int(
             training["checkpoint_interval"] if args.checkpoint_interval is None else args.checkpoint_interval
         )
+        permanent_checkpoint_interval = int(
+            training["permanent_checkpoint_interval"]
+            if args.permanent_checkpoint_interval is None
+            else args.permanent_checkpoint_interval
+        )
         log_interval = int(training["log_interval"] if args.log_interval is None else args.log_interval)
         positive_values = {
             "microbatch_size": microbatch_size,
@@ -1683,6 +1907,7 @@ def main() -> None:
             "validation_interval": validation_interval,
             "validation_samples": validation_samples,
             "checkpoint_interval": checkpoint_interval,
+            "permanent_checkpoint_interval": permanent_checkpoint_interval,
             "log_interval": log_interval,
             "max_cached_frames": args.max_cached_frames,
         }
@@ -1693,6 +1918,8 @@ def main() -> None:
             raise ValueError(f"invalid training schedule fields: {invalid}, warmup={warmup_updates}")
         if validation_samples % PHYSICAL_BATCH_SIZE != 0:
             raise ValueError(f"validation_samples must be divisible by the fixed physical batch {PHYSICAL_BATCH_SIZE}")
+        if permanent_checkpoint_interval % checkpoint_interval:
+            raise ValueError("permanent_checkpoint_interval must be a multiple of checkpoint_interval")
         optimization["total_updates"] = total_updates
         optimization["warmup_updates"] = warmup_updates
         optimization["microbatch_size"] = microbatch_size
@@ -1701,9 +1928,7 @@ def main() -> None:
         training["validation_interval"] = validation_interval
         training["validation_samples"] = validation_samples
         training["checkpoint_interval"] = checkpoint_interval
-        # This trainer never prunes committed transactional checkpoints, so
-        # every saved checkpoint is permanent and the resolved fields coincide.
-        training["permanent_checkpoint_interval"] = checkpoint_interval
+        training["permanent_checkpoint_interval"] = permanent_checkpoint_interval
         training["log_interval"] = log_interval
         config["run"] = {"seed": run_seed, "task": args.task, "max_cached_frames": args.max_cached_frames}
         expected_hash_seed = str(run_seed)
@@ -1999,6 +2224,14 @@ def main() -> None:
             _assert_distributed_trainer_state(trainer_state, resume_manifest)
         if trainer_state.next_update > total_updates:
             raise ValueError("resume checkpoint is beyond the configured training budget")
+        parent_checkpoint = (
+            None
+            if parent_manifest_sha256 is None
+            else {
+                "relative_path": args.resume.relative_to(args.output_dir).as_posix(),
+                "update": trainer_state.next_update,
+            }
+        )
 
         execution_end = total_updates
         if args.stop_after_updates is not None:
@@ -2159,6 +2392,10 @@ def main() -> None:
                         "model_id": DEFAULT_DIFFUSION_GEMMA_SPEC.model_id,
                         "member_index_bytes": calvin_identity["member_index"]["bytes"],
                         "parent_manifest_sha256": parent_manifest_sha256,
+                        "checkpoint_retention": make_checkpoint_retention_contract(
+                            permanent_checkpoint_interval=permanent_checkpoint_interval,
+                            parent_checkpoint=parent_checkpoint,
+                        ),
                         "platform": platform.platform(),
                         "physical_batch_size": execution_geometry["physical_batch_size"],
                         "policy_contract": policy_contract.to_dict(),
@@ -2184,6 +2421,10 @@ def main() -> None:
                     parent_manifest_sha256=parent_manifest_sha256,
                     last_metrics=metric,
                 )
+                parent_checkpoint = {
+                    "relative_path": checkpoint_dir.relative_to(args.output_dir).as_posix(),
+                    "update": trainer_state.next_update,
+                }
             _append_metric(
                 metrics_path,
                 metric,

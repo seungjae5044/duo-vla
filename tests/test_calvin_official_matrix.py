@@ -52,6 +52,28 @@ def test_preregistration_creator_rejects_its_own_source_mutation(
         CREATOR._require_creator_source_unchanged()
 
 
+def test_preregistration_output_roots_must_be_empty_real_and_distinct(tmp_path: Path) -> None:
+    runs = tmp_path / "runs"
+    claims = tmp_path / "claims"
+    runs.mkdir()
+    claims.mkdir()
+    captured = EVALUATOR.capture_official_output_roots(runs.resolve(), claims.resolve(), require_empty=True)
+    assert captured["runs"]["path"] == str(runs)
+    assert captured["claims"]["path"] == str(claims)
+
+    (runs / "unexpected").write_text("occupied\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="must be empty"):
+        EVALUATOR.capture_official_output_roots(runs.resolve(), claims.resolve(), require_empty=True)
+    (runs / "unexpected").unlink()
+
+    alias = tmp_path / "runs-alias"
+    alias.symlink_to(runs, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="canonical real path"):
+        EVALUATOR.capture_official_output_roots(alias.absolute(), claims.resolve(), require_empty=True)
+    with pytest.raises(RuntimeError, match="must be distinct"):
+        EVALUATOR.capture_official_output_roots(runs.resolve(), runs.resolve(), require_empty=True)
+
+
 def _geometry() -> dict[str, Any]:
     return {
         "expert_batch_isolation": "sample_isolated_grouped_mm_v1",
@@ -89,6 +111,7 @@ def _calvin_identity(*, metadata_sha256: str = "5" * 64) -> dict[str, Any]:
 
 def _input_cells() -> list[dict[str, Any]]:
     cells = []
+    runtime_sha256 = hashlib.sha256(b"evaluation-runtime").hexdigest()
     for seed, objective, nfe, execution_horizon in EVALUATOR.official_factor_matrix():
         contract = EVALUATOR.selected_policy_contract(objective, nfe)
         cells.append(
@@ -104,36 +127,47 @@ def _input_cells() -> list[dict[str, Any]]:
                     "sampler": contract["sampler"],
                     "train_seed": seed,
                 },
-                "serving_runtime_sha256": hashlib.sha256(f"runtime:{seed}:{objective}".encode()).hexdigest(),
+                "serving_runtime_sha256": runtime_sha256,
             }
         )
     return cells
 
 
 @pytest.fixture
-def manifest(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+def manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     sequences = [[{"initial": 0}, TASKS]]
     digest = EVALUATOR.canonical_sequence_sha256(sequences)
     monkeypatch.setattr(EVALUATOR, "NUM_SEQUENCES", 1)
     monkeypatch.setattr(EVALUATOR, "SEQUENCE_SHA256", digest)
     monkeypatch.setattr(CREATOR, "NUM_SEQUENCES", 1)
     monkeypatch.setattr(CREATOR, "SEQUENCE_SHA256", digest)
+    runs_root = tmp_path / "official-runs"
+    claims_root = tmp_path / "official-claims"
+    runs_root.mkdir()
+    claims_root.mkdir()
+    roots = EVALUATOR.capture_official_output_roots(runs_root.resolve(), claims_root.resolve())
     return CREATOR.build_manifest(
         {"cells": _input_cells()},
         aggregator_sha256=AGGREGATOR._STARTUP_AGGREGATION_SOURCE_IDENTITIES["aggregate_calvin_official.py"]["sha256"],
         attestation_sha256="c" * 64,
         final_freeze_token="frozen before scoring",
+        official_output_roots=roots,
         sequences=sequences,
     )
 
 
 def test_creator_derives_exact_canonical_matrix_and_policy_identities(manifest: dict[str, Any]) -> None:
+    assert EVALUATOR.PREREGISTRATION_SCHEMA.endswith("-v8")
+    assert EVALUATOR.RUN_SCHEMA.endswith("-v5")
+    assert AGGREGATOR.RUN_INVENTORY_SCHEMA.endswith("-v3")
+    assert AGGREGATOR.MATRIX_SUMMARY_SCHEMA.endswith("-v5")
     assert len(manifest["cells"]) == 24
     assert len({cell["cell_id"] for cell in manifest["cells"]}) == 24
     assert len({cell["checkpoint"]["sha256"] for cell in manifest["cells"]}) == 6
     assert manifest["training_seeds"] == [0, 1, 2]
     assert manifest["flow_nfes"] == [1, 5, 10]
     assert manifest["aggregation_python_version"] == EVALUATOR.PYTHON_VERSION
+    assert manifest["official_output_roots"]["schema"] == EVALUATOR.OUTPUT_ROOTS_SCHEMA
     assert (
         manifest["aggregator_sha256"]
         == AGGREGATOR._STARTUP_AGGREGATION_SOURCE_IDENTITIES["aggregate_calvin_official.py"]["sha256"]
@@ -142,6 +176,25 @@ def test_creator_derives_exact_canonical_matrix_and_policy_identities(manifest: 
         policy = cell["policy"]
         expected = EVALUATOR.selected_policy_contract(policy["objective"], policy["nfe"])
         assert policy["identity_sha256"] == EVALUATOR.canonical_sha256(expected)
+        assert cell["output_claim"] == EVALUATOR.derive_output_claim(
+            cell["cell_id"],
+            manifest["official_output_roots"],
+            manifest["final_freeze_token_sha256"],
+        )
+
+
+def test_creator_rejects_caller_supplied_output_claim(manifest: dict[str, Any]) -> None:
+    cells = _input_cells()
+    cells[0]["output_claim"] = {"output_dir": "/alternate"}
+    with pytest.raises(RuntimeError, match="input cell 0 fields differ"):
+        CREATOR.build_manifest(
+            {"cells": cells},
+            aggregator_sha256=manifest["aggregator_sha256"],
+            attestation_sha256=manifest["runtime_attestation_sha256"],
+            final_freeze_token="frozen before scoring",
+            official_output_roots=manifest["official_output_roots"],
+            sequences=manifest["sequences"],
+        )
 
 
 @pytest.mark.parametrize(
@@ -168,6 +221,11 @@ def test_creator_derives_exact_canonical_matrix_and_policy_identities(manifest: 
         ),
         (lambda value: value.__setitem__("aggregator_sha256", "not-a-digest"), "aggregator_sha256"),
         (lambda value: value.__setitem__("aggregation_python_version", "3.11.0"), "Python 3.8.20"),
+        (lambda value: value.__setitem__("policy_warmup_calls", 0), "warm-up count"),
+        (
+            lambda value: value["cells"][0].__setitem__("serving_runtime_sha256", "f" * 64),
+            "one evaluation serving runtime",
+        ),
     ],
 )
 def test_preregistration_rejects_missing_duplicate_and_off_matrix_cells(
@@ -184,15 +242,20 @@ def test_preregistration_rejects_missing_duplicate_and_off_matrix_cells(
 
 
 def _inventory(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
+    del root
     runs = []
     for cell in manifest["cells"]:
-        output_dir = root / cell["cell_id"]
+        output_dir = Path(cell["output_claim"]["output_dir"])
         output_dir.mkdir()
+        claim_path = Path(cell["output_claim"]["claim_path"])
+        claim_path.write_text("{}\n", encoding="utf-8")
+        claim_path.with_suffix(".json.sha256").write_text("placeholder\n", encoding="utf-8")
         runs.append(
             {
                 "cell_id": cell["cell_id"],
+                "claim_json_sha256": "c" * 64,
+                "completion_json_sha256": "f" * 64,
                 "episodes_jsonl_sha256": "e" * 64,
-                "output_dir": str(output_dir),
                 "run_json_sha256": "a" * 64,
                 "summary_json_sha256": "b" * 64,
             }
@@ -223,7 +286,16 @@ def test_aggregator_requires_exactly_one_complete_run_per_cell(
             "execution_horizon": cell["execution_horizon"],
             "nfe": policy["nfe"],
             "objective": policy["objective"],
+            "policy_latency_p50_seconds": 0.2 + seed,
+            "policy_latency_p95_seconds": 0.3 + seed,
+            "policy_throughput_calls_per_second": 4.0 + seed,
+            "policy_warmup_actions_sha256": ["1" * 64, "2" * 64],
+            "policy_warmup_calls": manifest["policy_warmup_calls"],
+            "rollout_environment_actions_per_second": 5.0 + seed,
             "run_json_sha256": entry["run_json_sha256"],
+            "server_latency_p50_seconds": 0.1 + seed,
+            "server_latency_p95_seconds": 0.15 + seed,
+            "server_throughput_calls_per_second": 8.0 + seed,
             "summary_json_sha256": entry["summary_json_sha256"],
             "train_seed": seed,
         }
@@ -235,34 +307,81 @@ def test_aggregator_requires_exactly_one_complete_run_per_cell(
         "d" * 64,
         inventory,
         "f" * 64,
-        inventory_dir=tmp_path,
     )
     assert result["cell_count"] == 24
     assert result["comparison_count"] == 8
+    assert result["policy_warmup_calls"] == manifest["policy_warmup_calls"]
+    assert result["serving_runtime_sha256"] == manifest["cells"][0]["serving_runtime_sha256"]
     assert len(result["content_sha256"]) == 64
     assert result["aggregator_sha256"] == manifest["aggregator_sha256"]
     assert result["aggregation_source_identities"] == AGGREGATOR._STARTUP_AGGREGATION_SOURCE_IDENTITIES
     assert all(len(group["metrics"]["AvgLen"]["values_by_train_seed"]) == 3 for group in result["comparisons"])
 
+    extra_claim = Path(manifest["official_output_roots"]["claims"]["path"]) / "unregistered.json"
+    extra_claim.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="claim root inventory is not exact"):
+        AGGREGATOR.aggregate_matrix(
+            manifest,
+            "d" * 64,
+            inventory,
+            "f" * 64,
+        )
+    extra_claim.unlink()
+
+    first_cell = manifest["cells"][0]
+    first_output = Path(first_cell["output_claim"]["output_dir"])
+    first_output.rmdir()
+    first_output.symlink_to(Path(manifest["official_output_roots"]["runs"]["path"]) / manifest["cells"][1]["cell_id"])
+    with pytest.raises(RuntimeError, match="real directory"):
+        AGGREGATOR.aggregate_matrix(
+            manifest,
+            "d" * 64,
+            inventory,
+            "f" * 64,
+        )
+    first_output.unlink()
+    first_output.mkdir()
+
+    def changed_warmup(entry: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        value = validate(entry, **kwargs)
+        if kwargs["registered_cell"]["execution_horizon"] == 4:
+            value["policy_warmup_actions_sha256"] = ["3" * 64, "4" * 64]
+        return value
+
+    monkeypatch.setattr(AGGREGATOR, "validate_run_artifact", changed_warmup)
+    with pytest.raises(RuntimeError, match="cross-K warm-up policy outputs"):
+        AGGREGATOR.aggregate_matrix(
+            manifest,
+            "d" * 64,
+            inventory,
+            "f" * 64,
+        )
+    monkeypatch.setattr(AGGREGATOR, "validate_run_artifact", validate)
+
     changed_source = copy.deepcopy(manifest)
     changed_source["aggregator_sha256"] = "a" * 64
     with pytest.raises(RuntimeError, match="pre-registered aggregator"):
-        AGGREGATOR.aggregate_matrix(changed_source, "d" * 64, inventory, "f" * 64, inventory_dir=tmp_path)
+        AGGREGATOR.aggregate_matrix(changed_source, "d" * 64, inventory, "f" * 64)
 
     missing = copy.deepcopy(inventory)
     missing["runs"].pop()
     with pytest.raises(RuntimeError, match="exactly 24"):
-        AGGREGATOR.aggregate_matrix(manifest, "d" * 64, missing, "f" * 64, inventory_dir=tmp_path)
+        AGGREGATOR.aggregate_matrix(manifest, "d" * 64, missing, "f" * 64)
+
+    arbitrary_path = copy.deepcopy(inventory)
+    arbitrary_path["runs"][0]["output_dir"] = "/alternate/run"
+    with pytest.raises(RuntimeError, match="run inventory entry fields differ"):
+        AGGREGATOR.aggregate_matrix(manifest, "d" * 64, arbitrary_path, "f" * 64)
 
     duplicate = copy.deepcopy(inventory)
     duplicate["runs"][-1]["cell_id"] = duplicate["runs"][0]["cell_id"]
     with pytest.raises(RuntimeError, match="duplicate"):
-        AGGREGATOR.aggregate_matrix(manifest, "d" * 64, duplicate, "f" * 64, inventory_dir=tmp_path)
+        AGGREGATOR.aggregate_matrix(manifest, "d" * 64, duplicate, "f" * 64)
 
     off_matrix = copy.deepcopy(inventory)
     off_matrix["runs"][-1]["cell_id"] = "seed-99-flow-nfe-99-k-99"
     with pytest.raises(RuntimeError, match="missing or off-matrix"):
-        AGGREGATOR.aggregate_matrix(manifest, "d" * 64, off_matrix, "f" * 64, inventory_dir=tmp_path)
+        AGGREGATOR.aggregate_matrix(manifest, "d" * 64, off_matrix, "f" * 64)
 
 
 def test_metric_aggregate_uses_n_minus_one_sample_standard_deviation() -> None:
@@ -274,6 +393,24 @@ def test_metric_aggregate_uses_n_minus_one_sample_standard_deviation() -> None:
     aggregate = AGGREGATOR._metric_aggregate(values, "SR1")
     assert aggregate["mean"] == 1.0
     assert aggregate["sample_std"] == 1.0
+
+
+def test_matrix_output_must_stay_outside_exact_official_roots(
+    tmp_path: Path,
+    manifest: dict[str, Any],
+) -> None:
+    external = tmp_path / "matrix.json"
+    assert AGGREGATOR._validate_matrix_output_path(external, manifest) == external
+    with pytest.raises(RuntimeError, match="outside the official runs root"):
+        AGGREGATOR._validate_matrix_output_path(
+            Path(manifest["official_output_roots"]["runs"]["path"]) / "matrix.json",
+            manifest,
+        )
+    with pytest.raises(RuntimeError, match="outside the official claims root"):
+        AGGREGATOR._validate_matrix_output_path(
+            Path(manifest["official_output_roots"]["claims"]["path"]) / "matrix.json",
+            manifest,
+        )
 
 
 @pytest.mark.parametrize("mutated_name", AGGREGATOR._AGGREGATION_SOURCE_NAMES)
@@ -459,12 +596,12 @@ def _failed_sequence_record(sequence_sha256: str) -> dict[str, Any]:
         "max_environment_actions": 360,
         "policy_calls": calls,
         "policy_identity_first_replan_idx": 0,
-        "policy_latency_p50_seconds": 0.0,
-        "policy_latency_p95_seconds": 0.0,
-        "policy_latency_seconds": [0.0] * calls,
-        "server_latency_p50_seconds": 0.0,
-        "server_latency_p95_seconds": 0.0,
-        "server_latency_seconds": [0.0] * calls,
+        "policy_latency_p50_seconds": 0.2,
+        "policy_latency_p95_seconds": 0.2,
+        "policy_latency_seconds": [0.2] * calls,
+        "server_latency_p50_seconds": 0.1,
+        "server_latency_p95_seconds": 0.1,
+        "server_latency_seconds": [0.1] * calls,
         "steps_to_success": None,
         "subtask_idx": 0,
         "subtask_name": TASKS[0],
@@ -480,6 +617,53 @@ def _failed_sequence_record(sequence_sha256: str) -> dict[str, Any]:
         "sequence_success": False,
         "subtasks": [subtask],
         "successful_subtasks": 0,
+    }
+
+
+def _policy_warmup_record(manifest: dict[str, Any], cell: dict[str, Any]) -> dict[str, Any]:
+    rgb_static, rgb_gripper, state = EVALUATOR.synthetic_policy_warmup_inputs()
+    subtask_name = manifest["sequences"][0][1][0]
+    instruction = INSTRUCTIONS[subtask_name]
+    policy = cell["policy"]
+    reports = []
+    for warmup_index in range(manifest["policy_warmup_calls"]):
+        warmup_replan_idx = EVALUATOR.POLICY_WARMUP_REPLAN_BASE + warmup_index
+        reports.append(
+            {
+                "actions_sha256": hashlib.sha256(f"actions:{warmup_index}".encode()).hexdigest(),
+                "discarded": True,
+                "evaluation_seed": EVALUATOR.EVALUATION_SEED,
+                "execution_horizon": cell["execution_horizon"],
+                "gripper_rgb_sha256": EVALUATOR._tensor_bytes_sha256(rgb_gripper),
+                "inference_seed": EVALUATOR._calvin_bridge.calvin_replan_seed(
+                    EVALUATOR.EVALUATION_SEED,
+                    EVALUATOR.SEQUENCE_SHA256,
+                    0,
+                    0,
+                    subtask_name,
+                    warmup_replan_idx,
+                ),
+                "instruction_sha256": hashlib.sha256(instruction.encode()).hexdigest(),
+                "nfe": policy["nfe"],
+                "objective": policy["objective"],
+                "policy_latency_seconds": 0.2,
+                "replan_idx": warmup_replan_idx,
+                "sampler": policy["sampler"],
+                "sequence_idx": 0,
+                "sequence_sha256": EVALUATOR.SEQUENCE_SHA256,
+                "server_latency_seconds": 0.1,
+                "state_sha256": EVALUATOR._tensor_bytes_sha256(state),
+                "static_rgb_sha256": EVALUATOR._tensor_bytes_sha256(rgb_static),
+                "subtask_idx": 0,
+                "subtask_name": subtask_name,
+                "train_seed": policy["train_seed"],
+                "warmup_index": warmup_index,
+            }
+        )
+    return {
+        "count": manifest["policy_warmup_calls"],
+        "included_in_episode_latency": False,
+        "reports": reports,
     }
 
 
@@ -528,6 +712,18 @@ def test_episode_authentication_rejects_metric_and_task_tampering(
             expected_instructions=INSTRUCTIONS,
         )
 
+    impossible_latency = copy.deepcopy(record)
+    impossible_latency["subtasks"][0]["server_latency_seconds"] = [0.3] * 90
+    impossible_latency["subtasks"][0]["server_latency_p50_seconds"] = 0.3
+    impossible_latency["subtasks"][0]["server_latency_p95_seconds"] = 0.3
+    with pytest.raises(RuntimeError, match="server latency exceeds"):
+        AGGREGATOR.validate_sequence_records(
+            [impossible_latency],
+            sequences=sequences,
+            execution_horizon=4,
+            expected_instructions=INSTRUCTIONS,
+        )
+
 
 def test_run_artifact_is_bound_and_summary_is_recomputed(
     tmp_path: Path,
@@ -544,6 +740,7 @@ def test_run_artifact_is_bound_and_summary_is_recomputed(
         for value in manifest["cells"]
         if value["cell_id"] == EVALUATOR.official_cell_id(0, "rectified_flow", 5, 4)
     )
+
     record = _failed_sequence_record(digest)
     episodes_payload = (json.dumps(record, allow_nan=False, separators=(",", ":"), sort_keys=True) + "\n").encode()
     episodes_sha256 = hashlib.sha256(episodes_payload).hexdigest()
@@ -611,11 +808,21 @@ def test_run_artifact_is_bound_and_summary_is_recomputed(
         "status": "ok",
         "train_seed": policy["train_seed"],
     }
+    claim = EVALUATOR.build_claim_record(
+        cell["output_claim"],
+        cell_id=cell["cell_id"],
+        preregistration_sha256="d" * 64,
+        final_freeze_token_sha256=manifest["final_freeze_token_sha256"],
+        created_utc="2026-08-30T00:00:00+00:00",
+    )
+    claim_payload = (json.dumps(claim, allow_nan=False, indent=2, sort_keys=True) + "\n").encode()
+    claim_sha256 = hashlib.sha256(claim_payload).hexdigest()
     run = {
         "annotation": annotation,
         "attestation": attestation,
         "attestation_sha256": attestation["attestation_sha256"],
         "cell": cell,
+        "claim_json_sha256": claim_sha256,
         "created_utc": "2026-08-30T00:00:00+00:00",
         "environment": {
             "control_frequency_hz": 30,
@@ -630,9 +837,11 @@ def test_run_artifact_is_bound_and_summary_is_recomputed(
         "final_freeze_token_sha256": manifest["final_freeze_token_sha256"],
         "finished_utc": "2026-08-30T01:00:00+00:00",
         "mode": "official-score",
+        "output_claim": cell["output_claim"],
         "oracle": oracle,
         "policy_health": health,
         "policy_socket": "/run/calvin.sock",
+        "policy_warmup": _policy_warmup_record(manifest, cell),
         "preregistration_manifest": "/freeze/calvin.json",
         "preregistration_sha256": "d" * 64,
         "protocol": EVALUATOR.PROTOCOL,
@@ -645,34 +854,124 @@ def test_run_artifact_is_bound_and_summary_is_recomputed(
     }
     run_payload = (json.dumps(run, allow_nan=False, indent=2, sort_keys=True) + "\n").encode()
     run_sha256 = hashlib.sha256(run_payload).hexdigest()
-    output_dir = tmp_path / "run"
+    output_dir = Path(cell["output_claim"]["output_dir"])
     output_dir.mkdir()
     (output_dir / "episodes.jsonl").write_bytes(episodes_payload)
     (output_dir / "summary.json").write_bytes(summary_payload)
     (output_dir / "run.json").write_bytes(run_payload)
+    claim_path = Path(cell["output_claim"]["claim_path"])
+    claim_path.write_bytes(claim_payload)
+    claim_path.with_suffix(".json.sha256").write_text(
+        f"{claim_sha256}  {claim_path.name}\n",
+        encoding="ascii",
+    )
+    completion = {
+        "cell_id": cell["cell_id"],
+        "claim_json_sha256": claim_sha256,
+        "episodes_jsonl_sha256": episodes_sha256,
+        "preregistration_sha256": "d" * 64,
+        "run_json_sha256": run_sha256,
+        "schema": EVALUATOR.COMPLETION_SCHEMA,
+        "sequence_records": 1,
+        "summary_json_sha256": summary_sha256,
+    }
+    completion_payload = (json.dumps(completion, allow_nan=False, indent=2, sort_keys=True) + "\n").encode()
+    completion_sha256 = hashlib.sha256(completion_payload).hexdigest()
+    completion_path = output_dir / "completion.json"
+    completion_path.write_bytes(completion_payload)
+    completion_path.with_suffix(".json.sha256").write_text(
+        f"{completion_sha256}  {completion_path.name}\n",
+        encoding="ascii",
+    )
     entry = {
         "cell_id": cell["cell_id"],
+        "claim_json_sha256": claim_sha256,
+        "completion_json_sha256": completion_sha256,
         "episodes_jsonl_sha256": episodes_sha256,
-        "output_dir": str(output_dir),
         "run_json_sha256": run_sha256,
         "summary_json_sha256": summary_sha256,
     }
 
     result = AGGREGATOR.validate_run_artifact(
         entry,
-        inventory_dir=tmp_path,
         preregistration=manifest,
         preregistration_sha256="d" * 64,
         registered_cell=cell,
     )
     assert result["AvgLen"] == 0.0
     assert result["cell_id"] == cell["cell_id"]
+    assert result["policy_latency_p50_seconds"] == pytest.approx(0.2)
+    assert result["policy_latency_p95_seconds"] == pytest.approx(0.2)
+    assert result["policy_throughput_calls_per_second"] == pytest.approx(5.0)
+    assert result["server_latency_p50_seconds"] == pytest.approx(0.1)
+    assert result["server_latency_p95_seconds"] == pytest.approx(0.1)
+    assert result["server_throughput_calls_per_second"] == pytest.approx(10.0)
+
+    for incomplete_status in ("running", "failed"):
+        incomplete_run = dict(run, status=incomplete_status)
+        incomplete_payload = (json.dumps(incomplete_run, allow_nan=False, indent=2, sort_keys=True) + "\n").encode()
+        (output_dir / "run.json").write_bytes(incomplete_payload)
+        with pytest.raises(RuntimeError, match="not complete"):
+            AGGREGATOR.validate_run_artifact(
+                dict(entry, run_json_sha256=hashlib.sha256(incomplete_payload).hexdigest()),
+                preregistration=manifest,
+                preregistration_sha256="d" * 64,
+                registered_cell=cell,
+            )
+    (output_dir / "run.json").write_bytes(run_payload)
+
+    tampered_run = copy.deepcopy(run)
+    tampered_run["policy_warmup"]["included_in_episode_latency"] = True
+    tampered_run_payload = (json.dumps(tampered_run, allow_nan=False, indent=2, sort_keys=True) + "\n").encode()
+    (output_dir / "run.json").write_bytes(tampered_run_payload)
+    tampered_entry = dict(entry, run_json_sha256=hashlib.sha256(tampered_run_payload).hexdigest())
+    with pytest.raises(RuntimeError, match="entered episode latency"):
+        AGGREGATOR.validate_run_artifact(
+            tampered_entry,
+            preregistration=manifest,
+            preregistration_sha256="d" * 64,
+            registered_cell=cell,
+        )
+    (output_dir / "run.json").write_bytes(run_payload)
 
     (output_dir / "summary.json").write_text("{}\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="externally supplied SHA-256"):
         AGGREGATOR.validate_run_artifact(
             entry,
-            inventory_dir=tmp_path,
+            preregistration=manifest,
+            preregistration_sha256="d" * 64,
+            registered_cell=cell,
+        )
+
+    (output_dir / "summary.json").write_bytes(summary_payload)
+    tampered_completion = dict(completion, run_json_sha256="0" * 64)
+    tampered_completion_payload = (
+        json.dumps(tampered_completion, allow_nan=False, indent=2, sort_keys=True) + "\n"
+    ).encode()
+    tampered_completion_sha256 = hashlib.sha256(tampered_completion_payload).hexdigest()
+    completion_path.write_bytes(tampered_completion_payload)
+    completion_path.with_suffix(".json.sha256").write_text(
+        f"{tampered_completion_sha256}  {completion_path.name}\n",
+        encoding="ascii",
+    )
+    with pytest.raises(RuntimeError, match="completion record binding"):
+        AGGREGATOR.validate_run_artifact(
+            dict(entry, completion_json_sha256=tampered_completion_sha256),
+            preregistration=manifest,
+            preregistration_sha256="d" * 64,
+            registered_cell=cell,
+        )
+
+    completion_path.write_bytes(completion_payload)
+    completion_path.with_suffix(".json.sha256").write_text(
+        f"{completion_sha256}  {completion_path.name}\n",
+        encoding="ascii",
+    )
+    external_link = tmp_path / "external-run-link.json"
+    external_link.hardlink_to(output_dir / "run.json")
+    with pytest.raises(RuntimeError, match="hard-linked"):
+        AGGREGATOR.validate_run_artifact(
+            entry,
             preregistration=manifest,
             preregistration_sha256="d" * 64,
             registered_cell=cell,

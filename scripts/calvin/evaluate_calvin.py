@@ -18,7 +18,7 @@ task oracle.  It additionally requires a pre-registration JSON document with
 this exact top-level shape::
 
     {
-      "schema": "duovla-calvin-official-preregistration-v6",
+      "schema": "duovla-calvin-official-preregistration-v8",
       "aggregation_python_version": "3.8.20",
       "aggregator_sha256": "sha256 of aggregate_calvin_official.py",
       "benchmark_protocol": "duovla-calvin-abc-to-d-v1",
@@ -28,6 +28,12 @@ this exact top-level shape::
       "final_checkpoint_update": 30000,
       "flow_nfes": [1, 5, 10],
       "inference_seed_domain": "duo-vla-calvin-inference-seed-v1",
+      "official_output_roots": {
+        "schema": "duovla-calvin-official-output-roots-v1",
+        "runs": {"path": "/canonical/runs", "device": 1, "inode": 2},
+        "claims": {"path": "/canonical/claims", "device": 1, "inode": 3}
+      },
+      "policy_warmup_calls": 2,
       "sequence_count": 1000,
       "sequence_sha256": "90191d...fd6446",
       "sequences": [...the complete canonical official sequence list...],
@@ -36,6 +42,12 @@ this exact top-level shape::
       "cells": [{
         "cell_id": "seed-0-flow-nfe-10-k-4",
         "checkpoint": {"sha256": "..."},
+        "output_claim": {
+          "schema": "duovla-calvin-official-output-claim-v1",
+          "claim_id_sha256": "...",
+          "claim_path": "/canonical/claims/seed-0-flow-nfe-10-k-4.json",
+          "output_dir": "/canonical/runs/seed-0-flow-nfe-10-k-4"
+        },
         "policy": {
           "identity_sha256": "...",
           "inference_seed_behavior": "episode_identity_gaussian_noise",
@@ -221,11 +233,18 @@ EVALUATION_SEED = 0
 MAX_ACTIONS_PER_SUBTASK = 360
 CONTROL_FREQUENCY_HZ = 30
 VALIDATION_SCENE = "calvin_scene_D"
-PREREGISTRATION_SCHEMA = "duovla-calvin-official-preregistration-v6"
-RUN_SCHEMA = "duovla-calvin-official-run-v3"
+PREREGISTRATION_SCHEMA = "duovla-calvin-official-preregistration-v8"
+RUN_SCHEMA = "duovla-calvin-official-run-v5"
 EPISODE_SCHEMA = "duovla-calvin-official-sequence-v1"
-SUMMARY_SCHEMA = "duovla-calvin-official-summary-v1"
+SUMMARY_SCHEMA = "duovla-calvin-official-summary-v2"
+OUTPUT_ROOTS_SCHEMA = "duovla-calvin-official-output-roots-v1"
+OUTPUT_CLAIM_SCHEMA = "duovla-calvin-official-output-claim-v1"
+CLAIM_RECORD_SCHEMA = "duovla-calvin-official-claim-record-v1"
+COMPLETION_SCHEMA = "duovla-calvin-official-completion-v1"
 FINAL_CHECKPOINT_UPDATE = 30_000
+DEFAULT_POLICY_WARMUP_CALLS = 2
+MIN_POLICY_WARMUP_CALLS = 1
+POLICY_WARMUP_REPLAN_BASE = MAX_ACTIONS_PER_SUBTASK
 OFFICIAL_TRAIN_SEEDS = (0, 1, 2)
 OFFICIAL_FLOW_NFES = (1, 5, 10)
 OFFICIAL_DIRECT_NFE = 1
@@ -242,6 +261,8 @@ _PREREGISTRATION_FIELDS = {
     "final_freeze_token_sha256",
     "flow_nfes",
     "inference_seed_domain",
+    "policy_warmup_calls",
+    "official_output_roots",
     "schema",
     "sequence_count",
     "sequence_sha256",
@@ -256,8 +277,10 @@ _CELL_FIELDS = {
     "execution_geometry",
     "execution_horizon",
     "policy",
+    "output_claim",
     "serving_runtime_sha256",
 }
+_CELL_CREATOR_FIELDS = _CELL_FIELDS - {"output_claim"}
 _CHECKPOINT_FIELDS = {"sha256"}
 _POLICY_FIELDS = {
     "identity_sha256",
@@ -268,6 +291,28 @@ _POLICY_FIELDS = {
     "train_seed",
 }
 _POLICY_CREATOR_FIELDS = _POLICY_FIELDS - {"identity_sha256"}
+_OUTPUT_ROOTS_FIELDS = {"claims", "runs", "schema"}
+_OUTPUT_ROOT_IDENTITY_FIELDS = {"device", "inode", "path"}
+_OUTPUT_CLAIM_FIELDS = {"claim_id_sha256", "claim_path", "output_dir", "schema"}
+_CLAIM_RECORD_FIELDS = {
+    "cell_id",
+    "claim_id_sha256",
+    "created_utc",
+    "final_freeze_token_sha256",
+    "output_dir",
+    "preregistration_sha256",
+    "schema",
+}
+_COMPLETION_FIELDS = {
+    "cell_id",
+    "claim_json_sha256",
+    "episodes_jsonl_sha256",
+    "preregistration_sha256",
+    "run_json_sha256",
+    "schema",
+    "sequence_records",
+    "summary_json_sha256",
+}
 _HEALTH_FIELDS = {
     "action_dim",
     "action_horizon",
@@ -450,6 +495,151 @@ def canonical_sha256(value: Any) -> str:
     """Hash a finite canonical JSON value."""
 
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _real_directory_identity(path: Path, *, name: str, require_empty: bool = False) -> Dict[str, Any]:
+    """Bind one canonical, non-symlink directory to its live device/inode."""
+
+    require(hasattr(os, "O_NOFOLLOW"), "official output roots require O_NOFOLLOW")
+    candidate = Path(path)
+    require(candidate.is_absolute(), f"{name} must be an absolute path")
+    try:
+        canonical = candidate.resolve(strict=True)
+        before = os.lstat(str(candidate))
+    except OSError as exc:
+        raise RuntimeError(f"cannot resolve {name}: {candidate}") from exc
+    require(canonical == candidate, f"{name} must be a canonical real path")
+    require(stat.S_ISDIR(before.st_mode), f"{name} must be a real directory")
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    try:
+        descriptor = os.open(str(candidate), flags)
+    except OSError as exc:
+        raise RuntimeError(f"cannot open {name}: {candidate}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        require(
+            stat.S_ISDIR(opened.st_mode) and opened.st_dev == before.st_dev and opened.st_ino == before.st_ino,
+            f"{name} identity changed while being opened",
+        )
+        if require_empty:
+            try:
+                entries = os.listdir(descriptor)
+            except (OSError, TypeError) as exc:
+                raise RuntimeError(f"cannot inspect {name}") from exc
+            require(not entries, f"{name} must be empty when pre-registration is created")
+        after = os.fstat(descriptor)
+        require(
+            after.st_dev == opened.st_dev and after.st_ino == opened.st_ino,
+            f"{name} identity changed while being inspected",
+        )
+    finally:
+        os.close(descriptor)
+    return {"device": opened.st_dev, "inode": opened.st_ino, "path": str(candidate)}
+
+
+def capture_official_output_roots(
+    runs_root: Path,
+    claims_root: Path,
+    *,
+    require_empty: bool = False,
+) -> Dict[str, Any]:
+    """Capture the two dedicated roots used by all 24 official attempts."""
+
+    runs = _real_directory_identity(Path(runs_root), name="official run root", require_empty=require_empty)
+    claims = _real_directory_identity(Path(claims_root), name="official claim root", require_empty=require_empty)
+    require(runs["path"] != claims["path"], "official run and claim roots must be distinct")
+    common = os.path.commonpath((runs["path"], claims["path"]))
+    require(
+        common not in (runs["path"], claims["path"]),
+        "official run and claim roots must not contain one another",
+    )
+    require(
+        (runs["device"], runs["inode"]) != (claims["device"], claims["inode"]),
+        "official run and claim roots must be different directories",
+    )
+    return {"claims": claims, "runs": runs, "schema": OUTPUT_ROOTS_SCHEMA}
+
+
+def validate_official_output_roots(value: Any, *, require_live: bool = False) -> Dict[str, Any]:
+    """Validate recorded root identities and optionally match their live inodes."""
+
+    require(isinstance(value, Mapping), "official output roots must be an object")
+    _require_exact_keys(value, _OUTPUT_ROOTS_FIELDS, "official output roots")
+    require(value["schema"] == OUTPUT_ROOTS_SCHEMA, "official output roots schema mismatch")
+    checked = {}  # type: Dict[str, Dict[str, Any]]
+    for key in ("runs", "claims"):
+        identity = value[key]
+        require(isinstance(identity, Mapping), f"official {key} root identity must be an object")
+        _require_exact_keys(identity, _OUTPUT_ROOT_IDENTITY_FIELDS, f"official {key} root identity")
+        path = identity["path"]
+        require(isinstance(path, str) and bool(path), f"official {key} root path is invalid")
+        candidate = Path(path)
+        require(candidate.is_absolute() and str(candidate) == path, f"official {key} root path is not canonical")
+        for field in ("device", "inode"):
+            require(type(identity[field]) is int and identity[field] >= 0, f"official {key} root {field} is invalid")
+        checked[key] = dict(identity)
+    require(checked["runs"]["path"] != checked["claims"]["path"], "official output roots must be distinct")
+    common = os.path.commonpath((checked["runs"]["path"], checked["claims"]["path"]))
+    require(
+        common not in (checked["runs"]["path"], checked["claims"]["path"]),
+        "official output roots must not contain one another",
+    )
+    require(
+        (checked["runs"]["device"], checked["runs"]["inode"])
+        != (checked["claims"]["device"], checked["claims"]["inode"]),
+        "official output roots must identify different directories",
+    )
+    if require_live:
+        for key in ("runs", "claims"):
+            observed = _real_directory_identity(Path(checked[key]["path"]), name=f"official {key} root")
+            require(observed == checked[key], f"official {key} root identity drifted after pre-registration")
+    return {"claims": checked["claims"], "runs": checked["runs"], "schema": OUTPUT_ROOTS_SCHEMA}
+
+
+def derive_output_claim(
+    cell_id: str,
+    roots: Mapping[str, Any],
+    final_freeze_token_sha256: str,
+) -> Dict[str, Any]:
+    """Derive, rather than accept, the sole run/claim paths for one cell."""
+
+    require(isinstance(cell_id, str) and bool(cell_id), "output claim cell ID is invalid")
+    checked_roots = validate_official_output_roots(roots)
+    _require_sha256(final_freeze_token_sha256, "output claim freeze-token SHA-256")
+    output_dir = str(Path(checked_roots["runs"]["path"]) / cell_id)
+    claim_path = str(Path(checked_roots["claims"]["path"]) / f"{cell_id}.json")
+    identity_payload = {
+        "cell_id": cell_id,
+        "claim_path": claim_path,
+        "final_freeze_token_sha256": final_freeze_token_sha256,
+        "output_dir": output_dir,
+        "protocol": PROTOCOL,
+    }
+    return {
+        "claim_id_sha256": canonical_sha256(identity_payload),
+        "claim_path": claim_path,
+        "output_dir": output_dir,
+        "schema": OUTPUT_CLAIM_SCHEMA,
+    }
+
+
+def validate_output_claim(
+    value: Any,
+    *,
+    cell_id: str,
+    roots: Mapping[str, Any],
+    final_freeze_token_sha256: str,
+) -> Dict[str, Any]:
+    require(isinstance(value, Mapping), "cell output claim must be an object")
+    _require_exact_keys(value, _OUTPUT_CLAIM_FIELDS, "cell output claim")
+    require(value["schema"] == OUTPUT_CLAIM_SCHEMA, "cell output claim schema mismatch")
+    expected = derive_output_claim(cell_id, roots, final_freeze_token_sha256)
+    require(canonical_json_bytes(value) == canonical_json_bytes(expected), "cell output claim is not canonical")
+    return dict(value)
 
 
 def official_cell_id(train_seed: int, objective: str, nfe: int, execution_horizon: int) -> str:
@@ -698,6 +888,253 @@ def first_language_phrase(language_annotations: Any, subtask_name: str) -> str:
     return phrase
 
 
+_POLICY_WARMUP_FIELDS = {
+    "actions_sha256",
+    "discarded",
+    "evaluation_seed",
+    "execution_horizon",
+    "gripper_rgb_sha256",
+    "inference_seed",
+    "instruction_sha256",
+    "nfe",
+    "objective",
+    "policy_latency_seconds",
+    "replan_idx",
+    "sampler",
+    "sequence_idx",
+    "sequence_sha256",
+    "server_latency_seconds",
+    "state_sha256",
+    "static_rgb_sha256",
+    "subtask_idx",
+    "subtask_name",
+    "train_seed",
+    "warmup_index",
+}
+
+
+def synthetic_policy_warmup_inputs() -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return deterministic, simulator-independent inputs for policy warm-up."""
+
+    static_values = np.arange(math.prod(STATIC_IMAGE_SHAPE), dtype=np.uint32).reshape(STATIC_IMAGE_SHAPE)
+    gripper_values = np.arange(math.prod(GRIPPER_IMAGE_SHAPE), dtype=np.uint32).reshape(GRIPPER_IMAGE_SHAPE)
+    rgb_static = (static_values % 251).astype(np.uint8)
+    rgb_gripper = ((gripper_values * 7 + 3) % 251).astype(np.uint8)
+    state = np.zeros(STATE_DIM, dtype=np.float32)
+    state[-1] = -1.0
+    return rgb_static, rgb_gripper, state
+
+
+def _tensor_bytes_sha256(value: np.ndarray) -> str:
+    return hashlib.sha256(np.ascontiguousarray(value).tobytes(order="C")).hexdigest()
+
+
+def validate_policy_warmup(
+    value: Any,
+    *,
+    count: int,
+    sequences: Sequence[Any],
+    language_annotations: Any,
+    execution_horizon: int,
+    policy: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Authenticate the discarded synthetic calls recorded before scoring."""
+
+    require(type(count) is int and count >= MIN_POLICY_WARMUP_CALLS, "policy warm-up count is below the minimum")
+    require(isinstance(value, Mapping), "policy warm-up record must be an object")
+    _require_exact_keys(value, {"count", "included_in_episode_latency", "reports"}, "policy warm-up record")
+    require(type(value["count"]) is int and value["count"] == count, "policy warm-up count drifted")
+    require(value["included_in_episode_latency"] is False, "policy warm-up calls entered episode latency")
+    reports = value["reports"]
+    require(isinstance(reports, list) and len(reports) == count, "policy warm-up report count drifted")
+    require(bool(sequences), "policy warm-up requires the registered sequence inventory")
+    first_sequence = sequences[0]
+    require(isinstance(first_sequence, (list, tuple)) and len(first_sequence) == 2, "warm-up sequence is invalid")
+    first_tasks = first_sequence[1]
+    require(isinstance(first_tasks, (list, tuple)) and bool(first_tasks), "warm-up task inventory is invalid")
+    subtask_name = first_tasks[0]
+    require(isinstance(subtask_name, str) and bool(subtask_name), "warm-up task name is invalid")
+    instruction = first_language_phrase(language_annotations, subtask_name)
+    rgb_static, rgb_gripper, state = synthetic_policy_warmup_inputs()
+    expected_hashes = {
+        "gripper_rgb_sha256": _tensor_bytes_sha256(rgb_gripper),
+        "instruction_sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
+        "state_sha256": _tensor_bytes_sha256(state),
+        "static_rgb_sha256": _tensor_bytes_sha256(rgb_static),
+    }
+    train_seed = policy.get("train_seed")
+    require(type(train_seed) is int and train_seed in OFFICIAL_TRAIN_SEEDS, "warm-up policy seed is invalid")
+    checked = []  # type: List[Dict[str, Any]]
+    for warmup_index, report in enumerate(reports):
+        require(isinstance(report, Mapping), "policy warm-up report must be an object")
+        _require_exact_keys(report, _POLICY_WARMUP_FIELDS, "policy warm-up report")
+        warmup_replan_idx = POLICY_WARMUP_REPLAN_BASE + warmup_index
+        expected_identity = {
+            "discarded": True,
+            "evaluation_seed": EVALUATION_SEED,
+            "execution_horizon": execution_horizon,
+            "nfe": policy.get("nfe"),
+            "objective": policy.get("objective"),
+            "replan_idx": warmup_replan_idx,
+            "sampler": policy.get("sampler"),
+            "sequence_idx": 0,
+            "sequence_sha256": SEQUENCE_SHA256,
+            "subtask_idx": 0,
+            "subtask_name": subtask_name,
+            "train_seed": train_seed,
+            "warmup_index": warmup_index,
+        }
+        for name, expected in expected_identity.items():
+            observed = report[name]
+            matches = type(observed) is type(expected) and observed == expected
+            require(matches, f"policy warm-up {name} drifted")
+        expected_seed = _calvin_bridge.calvin_replan_seed(
+            EVALUATION_SEED,
+            SEQUENCE_SHA256,
+            0,
+            0,
+            subtask_name,
+            warmup_replan_idx,
+        )
+        require(
+            type(report["inference_seed"]) is int and report["inference_seed"] == expected_seed,
+            "policy warm-up inference seed drifted",
+        )
+        for name, expected in expected_hashes.items():
+            require(report[name] == expected, f"policy warm-up {name} drifted")
+        _require_sha256(report["actions_sha256"], "policy warm-up actions_sha256")
+        require(
+            _is_finite_number(report["policy_latency_seconds"]) and report["policy_latency_seconds"] >= 0,
+            "policy warm-up latency is invalid",
+        )
+        require(
+            _is_finite_number(report["server_latency_seconds"]) and report["server_latency_seconds"] >= 0,
+            "policy warm-up server latency is invalid",
+        )
+        require(
+            float(report["policy_latency_seconds"]) >= float(report["server_latency_seconds"]),
+            "policy warm-up server latency exceeds the enclosing client latency",
+        )
+        checked.append(dict(report))
+    return {
+        "count": count,
+        "included_in_episode_latency": False,
+        "reports": checked,
+    }
+
+
+def run_policy_warmups(
+    client: Any,
+    health: Mapping[str, Any],
+    *,
+    count: int,
+    sequences: Sequence[Any],
+    language_annotations: Any,
+    execution_horizon: int,
+    attempt_callback: Optional[Callable[[int, Mapping[str, Any]], None]] = None,
+    report_callback: Optional[Callable[[Sequence[Mapping[str, Any]]], None]] = None,
+) -> Dict[str, Any]:
+    """Run and record canonical synthetic calls before any D observation exists."""
+
+    require(type(count) is int and count >= MIN_POLICY_WARMUP_CALLS, "official scoring requires a policy warm-up")
+    first_sequence = sequences[0]
+    subtask_name = first_sequence[1][0]
+    instruction = first_language_phrase(language_annotations, subtask_name)
+    rgb_static, rgb_gripper, state = synthetic_policy_warmup_inputs()
+    reports = []  # type: List[Dict[str, Any]]
+    for warmup_index in range(count):
+        warmup_replan_idx = POLICY_WARMUP_REPLAN_BASE + warmup_index
+        inference_seed = _calvin_bridge.calvin_replan_seed(
+            EVALUATION_SEED,
+            SEQUENCE_SHA256,
+            0,
+            0,
+            subtask_name,
+            warmup_replan_idx,
+        )
+        intent = {
+            "evaluation_seed": EVALUATION_SEED,
+            "execution_horizon": execution_horizon,
+            "gripper_rgb_sha256": _tensor_bytes_sha256(rgb_gripper),
+            "inference_seed": inference_seed,
+            "instruction_sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
+            "replan_idx": warmup_replan_idx,
+            "sequence_idx": 0,
+            "sequence_sha256": SEQUENCE_SHA256,
+            "state_sha256": _tensor_bytes_sha256(state),
+            "static_rgb_sha256": _tensor_bytes_sha256(rgb_static),
+            "subtask_idx": 0,
+            "subtask_name": subtask_name,
+            "train_seed": health["train_seed"],
+            "warmup_index": warmup_index,
+        }
+        if attempt_callback is not None:
+            attempt_callback(warmup_index, intent)
+        request_started = time.perf_counter()
+        actions, response = client.predict(
+            evaluation_seed=EVALUATION_SEED,
+            train_seed=health["train_seed"],
+            sequence_sha256=SEQUENCE_SHA256,
+            sequence_idx=0,
+            subtask_idx=0,
+            subtask_name=subtask_name,
+            replan_idx=warmup_replan_idx,
+            execution_horizon=execution_horizon,
+            instruction=instruction,
+            rgb_static=rgb_static,
+            rgb_gripper=rgb_gripper,
+            state=state,
+        )
+        policy_latency = time.perf_counter() - request_started
+        chunk = _validate_action_chunk(actions)
+        server_latency = _validate_prediction_metadata(
+            response,
+            evaluation_seed=EVALUATION_SEED,
+            train_seed=health["train_seed"],
+            sequence_idx=0,
+            subtask_idx=0,
+            subtask_name=subtask_name,
+            replan_idx=warmup_replan_idx,
+            execution_horizon=execution_horizon,
+        )
+        reports.append(
+            {
+                "actions_sha256": _tensor_bytes_sha256(chunk),
+                "discarded": True,
+                "evaluation_seed": EVALUATION_SEED,
+                "execution_horizon": execution_horizon,
+                "gripper_rgb_sha256": _tensor_bytes_sha256(rgb_gripper),
+                "inference_seed": inference_seed,
+                "instruction_sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
+                "nfe": health["nfe"],
+                "objective": health["objective"],
+                "policy_latency_seconds": policy_latency,
+                "replan_idx": warmup_replan_idx,
+                "sampler": health["sampler"],
+                "sequence_idx": 0,
+                "sequence_sha256": SEQUENCE_SHA256,
+                "server_latency_seconds": server_latency,
+                "state_sha256": _tensor_bytes_sha256(state),
+                "static_rgb_sha256": _tensor_bytes_sha256(rgb_static),
+                "subtask_idx": 0,
+                "subtask_name": subtask_name,
+                "train_seed": health["train_seed"],
+                "warmup_index": warmup_index,
+            }
+        )
+        if report_callback is not None:
+            report_callback(tuple(reports))
+    value = {"count": count, "included_in_episode_latency": False, "reports": reports}
+    return validate_policy_warmup(
+        value,
+        count=count,
+        sequences=sequences,
+        language_annotations=language_annotations,
+        execution_horizon=execution_horizon,
+        policy=health,
+    )
+
+
 def rollout_subtask(
     environment: Any,
     client: Any,
@@ -932,14 +1369,26 @@ def evaluate_official_sequences(
 
 
 def summarize_sequences(sequence_records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
-    """Compute official AvgLen/SR1..5 plus conditional attempted-task metrics."""
+    """Compute official scores and authenticated episode-only performance metrics."""
 
     require(bool(sequence_records), "cannot summarize zero CALVIN sequences")
     lengths = []  # type: List[int]
     task_totals = {}  # type: Dict[str, int]
     task_successes = {}  # type: Dict[str, int]
+    policy_latencies = []  # type: List[float]
+    server_latencies = []  # type: List[float]
+    attempted_subtasks = 0
+    environment_actions = 0
+    policy_calls = 0
+    rollout_elapsed_seconds = 0.0
     for expected_idx, record in enumerate(sequence_records):
         require(record.get("sequence_idx") == expected_idx, "CALVIN sequence records are not contiguous and ordered")
+        sequence_elapsed = record.get("elapsed_seconds")
+        require(
+            _is_finite_number(sequence_elapsed) and sequence_elapsed > 0,
+            "CALVIN sequence elapsed time must be positive and finite",
+        )
+        rollout_elapsed_seconds += float(sequence_elapsed)
         length = record.get("successful_subtasks")
         require(
             _is_integer(length, 0, SUBTASKS_PER_SEQUENCE + 1),
@@ -949,17 +1398,74 @@ def summarize_sequences(sequence_records: Sequence[Mapping[str, Any]]) -> Dict[s
         subtasks = record.get("subtasks")
         require(isinstance(subtasks, list), "CALVIN sequence record subtasks must be a list")
         for subtask in subtasks:
+            require(isinstance(subtask, Mapping), "CALVIN subtask metric must be an object")
             name = subtask.get("subtask_name")
             require(isinstance(name, str) and bool(name), "invalid subtask metric name")
             task_totals[name] = task_totals.get(name, 0) + 1
             task_successes[name] = task_successes.get(name, 0) + int(bool(subtask.get("success")))
+            subtask_policy_calls = subtask.get("policy_calls")
+            subtask_environment_actions = subtask.get("environment_actions")
+            require(
+                type(subtask_policy_calls) is int and subtask_policy_calls > 0,
+                "CALVIN subtask policy_calls must be positive",
+            )
+            require(
+                type(subtask_environment_actions) is int and subtask_environment_actions > 0,
+                "CALVIN subtask environment_actions must be positive",
+            )
+            subtask_policy_latencies = subtask.get("policy_latency_seconds")
+            subtask_server_latencies = subtask.get("server_latency_seconds")
+            require(
+                isinstance(subtask_policy_latencies, list)
+                and len(subtask_policy_latencies) == subtask_policy_calls
+                and all(_is_finite_number(value) and value >= 0 for value in subtask_policy_latencies),
+                "CALVIN subtask policy latency samples are invalid",
+            )
+            require(
+                isinstance(subtask_server_latencies, list)
+                and len(subtask_server_latencies) == subtask_policy_calls
+                and all(_is_finite_number(value) and value >= 0 for value in subtask_server_latencies),
+                "CALVIN subtask server latency samples are invalid",
+            )
+            require(
+                all(
+                    float(subtask_policy_latencies[index]) >= float(subtask_server_latencies[index])
+                    for index in range(subtask_policy_calls)
+                ),
+                "CALVIN server latency exceeds its enclosing client latency",
+            )
+            attempted_subtasks += 1
+            environment_actions += subtask_environment_actions
+            policy_calls += subtask_policy_calls
+            policy_latencies.extend(float(value) for value in subtask_policy_latencies)
+            server_latencies.extend(float(value) for value in subtask_server_latencies)
 
     count = len(lengths)
+    require(policy_calls > 0 and len(policy_latencies) == policy_calls, "CALVIN policy call inventory is empty")
+    require(len(server_latencies) == policy_calls, "CALVIN server latency inventory is incomplete")
+    policy_latency_total = sum(policy_latencies)
+    server_latency_total = sum(server_latencies)
+    require(policy_latency_total > 0, "CALVIN aggregate policy latency must be positive")
+    require(server_latency_total > 0, "CALVIN aggregate server latency must be positive")
+    require(rollout_elapsed_seconds > 0, "CALVIN aggregate rollout elapsed time must be positive")
     summary = {
         "AvgLen": sum(lengths) / count,
+        "attempted_subtasks": attempted_subtasks,
+        "environment_actions": environment_actions,
+        "policy_calls": policy_calls,
+        "policy_latency_p50_seconds": _percentile(policy_latencies, 50.0),
+        "policy_latency_p95_seconds": _percentile(policy_latencies, 95.0),
+        "policy_latency_total_seconds": policy_latency_total,
+        "policy_throughput_calls_per_second": policy_calls / policy_latency_total,
+        "rollout_elapsed_seconds": rollout_elapsed_seconds,
+        "rollout_environment_actions_per_second": environment_actions / rollout_elapsed_seconds,
         "schema": SUMMARY_SCHEMA,
         "sequence_count": count,
         "sequence_sha256": SEQUENCE_SHA256,
+        "server_latency_p50_seconds": _percentile(server_latencies, 50.0),
+        "server_latency_p95_seconds": _percentile(server_latencies, 95.0),
+        "server_latency_total_seconds": server_latency_total,
+        "server_throughput_calls_per_second": policy_calls / server_latency_total,
         "task_metrics": [
             {
                 "attempted": task_totals[name],
@@ -1160,7 +1666,12 @@ def _read_strict_json(path: Path, *, expected_sha256: Optional[str] = None) -> T
     return value, digest
 
 
-def _validate_registered_cell(candidate: Any) -> Dict[str, Any]:
+def _validate_registered_cell(
+    candidate: Any,
+    *,
+    roots: Optional[Mapping[str, Any]] = None,
+    final_freeze_token_sha256: Optional[str] = None,
+) -> Dict[str, Any]:
     """Validate one cell against the canonical official factor contract."""
 
     require(isinstance(candidate, dict), "pre-registration cell must be an object")
@@ -1202,6 +1713,28 @@ def _validate_registered_cell(candidate: Any) -> Dict[str, Any]:
         candidate["cell_id"] == official_cell_id(train_seed, objective, nfe, execution_horizon),
         "pre-registration cell_id is not canonical",
     )
+    if roots is None or final_freeze_token_sha256 is None:
+        require(
+            roots is None and final_freeze_token_sha256 is None,
+            "output claim validation context is incomplete",
+        )
+        output_claim = candidate["output_claim"]
+        require(isinstance(output_claim, Mapping), "cell output claim must be an object")
+        _require_exact_keys(output_claim, _OUTPUT_CLAIM_FIELDS, "cell output claim")
+        require(output_claim["schema"] == OUTPUT_CLAIM_SCHEMA, "cell output claim schema mismatch")
+        _require_sha256(output_claim["claim_id_sha256"], "cell output claim ID")
+        for name in ("claim_path", "output_dir"):
+            require(
+                isinstance(output_claim[name], str) and Path(output_claim[name]).is_absolute(),
+                f"cell output claim {name} is invalid",
+            )
+    else:
+        validate_output_claim(
+            candidate["output_claim"],
+            cell_id=candidate["cell_id"],
+            roots=roots,
+            final_freeze_token_sha256=final_freeze_token_sha256,
+        )
     return dict(candidate)
 
 
@@ -1216,6 +1749,7 @@ def validate_preregistration_manifest(
     require(isinstance(manifest, dict), "pre-registration manifest must be an object")
     _require_exact_keys(manifest, _PREREGISTRATION_FIELDS, "pre-registration manifest")
     require(manifest["schema"] == PREREGISTRATION_SCHEMA, "pre-registration schema mismatch")
+    roots = validate_official_output_roots(manifest["official_output_roots"])
     require(
         manifest["aggregation_python_version"] == PYTHON_VERSION,
         f"pre-registration aggregation runtime must be Python {PYTHON_VERSION}",
@@ -1254,6 +1788,10 @@ def validate_preregistration_manifest(
         "pre-registration inference seed domain changed",
     )
     require(
+        type(manifest["policy_warmup_calls"]) is int and manifest["policy_warmup_calls"] >= MIN_POLICY_WARMUP_CALLS,
+        f"pre-registration policy warm-up count must be at least {MIN_POLICY_WARMUP_CALLS}",
+    )
+    require(
         type(manifest["subtasks_per_sequence"]) is int and manifest["subtasks_per_sequence"] == SUBTASKS_PER_SEQUENCE,
         "pre-registration subtasks-per-sequence changed",
     )
@@ -1290,7 +1828,14 @@ def validate_preregistration_manifest(
 
     cells = manifest["cells"]
     require(isinstance(cells, list), "pre-registration cells must be a list")
-    checked_cells = [_validate_registered_cell(candidate) for candidate in cells]
+    checked_cells = [
+        _validate_registered_cell(
+            candidate,
+            roots=roots,
+            final_freeze_token_sha256=manifest["final_freeze_token_sha256"],
+        )
+        for candidate in cells
+    ]
     cell_ids = [candidate["cell_id"] for candidate in checked_cells]
     require(len(cell_ids) == len(set(cell_ids)), "pre-registration cell_id values must be unique")
     factors = {
@@ -1304,10 +1849,26 @@ def validate_preregistration_manifest(
     }
     require(factors == official_factor_matrix(), "pre-registration does not contain the exact 24-cell factor matrix")
     require(len(checked_cells) == len(factors) == 24, "pre-registration must contain exactly 24 policy cells")
+    require(
+        len({candidate["output_claim"]["output_dir"] for candidate in checked_cells}) == 24,
+        "pre-registration output directories must be unique",
+    )
+    require(
+        len({candidate["output_claim"]["claim_path"] for candidate in checked_cells}) == 24,
+        "pre-registration claim paths must be unique",
+    )
+    require(
+        len({candidate["output_claim"]["claim_id_sha256"] for candidate in checked_cells}) == 24,
+        "pre-registration claim identities must be unique",
+    )
 
     require(
         len({canonical_json_bytes(candidate["execution_geometry"]) for candidate in checked_cells}) == 1,
         "all official cells must share one execution geometry",
+    )
+    require(
+        len({candidate["serving_runtime_sha256"] for candidate in checked_cells}) == 1,
+        "all official cells must share one evaluation serving runtime",
     )
     for seed in OFFICIAL_TRAIN_SEEDS:
         for objective in ("rectified_flow", "direct_regression"):
@@ -1319,10 +1880,6 @@ def validate_preregistration_manifest(
             require(
                 len({candidate["checkpoint"]["sha256"] for candidate in group}) == 1,
                 "NFE/K cells must share one final checkpoint per seed/objective",
-            )
-            require(
-                len({candidate["serving_runtime_sha256"] for candidate in group}) == 1,
-                "NFE/K cells must share one serving runtime per seed/objective",
             )
         flow_checkpoint = next(
             candidate["checkpoint"]["sha256"]
@@ -1378,6 +1935,55 @@ def load_preregistration(
         "CLI execution horizon differs from the pre-registered cell",
     )
     return dict(manifest), selected_cell, manifest_sha256
+
+
+def build_claim_record(
+    output_claim: Mapping[str, Any],
+    *,
+    cell_id: str,
+    preregistration_sha256: str,
+    final_freeze_token_sha256: str,
+    created_utc: str,
+) -> Dict[str, Any]:
+    """Build the immutable external record that consumes one cell attempt."""
+
+    _require_sha256(preregistration_sha256, "claim pre-registration SHA-256")
+    _require_sha256(final_freeze_token_sha256, "claim freeze-token SHA-256")
+    require(isinstance(created_utc, str) and bool(created_utc), "claim creation timestamp is invalid")
+    require(isinstance(output_claim, Mapping), "output claim must be an object")
+    _require_exact_keys(output_claim, _OUTPUT_CLAIM_FIELDS, "output claim")
+    return {
+        "cell_id": cell_id,
+        "claim_id_sha256": output_claim["claim_id_sha256"],
+        "created_utc": created_utc,
+        "final_freeze_token_sha256": final_freeze_token_sha256,
+        "output_dir": output_claim["output_dir"],
+        "preregistration_sha256": preregistration_sha256,
+        "schema": CLAIM_RECORD_SCHEMA,
+    }
+
+
+def validate_claim_record(
+    value: Any,
+    *,
+    output_claim: Mapping[str, Any],
+    cell_id: str,
+    preregistration_sha256: str,
+    final_freeze_token_sha256: str,
+) -> Dict[str, Any]:
+    require(isinstance(value, Mapping), "official claim record must be an object")
+    _require_exact_keys(value, _CLAIM_RECORD_FIELDS, "official claim record")
+    require(value["schema"] == CLAIM_RECORD_SCHEMA, "official claim record schema mismatch")
+    require(isinstance(value["created_utc"], str) and bool(value["created_utc"]), "claim timestamp is invalid")
+    expected = build_claim_record(
+        output_claim,
+        cell_id=cell_id,
+        preregistration_sha256=preregistration_sha256,
+        final_freeze_token_sha256=final_freeze_token_sha256,
+        created_utc=value["created_utc"],
+    )
+    require(canonical_json_bytes(value) == canonical_json_bytes(expected), "official claim record binding mismatch")
+    return dict(value)
 
 
 def _read_stable_regular_bytes(path: Path, *, name: str) -> Tuple[bytes, Dict[str, Any]]:
@@ -1674,6 +2280,32 @@ def publish_bytes_and_sha256_exclusive(
         _unlink_created_path(temporary_companion, temporary_companion_identity)
 
 
+def _capture_exclusive_pair(
+    path: Path,
+    *,
+    expected_sha256: str,
+    name: str,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Authenticate one already-published payload/sidecar pair and its inodes."""
+
+    _require_sha256(expected_sha256, f"{name} SHA-256")
+    payload_observed = _read_published_target_identity(path, name=name)
+    require(
+        payload_observed["links"] == 1 and payload_observed["sha256"] == expected_sha256,
+        f"published {name} digest or link count is invalid",
+    )
+    companion = path.with_suffix(path.suffix + ".sha256")
+    companion_observed = _read_published_target_identity(companion, name=f"{name} SHA-256 companion")
+    expected_companion = f"{expected_sha256}  {path.name}\n".encode("ascii")
+    require(
+        companion_observed["links"] == 1
+        and companion_observed["bytes"] == len(expected_companion)
+        and companion_observed["sha256"] == hashlib.sha256(expected_companion).hexdigest(),
+        f"published {name} SHA-256 companion is invalid",
+    )
+    return _publication_identity(payload_observed), _publication_identity(companion_observed)
+
+
 def write_json_atomic(path: Path, value: Mapping[str, Any]) -> Dict[str, Any]:
     """Atomically replace JSON and return its verified target inode/content identity."""
 
@@ -1714,49 +2346,93 @@ class EvaluationJournal:
         *,
         commit_guard: Optional[Callable[[], None]] = None,
     ) -> None:
-        self.output_dir = output_dir.resolve()
+        self.output_dir = Path(output_dir)
+        require(self.output_dir.is_absolute(), "evaluation journal output directory must be absolute")
         self.run_path = self.output_dir / "run.json"
         self.episodes_path = self.output_dir / "episodes.jsonl"
         self.summary_path = self.output_dir / "summary.json"
+        self.completion_path = self.output_dir / "completion.json"
         self.run_manifest = dict(run_manifest)
         self._episode_sink = None  # type: Optional[Any]
         self._episode_digest = hashlib.sha256()
         self._episode_bytes = 0
         self._episode_count = 0
         self._episodes_identity = None  # type: Optional[Dict[str, Any]]
+        self._claim_targets = ()  # type: Sequence[Tuple[Path, Mapping[str, Any], str]]
         self._commit_guard = commit_guard
 
     def start(self) -> None:
-        self.output_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
-        self.run_manifest["status"] = "running"
-        write_json_atomic(self.run_path, self.run_manifest)
-        require(hasattr(os, "O_NOFOLLOW"), "evaluation journal requires O_NOFOLLOW")
-        descriptor = os.open(
-            str(self.episodes_path),
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
+        claimed = False
+        try:
+            self.output_dir.mkdir(parents=False, exist_ok=False, mode=0o700)
+            claimed = True
+            self.run_manifest["status"] = "running"
+            write_json_atomic(self.run_path, self.run_manifest)
+            require(hasattr(os, "O_NOFOLLOW"), "evaluation journal requires O_NOFOLLOW")
+            descriptor = os.open(
+                str(self.episodes_path),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+            self._episode_sink = os.fdopen(descriptor, "w", encoding="utf-8")
+            self._episode_sink.flush()
+            os.fsync(self._episode_sink.fileno())
+            opened = os.fstat(self._episode_sink.fileno())
+            require(
+                stat.S_ISREG(opened.st_mode) and opened.st_nlink == 1 and opened.st_size == 0,
+                "evaluation journal episodes target is invalid",
+            )
+            self._episodes_identity = {
+                "bytes": 0,
+                "device": opened.st_dev,
+                "inode": opened.st_ino,
+                "sha256": self._episode_digest.hexdigest(),
+            }
+            _verify_published_target(
+                self.episodes_path,
+                self._episodes_identity,
+                links=1,
+                name="episodes JSONL",
+            )
+            _fsync_directory(self.output_dir)
+        except BaseException as exc:
+            if claimed:
+                try:
+                    self.fail(exc)
+                except BaseException as fail_exc:
+                    raise RuntimeError(
+                        f"evaluation journal start failed and could not record failure: "
+                        f"{type(fail_exc).__name__}: {fail_exc}"
+                    ) from exc
+            raise
+
+    def bind_claim(self, claim_path: Path, claim_json_sha256: str) -> None:
+        """Bind the immutable external attempt claim into the durable run journal."""
+
+        require(self.run_manifest.get("status") == "running", "evaluation journal is not running")
+        registered = self.run_manifest.get("output_claim")
+        if registered is not None:
+            registered_path = registered.get("claim_path") if isinstance(registered, Mapping) else None
+            require(
+                isinstance(registered_path, str) and Path(registered_path) == claim_path,
+                "journal claim path differs from the pre-registered output claim",
+            )
+        payload_identity, companion_identity = _capture_exclusive_pair(
+            claim_path,
+            expected_sha256=claim_json_sha256,
+            name="official claim JSON",
         )
-        self._episode_sink = os.fdopen(descriptor, "w", encoding="utf-8")
-        self._episode_sink.flush()
-        os.fsync(self._episode_sink.fileno())
-        opened = os.fstat(self._episode_sink.fileno())
-        require(
-            stat.S_ISREG(opened.st_mode) and opened.st_nlink == 1 and opened.st_size == 0,
-            "evaluation journal episodes target is invalid",
+        self._claim_targets = (
+            (claim_path, payload_identity, "official claim JSON"),
+            (
+                claim_path.with_suffix(claim_path.suffix + ".sha256"),
+                companion_identity,
+                "official claim SHA-256 companion",
+            ),
         )
-        self._episodes_identity = {
-            "bytes": 0,
-            "device": opened.st_dev,
-            "inode": opened.st_ino,
-            "sha256": self._episode_digest.hexdigest(),
-        }
-        _verify_published_target(
-            self.episodes_path,
-            self._episodes_identity,
-            links=1,
-            name="episodes JSONL",
-        )
-        _fsync_directory(self.output_dir)
+        self._guard_targets(())
+        self.run_manifest["claim_json_sha256"] = claim_json_sha256
+        self.update_running({})
 
     def append_episode(self, record: Mapping[str, Any]) -> None:
         require(self._episode_sink is not None, "evaluation journal is not running")
@@ -1769,6 +2445,16 @@ class EvaluationJournal:
         self._episode_digest.update(encoded)
         self._episode_bytes += len(encoded)
         self._episode_count += 1
+
+    def update_running(self, values: Mapping[str, Any]) -> None:
+        """Durably checkpoint pre-episode setup without relinquishing ownership."""
+
+        require(self.run_manifest.get("status") == "running", "evaluation journal is not running")
+        require(self._episode_sink is not None, "evaluation journal episode stream is not open")
+        self.run_manifest.update(dict(values))
+        self._guard_targets(())
+        write_json_atomic(self.run_path, self.run_manifest)
+        self._guard_targets(())
 
     def _close_episodes(self) -> None:
         if self._episode_sink is not None:
@@ -1804,15 +2490,21 @@ class EvaluationJournal:
         )
 
     def _guard_targets(self, targets: Sequence[Tuple[Path, Mapping[str, Any], str]]) -> None:
-        for path, identity, name in targets:
+        guarded = tuple(self._claim_targets) + tuple(targets)
+        for path, identity, name in guarded:
             _verify_published_target(path, identity, links=1, name=name)
         if self._commit_guard is not None:
             self._commit_guard()
-        for path, identity, name in targets:
+        for path, identity, name in guarded:
             _verify_published_target(path, identity, links=1, name=name)
 
     def complete(self, summary: Mapping[str, Any]) -> None:
         try:
+            if self.run_manifest.get("mode") == "official-score":
+                require(
+                    "claim_json_sha256" in self.run_manifest and "output_claim" in self.run_manifest,
+                    "official score cannot complete without its immutable external claim",
+                )
             self._close_episodes()
             require(self._episode_count == NUM_SEQUENCES, "official score did not write exactly 1000 sequence records")
             require(self._episodes_identity is not None, "evaluation journal episodes identity is missing")
@@ -1833,6 +2525,47 @@ class EvaluationJournal:
             run_identity = write_json_atomic(self.run_path, self.run_manifest)
             run_target = (self.run_path, run_identity, "complete run JSON")
             self._guard_targets((episode_target, summary_target, run_target))
+            if "claim_json_sha256" in self.run_manifest:
+                completion = {
+                    "cell_id": self.run_manifest["cell"]["cell_id"],
+                    "claim_json_sha256": self.run_manifest["claim_json_sha256"],
+                    "episodes_jsonl_sha256": self.run_manifest["episodes_jsonl_sha256"],
+                    "preregistration_sha256": self.run_manifest["preregistration_sha256"],
+                    "run_json_sha256": run_identity["sha256"],
+                    "schema": COMPLETION_SCHEMA,
+                    "sequence_records": self._episode_count,
+                    "summary_json_sha256": self.run_manifest["summary_json_sha256"],
+                }
+                completion_payload = (
+                    json.dumps(completion, allow_nan=False, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+                ).encode("ascii")
+
+                def completion_guard() -> None:
+                    self._guard_targets((episode_target, summary_target, run_target))
+
+                completion_sha256 = publish_bytes_and_sha256_exclusive(
+                    self.completion_path,
+                    completion_payload,
+                    commit_guard=completion_guard,
+                )
+                completion_identity, companion_identity = _capture_exclusive_pair(
+                    self.completion_path,
+                    expected_sha256=completion_sha256,
+                    name="official completion JSON",
+                )
+                self._guard_targets(
+                    (
+                        episode_target,
+                        summary_target,
+                        run_target,
+                        (self.completion_path, completion_identity, "official completion JSON"),
+                        (
+                            self.completion_path.with_suffix(self.completion_path.suffix + ".sha256"),
+                            companion_identity,
+                            "official completion SHA-256 companion",
+                        ),
+                    )
+                )
         except BaseException as exc:
             self.fail(exc)
             raise
@@ -2091,7 +2824,7 @@ def run_official_score_mode(args: argparse.Namespace) -> Dict[str, Any]:
     attestation_sha256 = attestation["attestation_sha256"]
     _require_sha256(attestation_sha256, "runtime/data attestation SHA-256")
     sequences = regenerate_official_sequences(args.evaluation_seed)
-    _manifest, selected_cell, preregistration_sha256 = load_preregistration(
+    manifest, selected_cell, preregistration_sha256 = load_preregistration(
         args.preregistration_manifest.resolve(),
         sequences,
         cell_id=args.cell_id,
@@ -2100,24 +2833,91 @@ def run_official_score_mode(args: argparse.Namespace) -> Dict[str, Any]:
         preregistration_sha256=args.preregistration_sha256,
         runtime_attestation_sha256=attestation_sha256,
     )
+    roots = validate_official_output_roots(manifest["official_output_roots"], require_live=True)
+    output_claim = selected_cell["output_claim"]
+    expected_output_dir = Path(output_claim["output_dir"])
+    expected_claim_path = Path(output_claim["claim_path"])
+    require(
+        args.output_dir.is_absolute() and args.output_dir == expected_output_dir,
+        "official-score --output-dir differs from the pre-registered canonical output directory",
+    )
+    require(
+        args.policy_warmup_calls == manifest["policy_warmup_calls"],
+        "official-score policy warm-up count differs from the pre-registration",
+    )
     runtime_identity = attestation["runtime"]
     dataset_identity = attestation["dataset"]
     official_yaml = runtime_identity["official_yaml"]
-    annotations, annotation_identity = load_validation_annotations(official_yaml["validation_annotations"])
-    # Authenticate every instruction before constructing anything capable of
-    # policy inference.
-    for _initial_state, tasks in sequences:
-        for task in tasks:
-            first_language_phrase(annotations, task)
+    created_utc = datetime.now(timezone.utc).isoformat()
+    run_manifest = {
+        "attestation": attestation,
+        "attestation_sha256": attestation_sha256,
+        "cell": selected_cell,
+        "created_utc": created_utc,
+        "evaluation_seed": args.evaluation_seed,
+        "execution_horizon": args.execution_horizon,
+        "final_freeze_token_sha256": hashlib.sha256(args.final_freeze_token.encode("utf-8")).hexdigest(),
+        "mode": "official-score",
+        "output_claim": output_claim,
+        "policy_socket": str(args.socket),
+        "policy_warmup": {
+            "attempted_count": 0,
+            "completed_count": 0,
+            "current_request": None,
+            "expected_count": args.policy_warmup_calls,
+            "included_in_episode_latency": False,
+            "reports": [],
+            "status": "pending",
+        },
+        "preregistration_manifest": str(args.preregistration_manifest.resolve()),
+        "preregistration_sha256": preregistration_sha256,
+        "protocol": PROTOCOL,
+        "schema": RUN_SCHEMA,
+        "sequence_count": NUM_SEQUENCES,
+        "sequence_sha256": SEQUENCE_SHA256,
+    }
 
-    from calvin_agent.evaluation.utils import get_env_state_for_initial_condition
+    def output_commit_guard() -> None:
+        _require_evaluator_sources_unchanged(_IMPORT_EVALUATOR_SOURCE_IDENTITIES)
+        validate_official_output_roots(roots, require_live=True)
 
-    task_oracle, oracle_identity = load_task_oracle(official_yaml["task_oracle"])
-    environment, environment_identity = construct_validation_environment(
-        args.dataset_root,
-        dataset_identity["validation_critical_files"]["validation/.hydra/merged_config.yaml"],
+    journal = EvaluationJournal(
+        expected_output_dir,
+        run_manifest,
+        commit_guard=output_commit_guard,
     )
+    _require_evaluator_sources_unchanged(_IMPORT_EVALUATOR_SOURCE_IDENTITIES)
+    # Claim and journal the output before the first policy connection or call.
+    # A collision, concurrent invocation, or later setup failure is therefore
+    # incapable of producing an unaudited warm-up attempt for this cell.
+    journal.start()
+    environment = None
     try:
+        claim_record = build_claim_record(
+            output_claim,
+            cell_id=selected_cell["cell_id"],
+            preregistration_sha256=preregistration_sha256,
+            final_freeze_token_sha256=manifest["final_freeze_token_sha256"],
+            created_utc=created_utc,
+        )
+        claim_payload = (
+            json.dumps(claim_record, allow_nan=False, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+        ).encode("ascii")
+        claim_json_sha256 = publish_bytes_and_sha256_exclusive(
+            expected_claim_path,
+            claim_payload,
+            commit_guard=output_commit_guard,
+        )
+        journal.bind_claim(expected_claim_path, claim_json_sha256)
+
+        annotations, annotation_identity = load_validation_annotations(official_yaml["validation_annotations"])
+        # Authenticate every instruction before constructing anything capable of
+        # policy inference.
+        for _initial_state, tasks in sequences:
+            for task in tasks:
+                first_language_phrase(annotations, task)
+        journal.update_running({"annotation": annotation_identity})
+
         with PolicyClient(args.socket, timeout_seconds=args.policy_timeout_seconds) as client:
             health = validate_policy_health(
                 client.health(),
@@ -2125,57 +2925,94 @@ def run_official_score_mode(args: argparse.Namespace) -> Dict[str, Any]:
                 expected_cell=selected_cell,
                 expected_calvin_identity=dataset_identity["calvin_identity"],
             )
-            run_manifest = {
-                "annotation": annotation_identity,
-                "attestation": attestation,
-                "attestation_sha256": attestation_sha256,
-                "cell": selected_cell,
-                "created_utc": datetime.now(timezone.utc).isoformat(),
-                "environment": environment_identity,
-                "evaluation_seed": args.evaluation_seed,
-                "execution_horizon": args.execution_horizon,
-                "final_freeze_token_sha256": hashlib.sha256(args.final_freeze_token.encode("utf-8")).hexdigest(),
-                "mode": "official-score",
-                "oracle": oracle_identity,
-                "policy_health": health,
-                "policy_socket": str(args.socket),
-                "preregistration_manifest": str(args.preregistration_manifest.resolve()),
-                "preregistration_sha256": preregistration_sha256,
-                "protocol": PROTOCOL,
-                "schema": RUN_SCHEMA,
-                "sequence_count": NUM_SEQUENCES,
-                "sequence_sha256": SEQUENCE_SHA256,
-            }
-            journal = EvaluationJournal(
-                args.output_dir,
-                run_manifest,
-                commit_guard=lambda: _require_evaluator_sources_unchanged(_IMPORT_EVALUATOR_SOURCE_IDENTITIES),
-            )
-            _require_evaluator_sources_unchanged(_IMPORT_EVALUATOR_SOURCE_IDENTITIES)
-            journal.start()
-            try:
-                records = evaluate_official_sequences(
-                    environment,
-                    client,
-                    task_oracle,
-                    sequences,
-                    annotations,
-                    get_env_state_for_initial_condition,
-                    train_seed=health["train_seed"],
-                    evaluation_seed=args.evaluation_seed,
-                    execution_horizon=args.execution_horizon,
-                    episode_callback=journal.append_episode,
+            journal.update_running({"policy_health": health})
+            partial_warmup_reports = []  # type: List[Dict[str, Any]]
+
+            def record_warmup_attempt(warmup_index: int, intent: Mapping[str, Any]) -> None:
+                journal.update_running(
+                    {
+                        "policy_warmup": {
+                            "attempted_count": warmup_index + 1,
+                            "completed_count": len(partial_warmup_reports),
+                            "current_request": dict(intent),
+                            "expected_count": args.policy_warmup_calls,
+                            "included_in_episode_latency": False,
+                            "reports": list(partial_warmup_reports),
+                            "status": "running",
+                        }
+                    }
                 )
-                summary = summarize_sequences(records)
-                require(summary["sequence_count"] == NUM_SEQUENCES, "summary is not the complete official score")
-                _require_evaluator_sources_unchanged(_IMPORT_EVALUATOR_SOURCE_IDENTITIES)
-                journal.complete(summary)
-            except BaseException as exc:
-                if journal.run_manifest.get("status") != "failed":
-                    journal.fail(exc)
-                raise
-    finally:
-        _close_environment(environment)
+
+            def record_partial_warmup(reports: Sequence[Mapping[str, Any]]) -> None:
+                partial_warmup_reports[:] = [dict(report) for report in reports]
+                journal.update_running(
+                    {
+                        "policy_warmup": {
+                            "attempted_count": len(reports),
+                            "completed_count": len(reports),
+                            "current_request": None,
+                            "expected_count": args.policy_warmup_calls,
+                            "included_in_episode_latency": False,
+                            "reports": [dict(report) for report in reports],
+                            "status": "running",
+                        }
+                    }
+                )
+
+            policy_warmup = run_policy_warmups(
+                client,
+                health,
+                count=args.policy_warmup_calls,
+                sequences=sequences,
+                language_annotations=annotations,
+                execution_horizon=args.execution_horizon,
+                attempt_callback=record_warmup_attempt,
+                report_callback=record_partial_warmup,
+            )
+            journal.update_running({"policy_warmup": policy_warmup})
+            # Only discarded synthetic policy calls are allowed before this point;
+            # no validation-D observation or task-oracle outcome exists yet.
+            from calvin_agent.evaluation.utils import get_env_state_for_initial_condition
+
+            task_oracle, oracle_identity = load_task_oracle(official_yaml["task_oracle"])
+            environment, environment_identity = construct_validation_environment(
+                args.dataset_root,
+                dataset_identity["validation_critical_files"]["validation/.hydra/merged_config.yaml"],
+            )
+            journal.update_running({"environment": environment_identity, "oracle": oracle_identity})
+            records = evaluate_official_sequences(
+                environment,
+                client,
+                task_oracle,
+                sequences,
+                annotations,
+                get_env_state_for_initial_condition,
+                train_seed=health["train_seed"],
+                evaluation_seed=args.evaluation_seed,
+                execution_horizon=args.execution_horizon,
+                episode_callback=journal.append_episode,
+            )
+            summary = summarize_sequences(records)
+            require(summary["sequence_count"] == NUM_SEQUENCES, "summary is not the complete official score")
+            _require_evaluator_sources_unchanged(_IMPORT_EVALUATOR_SOURCE_IDENTITIES)
+            environment_to_close = environment
+            environment = None
+            _close_environment(environment_to_close)
+            journal.complete(summary)
+    except BaseException as exc:
+        failure = exc
+        if environment is not None:
+            environment_to_close = environment
+            environment = None
+            try:
+                _close_environment(environment_to_close)
+            except BaseException as close_exc:
+                failure = RuntimeError(
+                    f"{type(exc).__name__}: {exc}; environment close failed: {type(close_exc).__name__}: {close_exc}"
+                )
+        if journal.run_manifest.get("status") != "failed":
+            journal.fail(failure)
+        raise
     return summary
 
 
@@ -2194,9 +3031,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--socket",
         type=Path,
-        default=cache_root / "run" / "calvin-policy.sock",
     )
-    parser.add_argument("--policy-timeout-seconds", type=float, default=300.0)
+    parser.add_argument("--policy-timeout-seconds", type=float)
+    parser.add_argument(
+        "--policy-warmup-calls",
+        type=int,
+        help=(
+            "discarded synthetic policy calls before scoring; required in official-score mode "
+            f"(recommended {DEFAULT_POLICY_WARMUP_CALLS}, minimum {MIN_POLICY_WARMUP_CALLS})"
+        ),
+    )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--preregistration-manifest", type=Path)
     parser.add_argument(
@@ -2213,10 +3057,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def validate_mode_arguments(args: argparse.Namespace) -> None:
     require(args.evaluation_seed == EVALUATION_SEED, "official CALVIN evaluation_seed must equal 0")
-    require(
-        _is_finite_number(args.policy_timeout_seconds) and args.policy_timeout_seconds > 0,
-        "policy timeout must be positive and finite",
-    )
     if args.mode == "infrastructure":
         require(args.execution_horizon is None, "infrastructure mode must not select a policy execution horizon")
         require(args.output_dir is None, "infrastructure mode does not create scoring artifacts")
@@ -2227,8 +3067,18 @@ def validate_mode_arguments(args: argparse.Namespace) -> None:
         )
         require(args.cell_id is None, "infrastructure mode must not select a scoring cell")
         require(args.final_freeze_token is None, "infrastructure mode must not receive a final freeze token")
+        require(args.policy_warmup_calls is None, "infrastructure mode must not receive policy warm-up calls")
+        require(args.socket is None, "infrastructure mode must not receive a policy socket")
+        require(args.policy_timeout_seconds is None, "infrastructure mode must not receive a policy timeout")
         return
     require(args.execution_horizon in SUPPORTED_EXECUTION_HORIZONS, "official-score requires K in {1, 4}")
+    require(isinstance(args.socket, Path), "official-score requires an explicit --socket")
+    if args.policy_timeout_seconds is None:
+        args.policy_timeout_seconds = 300.0
+    require(
+        _is_finite_number(args.policy_timeout_seconds) and args.policy_timeout_seconds > 0,
+        "policy timeout must be positive and finite",
+    )
     require(args.output_dir is not None, "official-score requires --output-dir")
     require(args.preregistration_manifest is not None, "official-score requires --preregistration-manifest")
     _require_sha256(args.preregistration_sha256, "official-score --preregistration-sha256")
@@ -2236,6 +3086,10 @@ def validate_mode_arguments(args: argparse.Namespace) -> None:
     require(
         isinstance(args.final_freeze_token, str) and bool(args.final_freeze_token.strip()),
         "official-score requires an explicit --final-freeze-token string",
+    )
+    require(
+        type(args.policy_warmup_calls) is int and args.policy_warmup_calls >= MIN_POLICY_WARMUP_CALLS,
+        f"official-score policy warm-up calls must be at least {MIN_POLICY_WARMUP_CALLS}",
     )
 
 

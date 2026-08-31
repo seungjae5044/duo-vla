@@ -1,13 +1,14 @@
-#!/bin/bash
+#!/bin/bash -p
 set -euo pipefail
+readonly requested_cache_root="${DUO_VLA_CACHE_ROOT:-/root/.cache/duo-vla}"
 export PATH="/usr/bin:/bin"
-readonly cache_root="${DUO_VLA_CACHE_ROOT:-/root/.cache/duo-vla}"
-unset BASH_ENV ENV
+unset BASH_ENV CDPATH ENV GLOBIGNORE
 while IFS= read -r name; do
   [[ "${name}" == LD_* ]] && unset "${name}"
 done < <(compgen -v)
 
-readonly project_dir="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly project_dir="$(cd "${BASH_SOURCE[0]%/*}/.." && pwd -P)"
+readonly cache_root="$(realpath -m -- "${requested_cache_root}")"
 readonly environment_path="${cache_root}/venvs/libero-eval"
 
 if [[ ! -x "${environment_path}/bin/python" ]]; then
@@ -32,7 +33,8 @@ exec /usr/bin/env -i \
   "PYOPENGL_PLATFORM=egl" \
   "PYTHONHASHSEED=0" \
   "PYTHONNOUSERSITE=1" \
-  "PYTHONPATH=${project_dir}/src:${project_dir}/scripts" \
-  "${environment_path}/bin/python" \
+  "PYTHONSAFEPATH=1" \
+  "PYTHONDONTWRITEBYTECODE=1" \
+  "${environment_path}/bin/python" -P -B -X pycache_prefix=/dev/null \
   "${project_dir}/scripts/evaluate_libero.py" \
   "$@"

@@ -4,9 +4,6 @@ set -euo pipefail
 readonly requested_cache_root="${DUO_VLA_CACHE_ROOT:-/root/.cache/duo-vla}"
 export PATH="/usr/bin:/bin"
 unset BASH_ENV CDPATH ENV GLOBIGNORE
-while IFS= read -r name; do
-  [[ "${name}" == LD_* ]] && unset "${name}"
-done < <(compgen -v)
 
 readonly project_dir="$(cd "${BASH_SOURCE[0]%/*}/.." && pwd -P)"
 readonly cache_root="$(realpath -m -- "${requested_cache_root}")"
@@ -37,5 +34,5 @@ exec /usr/bin/env -i \
   "PYTHONSAFEPATH=1" \
   "PYTHONDONTWRITEBYTECODE=1" \
   "${environment_path}/bin/python" -P -B -X pycache_prefix=/dev/null \
-  "${project_dir}/scripts/preflight_libero_env.py" \
+  "${project_dir}/scripts/aggregate_libero_official.py" \
   "$@"

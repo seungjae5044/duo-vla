@@ -1,19 +1,138 @@
 #!/usr/bin/env python3
 """Persistent Unix-socket Duo-VLA policy server for the isolated LIBERO evaluator."""
 
+# ruff: noqa: E402 -- authenticate local import roots before importing project code.
+
 from __future__ import annotations
 
 import argparse
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 import os
+import platform
+import site
+import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any, ClassVar
 
 import numpy as np
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _activate_project_source_root() -> Path:
+    source_root = _SCRIPT_DIR.parent / "src"
+    if source_root.resolve(strict=True) != source_root or not stat.S_ISDIR(os.lstat(source_root).st_mode):
+        raise RuntimeError("project src import root must be a canonical real directory")
+    identity_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns", "st_nlink")
+
+    def same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+        return all(getattr(left, name) == getattr(right, name) for name in identity_fields)
+
+    def walk(directory: int, prefix: tuple[str, ...]) -> None:
+        before = os.fstat(directory)
+        names = sorted(os.listdir(directory))
+        for name in names:
+            context = "/".join((*prefix, name))
+            observed = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if stat.S_ISDIR(observed.st_mode):
+                if name == "__pycache__":
+                    continue
+                child = os.open(
+                    name,
+                    os.O_RDONLY | os.O_NONBLOCK | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=directory,
+                )
+                try:
+                    if not same_identity(observed, os.fstat(child)):
+                        raise RuntimeError(f"project source directory changed while opening: {context}")
+                    walk(child, (*prefix, name))
+                finally:
+                    os.close(child)
+            elif not (stat.S_ISREG(observed.st_mode) and name.endswith(".py")):
+                raise RuntimeError(f"project source import entry is unsafe: {context}")
+        if names != sorted(os.listdir(directory)) or not same_identity(before, os.fstat(directory)):
+            raise RuntimeError(f"project source directory changed during inventory: {'/'.join(prefix) or '.'}")
+
+    root_descriptor = os.open(
+        source_root,
+        os.O_RDONLY | os.O_NONBLOCK | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    try:
+        if sorted(os.listdir(root_descriptor)) != ["duo_vla"]:
+            raise RuntimeError("project src import root must contain only the real duo_vla package directory")
+        package_descriptor = os.open(
+            "duo_vla",
+            os.O_RDONLY | os.O_NONBLOCK | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=root_descriptor,
+        )
+        try:
+            walk(package_descriptor, ("duo_vla",))
+        finally:
+            os.close(package_descriptor)
+    finally:
+        os.close(root_descriptor)
+    source_text = str(source_root)
+    sys.path[:] = [source_text] + [
+        entry for entry in sys.path if str(Path(entry or os.getcwd()).resolve()) != source_text
+    ]
+    return source_root
+
+
+_PROJECT_SOURCE_ROOT = _activate_project_source_root()
+
+
+def _validate_project_module_origins(required_modules: set[str]) -> dict[str, str]:
+    package_root = (_PROJECT_SOURCE_ROOT / "duo_vla").resolve(strict=True)
+    loaded = {name: module for name, module in sys.modules.items() if name == "duo_vla" or name.startswith("duo_vla.")}
+    missing = sorted(required_modules - set(loaded))
+    if missing:
+        raise RuntimeError(f"required checkout modules are not loaded: {missing}")
+    origins: dict[str, str] = {}
+    for name, module in sorted(loaded.items()):
+        origin = getattr(getattr(module, "__spec__", None), "origin", None)
+        module_file = getattr(module, "__file__", None)
+        if not isinstance(origin, str) or not isinstance(module_file, str):
+            raise RuntimeError(f"checkout module has no file origin: {name}")
+        resolved_origin = Path(origin).resolve(strict=True)
+        resolved_file = Path(module_file).resolve(strict=True)
+        if resolved_origin != resolved_file or not resolved_file.is_relative_to(package_root):
+            raise RuntimeError(f"checkout module origin escapes authenticated source root: {name}")
+        origins[name] = str(resolved_file)
+    return origins
+
+
+def _load_local_module(name: str, path: Path) -> Any:
+    expected = path.resolve(strict=True)
+    existing = sys.modules.get(name)
+    if existing is not None:
+        module_file = getattr(existing, "__file__", None)
+        origin = getattr(getattr(existing, "__spec__", None), "origin", None)
+        if not isinstance(module_file, str) or not isinstance(origin, str):
+            raise RuntimeError(f"existing local module {name} has no file origin")
+        if Path(module_file).resolve() != expected or Path(origin).resolve() != expected:
+            raise RuntimeError(f"existing local module {name} has an unexpected origin")
+        return existing
+    specification = importlib.util.spec_from_file_location(name, expected)
+    if specification is None or specification.loader is None:
+        raise RuntimeError(f"cannot construct import specification for {expected}")
+    module = importlib.util.module_from_spec(specification)
+    sys.modules[name] = module
+    try:
+        specification.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+_libero_bridge = _load_local_module("libero_bridge", _SCRIPT_DIR / "libero_bridge.py")
+
 from libero_bridge import (
     ACTION_DIM,
     ACTION_HORIZON,
@@ -27,12 +146,34 @@ from libero_bridge import (
     validate_wire_policy_contract,
 )
 
+_bridge_file = getattr(_libero_bridge, "__file__", None)
+_bridge_origin = getattr(getattr(_libero_bridge, "__spec__", None), "origin", None)
+if (
+    not isinstance(_bridge_file, str)
+    or not isinstance(_bridge_origin, str)
+    or Path(_bridge_file).resolve() != (_SCRIPT_DIR / "libero_bridge.py").resolve()
+    or Path(_bridge_origin).resolve() != (_SCRIPT_DIR / "libero_bridge.py").resolve()
+):
+    raise RuntimeError("imported LIBERO bridge has an unexpected module origin")
+
 from duo_vla.runtime_determinism import configure_strict_cuda_determinism, deterministic_torch_runtime
+from duo_vla.runtime_integrity import (
+    content_address_train_venv,
+    require_matching_train_venv,
+    static_environment_identity,
+    validate_torchrun_rank_environment,
+)
+
+_validate_project_module_origins({"duo_vla", "duo_vla.runtime_determinism", "duo_vla.runtime_integrity"})
 
 MODEL_ID = "google/diffusiongemma-26B-A4B-it"
 MODEL_REVISION = "f7f5b7f5fa82ffc52addd066915886d497f5517b"
 DATASET_ID = "HuggingFaceVLA/libero"
 DATASET_REVISION = "86958911c0f959db2bbbdb107eb3e17c5f9c798e"
+DATASET_TREE_SHA256 = "d9c14b4aff28bcc56f341b171c6a5a3b10510d4bd0378662891c5156d245add8"
+DATASET_CONTENT_INVENTORY_SHA256 = "63fd7a951ebb397a33c43cad4a7c48c7c6911bd8d1481ff99b07da5f7890782c"
+DATASET_FILES_VERIFIED = 382
+DATASET_TOTAL_BYTES = 34_926_155_087
 NORMALIZATION_SHA256 = "a972b5d95a8aaa8ae7582bafcbc071261979cb46c2a3515b4da7a7cf0156ac73"
 TRAIN_LOCK_SHA256 = "0b1fb188747ee99224078b3c40975ca7e6f8e082e22d2860f9b50ee679a67c46"
 EXPECTED_TRAIN_PACKAGES = {
@@ -53,24 +194,72 @@ EXPERTS_IMPLEMENTATION = "grouped_mm"
 EXPERT_BATCH_ISOLATION = "sample_isolated_grouped_mm_v1"
 LIBERO_PREFIX_CAMERA_NAMES = ("agentview", "eye_in_hand")
 REQUIRED_SERVING_ENVIRONMENT = {
+    "BLIS_NUM_THREADS": "1",
     "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
     "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
     "CUDA_VISIBLE_DEVICES": "0,1",
+    "HF_HUB_DISABLE_PROGRESS_BARS": "1",
     "HF_HUB_OFFLINE": "1",
+    "HOME": "/root",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
     "MKL_NUM_THREADS": "1",
     "NUMEXPR_NUM_THREADS": "1",
     "OMP_DYNAMIC": "FALSE",
     "OMP_NUM_THREADS": "1",
     "OPENBLAS_NUM_THREADS": "1",
+    "PATH": "/usr/bin:/bin",
     "PYTHONHASHSEED": "0",
     "PYTHONNOUSERSITE": "1",
+    "PYTHONPYCACHEPREFIX": "/dev/null",
+    "PYTHONSAFEPATH": "1",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "RAYON_NUM_THREADS": "1",
     "TOKENIZERS_PARALLELISM": "false",
     "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
     "TRANSFORMERS_OFFLINE": "1",
+    "TZ": "UTC",
+    "VECLIB_MAXIMUM_THREADS": "1",
 }
-_ALGORITHM_ENVIRONMENT_PREFIXES = ("CUBLAS_", "CUDA_", "CUDNN_", "NCCL_", "PYTORCH_", "TORCH_")
+_ALGORITHM_ENVIRONMENT_PREFIXES = (
+    "BLIS_",
+    "CUBLAS_",
+    "CUDA_",
+    "CUDNN_",
+    "GCONV_PATH",
+    "GLIBC_",
+    "GOMP_",
+    "KMP_",
+    "LD_",
+    "LOCPATH",
+    "MALLOC_",
+    "MKL_",
+    "NCCL_",
+    "NIX_",
+    "NVIDIA_",
+    "NUMEXPR_",
+    "OMP_",
+    "OPENBLAS_",
+    "PYTORCH_",
+    "RAYON_",
+    "TORCH_",
+    "VECLIB_",
+)
 _ALLOWED_ALGORITHM_ENVIRONMENT = frozenset(
-    {"CUBLAS_WORKSPACE_CONFIG", "CUDA_DEVICE_ORDER", "CUDA_VISIBLE_DEVICES", "TORCH_NCCL_ASYNC_ERROR_HANDLING"}
+    {
+        "BLIS_NUM_THREADS",
+        "CUBLAS_WORKSPACE_CONFIG",
+        "CUDA_DEVICE_ORDER",
+        "CUDA_VISIBLE_DEVICES",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "OMP_DYNAMIC",
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "RAYON_NUM_THREADS",
+        "TORCH_NCCL_ASYNC_ERROR_HANDLING",
+        "VECLIB_MAXIMUM_THREADS",
+    }
 )
 
 
@@ -117,10 +306,32 @@ def _training_source_tree_sha256(root: Path) -> str:
     return digest.hexdigest()
 
 
-def _validate_serving_process_environment(project_root: Path) -> dict[str, str]:
+def _validate_serving_process_environment(project_root: Path) -> dict[str, Any]:
     """Require the canonical launcher environment before any CUDA initialization."""
 
-    forbidden = ("LD_LIBRARY_PATH", "LD_PRELOAD", "PYTHONHOME", "PYTHONINSPECT", "PYTHONSTARTUP")
+    _activate_project_source_root()
+    _validate_project_module_origins({"duo_vla", "duo_vla.runtime_determinism", "duo_vla.runtime_integrity"})
+    project_root = project_root.resolve()
+    cache_root = Path(os.environ.get("DUO_VLA_CACHE_ROOT", "/root/.cache/duo-vla")).resolve()
+    train_venv = (cache_root / "venvs/train").resolve()
+    expected = {
+        **REQUIRED_SERVING_ENVIRONMENT,
+        "DUO_VLA_CACHE_ROOT": str(cache_root),
+        "DUO_VLA_PROJECT_ROOT": str(project_root),
+        "DUO_VLA_TRAIN_VENV": str(train_venv),
+        "HF_HOME": str(Path(os.environ.get("HF_HOME", "/root/.cache/huggingface")).resolve()),
+    }
+    forbidden = (
+        "BASH_ENV",
+        "ENV",
+        "GLOBIGNORE",
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "PYTHONHOME",
+        "PYTHONINSPECT",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+    )
     present_forbidden = [name for name in forbidden if os.environ.get(name)]
     present_algorithm_overrides = sorted(
         name
@@ -132,14 +343,96 @@ def _validate_serving_process_environment(project_root: Path) -> dict[str, str]:
         "LIBERO serving environment contains injection/algorithm overrides: "
         f"forbidden={present_forbidden}, algorithm_overrides={present_algorithm_overrides}",
     )
-    observed = {name: os.environ.get(name) for name in REQUIRED_SERVING_ENVIRONMENT}
-    require(observed == REQUIRED_SERVING_ENVIRONMENT, f"LIBERO serving environment differs from launcher: {observed}")
-    expected_pythonpath = f"{(project_root / 'src').resolve()}:{(project_root / 'scripts').resolve()}"
-    require(
-        os.environ.get("PYTHONPATH") == expected_pythonpath,
-        f"LIBERO serving requires PYTHONPATH={expected_pythonpath}",
+    observed = {name: os.environ.get(name) for name in expected}
+    require(observed == expected, f"LIBERO serving environment differs from launcher: {observed}")
+    require(Path(sys.prefix).resolve() == train_venv, f"LIBERO serving requires the pinned train venv: {train_venv}")
+    require(sys.flags.safe_path == 1, "LIBERO serving requires Python safe-path mode")
+    require(sys.flags.dont_write_bytecode == 1 and sys.dont_write_bytecode, "LIBERO serving requires -B")
+    require(sys.flags.no_user_site == 1 and not site.ENABLE_USER_SITE, "LIBERO serving requires no user site")
+    require(sys.pycache_prefix == "/dev/null", "LIBERO serving requires an impossible pycache lookup prefix")
+    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    compact_version = f"python{sys.version_info.major}{sys.version_info.minor}"
+    expected_sys_path = [
+        str((project_root / "src").resolve()),
+        str(Path(sys.base_prefix) / "lib" / f"{compact_version}.zip"),
+        str(Path(sys.base_prefix) / "lib" / version),
+        str(Path(sys.base_exec_prefix) / "lib" / version / "lib-dynload"),
+        str(train_venv / "lib" / version / "site-packages"),
+    ]
+    require(sys.path == expected_sys_path, f"LIBERO serving import search path differs: {sys.path}")
+    rank_environment = validate_torchrun_rank_environment(
+        os.environ,
+        required=any(name in os.environ for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE")),
     )
-    return {**REQUIRED_SERVING_ENVIRONMENT, "PYTHONPATH": expected_pythonpath}
+    return {
+        "environment": dict(sorted(observed.items())),
+        "static_environment_sha256": static_environment_identity(observed)["sha256"],
+        "torchrun": rank_environment,
+    }
+
+
+def _driver_and_binary_identity(torch: Any) -> dict[str, Any]:
+    """Bind the latency runtime to its driver, device mapping, and loaded binaries."""
+
+    try:
+        completed = subprocess.run(
+            [
+                "/usr/bin/nvidia-smi",
+                "--query-gpu=index,name,uuid,driver_version,compute_cap",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("cannot attest the driver/device runtime") from exc
+    rows: list[dict[str, Any]] = []
+    for line in completed.stdout.splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        require(len(fields) == 5 and all(fields), f"invalid driver/device identity row: {line!r}")
+        rows.append(
+            {
+                "compute_capability": fields[4],
+                "driver_version": fields[3],
+                "index": int(fields[0]),
+                "name": fields[1],
+                "uuid": fields[2],
+            }
+        )
+    require([row["index"] for row in rows] == [0, 1], "driver query did not report two devices in order")
+    logical: list[dict[str, Any]] = []
+    for index, physical in enumerate(rows):
+        properties = torch.cuda.get_device_properties(index)
+        uuid = str(getattr(properties, "uuid", ""))
+        name = str(getattr(properties, "name", torch.cuda.get_device_name(index)))
+        capability = list(torch.cuda.get_device_capability(index))
+        require(uuid and uuid.lower() == physical["uuid"].removeprefix("GPU-").lower(), "device UUID mapping differs")
+        require(name == physical["name"], "device name differs between CUDA and driver query")
+        require(".".join(map(str, capability)) == physical["compute_capability"], "device capability differs")
+        logical.append(
+            {
+                "compute_capability": capability,
+                "logical_index": index,
+                "name": name,
+                "physical_index": physical["index"],
+                "uuid": uuid,
+            }
+        )
+    torch_binary = Path(torch._C.__file__).resolve()
+    python_binary = Path(sys.executable).resolve()
+    return {
+        "binaries": {
+            "nvidia_smi_sha256": sha256_file(Path("/usr/bin/nvidia-smi")),
+            "python_executable": str(python_binary),
+            "python_executable_sha256": sha256_file(python_binary),
+            "torch_extension": str(torch_binary),
+            "torch_extension_sha256": sha256_file(torch_binary),
+        },
+        "logical_cuda_devices": logical,
+        "nvidia_smi_devices": rows,
+    }
 
 
 def configure_and_identify_serving_runtime(
@@ -168,7 +461,9 @@ def configure_and_identify_serving_runtime(
         "checkpoint report has no training execution-environment identity",
     )
     execution_geometry = validate_execution_geometry(checkpoint_report.get("execution_geometry"))
-    gpu_properties = [torch.cuda.get_device_properties(index) for index in range(torch.cuda.device_count())]
+    train_venv = checkpoint_report.get("train_venv")
+    require(isinstance(train_venv, dict), "checkpoint report has no authenticated train-venv identity")
+    hardware = _driver_and_binary_identity(torch)
     payload = {
         "authenticated_software": {
             "bridge_sha256": sha256_file(project_root / "scripts/libero_bridge.py"),
@@ -179,20 +474,27 @@ def configure_and_identify_serving_runtime(
             "serve_policy_sha256": sha256_file(Path(__file__)),
             "train_launcher_sha256": sha256_file(project_root / "scripts/run_libero_train.sh"),
             "train_lock_sha256": TRAIN_LOCK_SHA256,
+            "train_venv_content_inventory_sha256": train_venv["content_inventory_sha256"],
+            "train_venv_root_sha256": train_venv["root_sha256"],
+            "train_venv_tree_metadata_sha256": train_venv["tree_metadata_sha256"],
         },
         "determinism": deterministic_torch_runtime(torch),
         "environment": environment,
         "execution_geometry": execution_geometry,
-        "gpu_capability": [list(torch.cuda.get_device_capability(index)) for index in range(torch.cuda.device_count())],
-        "gpu_names": [torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())],
-        "gpu_uuids": [str(getattr(properties, "uuid", "")) for properties in gpu_properties],
+        "gpu_capability": [row["compute_capability"] for row in hardware["logical_cuda_devices"]],
+        "gpu_names": [row["name"] for row in hardware["logical_cuda_devices"]],
+        "gpu_uuids": [row["uuid"] for row in hardware["logical_cuda_devices"]],
+        "hardware": hardware,
         "platform": {
             "cuda_runtime": torch.version.cuda,
             "cudnn": torch.backends.cudnn.version(),
+            "machine": platform.machine(),
+            "nccl": list(torch.cuda.nccl.version()),
+            "platform": platform.platform(),
             "python": sys.version.split()[0],
             "torch": torch.__version__,
         },
-        "schema": "duovla-libero-serving-runtime-v1",
+        "schema": "duovla-libero-serving-runtime-v2",
         "sdpa_backends": {
             "cudnn": torch.backends.cuda.cudnn_sdp_enabled(),
             "flash": torch.backends.cuda.flash_sdp_enabled(),
@@ -204,6 +506,34 @@ def configure_and_identify_serving_runtime(
     require(len(payload["gpu_names"]) == 2, "LIBERO serving runtime must expose exactly two GPUs")
     require(all(payload["gpu_uuids"]), "LIBERO serving runtime could not identify both GPU UUIDs")
     return payload, _canonical_sha256(payload)
+
+
+def latency_runtime_identity(serving_runtime: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """Remove checkpoint-training provenance while retaining latency-relevant runtime identity."""
+
+    expected = {
+        "authenticated_software",
+        "determinism",
+        "environment",
+        "execution_geometry",
+        "gpu_capability",
+        "gpu_names",
+        "gpu_uuids",
+        "hardware",
+        "platform",
+        "schema",
+        "sdpa_backends",
+        "training_execution_environment_sha256",
+    }
+    require(set(serving_runtime) == expected, "serving runtime fields changed before latency identity derivation")
+    require(serving_runtime["schema"] == "duovla-libero-serving-runtime-v2", "serving runtime schema changed")
+    identity = {
+        name: value
+        for name, value in serving_runtime.items()
+        if name not in {"schema", "training_execution_environment_sha256"}
+    }
+    identity["schema"] = "duovla-libero-latency-runtime-v2"
+    return identity, _canonical_sha256(identity)
 
 
 def model_snapshot_preflight() -> dict[str, Any]:
@@ -299,6 +629,7 @@ def _authenticated_training_environment(
     resolved_config: dict[str, Any],
     manifest: dict[str, Any],
     *,
+    project_root: Path,
     train_seed: int,
 ) -> dict[str, Any]:
     """Require a checkpoint produced under the strict deterministic trainer contract."""
@@ -333,12 +664,67 @@ def _authenticated_training_environment(
     authenticated_runtime = environment.get("authenticated_runtime")
     require(isinstance(authenticated_runtime, dict), "training environment has no authenticated runtime")
     require(
+        set(authenticated_runtime)
+        == {
+            "algorithm_override_environment",
+            "environment",
+            "nccl_environment",
+            "static_environment_sha256",
+            "torchrun",
+            "train_venv",
+        },
+        "training authenticated-runtime fields differ",
+    )
+    require(
         authenticated_runtime.get("algorithm_override_environment") == {},
         "training environment contains unpinned algorithm overrides",
     )
     require(
         authenticated_runtime.get("nccl_environment") == {},
         "training environment contains unpinned NCCL overrides",
+    )
+    expected_venv = authenticated_runtime.get("train_venv")
+    train_venv = Path(os.environ.get("DUO_VLA_TRAIN_VENV", ""))
+    require(train_venv.is_absolute(), "serving process has no canonical train-venv path")
+    require(
+        train_venv.resolve() == (Path(os.environ["DUO_VLA_CACHE_ROOT"]) / "venvs/train").resolve(),
+        "serving train-venv path differs from the cache-root contract",
+    )
+    live_venv = content_address_train_venv(train_venv)
+    require_matching_train_venv(expected_venv, live_venv)
+    expected_environment = authenticated_runtime.get("environment")
+    require(isinstance(expected_environment, dict), "training environment has no static process environment")
+    expected_training_environment = {
+        **REQUIRED_SERVING_ENVIRONMENT,
+        "DUO_VLA_CACHE_ROOT": str(Path(os.environ["DUO_VLA_CACHE_ROOT"]).resolve()),
+        "DUO_VLA_PROJECT_ROOT": str(project_root.resolve()),
+        "DUO_VLA_TRAIN_VENV": str(train_venv.resolve()),
+        "HF_HOME": str(Path(os.environ["HF_HOME"]).resolve()),
+        "PYTHONHASHSEED": str(train_seed),
+    }
+    require(
+        expected_environment == dict(sorted(expected_training_environment.items())),
+        "checkpoint training process environment differs from the canonical launcher",
+    )
+    require(
+        authenticated_runtime.get("static_environment_sha256")
+        == static_environment_identity(expected_environment)["sha256"],
+        "checkpoint training static-environment SHA-256 mismatch",
+    )
+    require(
+        expected_environment.get("DUO_VLA_PROJECT_ROOT") == str(project_root.resolve()),
+        "checkpoint training project root differs from serving",
+    )
+    require(
+        authenticated_runtime.get("torchrun")
+        == {
+            "group_world_size": 1,
+            "local_rank_equals_rank": True,
+            "local_world_size": 2,
+            "role_world_size": 2,
+            "world_size": 2,
+        },
+        "checkpoint training torchrun topology differs",
     )
     return environment
 
@@ -410,6 +796,24 @@ def resolve_checkpoint(
     require(model_config.get("revision") == MODEL_REVISION, "resolved config model revision mismatch")
     artifact_trees = resolved_config.get("artifact_trees")
     require(isinstance(artifact_trees, dict), "resolved config has no artifact tree identities")
+    expected_dataset_identity = {
+        "dataset_content_inventory_sha256": DATASET_CONTENT_INVENTORY_SHA256,
+        "dataset_files_verified": DATASET_FILES_VERIFIED,
+        "dataset_total_bytes": DATASET_TOTAL_BYTES,
+        "dataset_tree_sha256": DATASET_TREE_SHA256,
+    }
+    for name, expected in expected_dataset_identity.items():
+        require(artifact_trees.get(name) == expected, f"resolved config {name} differs from the qualified dataset")
+        require(manifest.get(name) == expected, f"checkpoint {name} differs from the qualified dataset")
+    expected_model_identity = {
+        "model_content_inventory_sha256": model_snapshot_report.get("content_inventory_sha256"),
+        "model_files_verified": model_snapshot_report.get("files_verified"),
+        "model_total_bytes": model_snapshot_report.get("total_bytes"),
+        "model_tree_sha256": model_snapshot_report.get("tree_metadata_sha256"),
+    }
+    for name, expected in expected_model_identity.items():
+        require(artifact_trees.get(name) == expected, f"resolved config {name} differs from the authenticated snapshot")
+        require(manifest.get(name) == expected, f"checkpoint {name} differs from the authenticated snapshot")
     require(
         artifact_trees.get("model_tree_sha256") == model_snapshot_report.get("tree_metadata_sha256"),
         "resolved config model tree identity differs from the authenticated snapshot",
@@ -502,9 +906,12 @@ def resolve_checkpoint(
     training_environment = _authenticated_training_environment(
         resolved_config,
         manifest,
+        project_root=Path(__file__).resolve().parents[1],
         train_seed=train_seed,
     )
     checkpoint_report = {
+        **expected_dataset_identity,
+        **expected_model_identity,
         "kind": manifest.get("kind"),
         "manifest_sha256": sha256_file(checkpoint_dir / "manifest.json"),
         "path": str(checkpoint_dir),
@@ -514,6 +921,7 @@ def resolve_checkpoint(
         "train_seed": train_seed,
         "training_execution_environment": training_environment,
         "training_execution_environment_sha256": manifest["execution_environment_sha256"],
+        "train_venv": training_environment["authenticated_runtime"]["train_venv"],
         "execution_geometry": execution_geometry,
     }
     return (
@@ -595,16 +1003,31 @@ def _health_payload(
     train_seed: int,
     checkpoint_report: dict[str, Any] | None,
     policy_contract: dict[str, Any],
+    latency_runtime_sha256: str | None = None,
     serving_runtime_sha256: str | None = None,
 ) -> dict[str, Any]:
     wire_contract = {name: policy_contract[name] for name in ("objective", "sampler", "nfe", "inference_seed_behavior")}
     validate_wire_policy_contract(wire_contract, allow_fake=mode == "fake")
+    for name, value in (
+        ("latency_runtime_sha256", latency_runtime_sha256),
+        ("serving_runtime_sha256", serving_runtime_sha256),
+    ):
+        if mode == "real":
+            require(
+                isinstance(value, str)
+                and len(value) == 64
+                and all(character in "0123456789abcdef" for character in value),
+                f"real policy {name} is invalid",
+            )
+        else:
+            require(value is None, f"fake policy cannot claim {name}")
     return {
         "action_dim": ACTION_DIM,
         "action_horizon": ACTION_HORIZON,
         "checkpoint": checkpoint_report,
         "dataset_revision": DATASET_REVISION,
         "execution_geometry": checkpoint_report["execution_geometry"] if mode == "real" else None,
+        "latency_runtime_sha256": latency_runtime_sha256,
         "mode": mode,
         "model_revision": MODEL_REVISION if mode == "real" else None,
         "normalization_content_sha256": NORMALIZATION_SHA256 if mode == "real" else None,
@@ -967,6 +1390,7 @@ def run_distributed_server(
         project_root=project_root,
         checkpoint_report=checkpoint_report,
     )
+    _, latency_runtime_sha256 = latency_runtime_identity(serving_runtime)
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
@@ -979,6 +1403,12 @@ def run_distributed_server(
         require(
             runtime_hashes == [serving_runtime_sha256] * dist.get_world_size(),
             f"TP ranks have different serving runtime identities: {runtime_hashes}",
+        )
+        latency_runtime_hashes: list[str | None] = [None] * dist.get_world_size()
+        dist.all_gather_object(latency_runtime_hashes, latency_runtime_sha256)
+        require(
+            latency_runtime_hashes == [latency_runtime_sha256] * dist.get_world_size(),
+            f"TP ranks have different latency runtime identities: {latency_runtime_hashes}",
         )
         policy = RealPolicy(
             checkpoint_dir,
@@ -993,6 +1423,7 @@ def run_distributed_server(
             train_seed=train_seed,
             checkpoint_report=checkpoint_report,
             policy_contract=policy_contract,
+            latency_runtime_sha256=latency_runtime_sha256,
             serving_runtime_sha256=serving_runtime_sha256,
         )
         dist.barrier()
@@ -1039,6 +1470,7 @@ def run_distributed_server(
                             "nfe": policy_contract["nfe"],
                             "objective": policy_contract["objective"],
                             **checkpoint_report["execution_geometry"],
+                            "latency_runtime_sha256": latency_runtime_sha256,
                             "sampler": policy_contract["sampler"],
                             "serving_runtime": serving_runtime,
                             "serving_runtime_sha256": serving_runtime_sha256,
@@ -1126,8 +1558,10 @@ def main() -> None:
             project_root=project_root,
             checkpoint_report=report["checkpoint"],
         )
+        _, latency_runtime_sha256 = latency_runtime_identity(serving_runtime)
         report["serving_runtime"] = serving_runtime
         report["serving_runtime_sha256"] = serving_runtime_sha256
+        report["latency_runtime_sha256"] = latency_runtime_sha256
         print(json.dumps(report, indent=2, sort_keys=True))
         return
     run_distributed_server(

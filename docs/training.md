@@ -61,7 +61,8 @@ its weight is inactive because its input is zero; its bias remains trainable.
 | Gradient clipping | TP-aware global norm `1.0` |
 | Schedule | 1,000-update linear warm-up, then cosine decay to `0.1x` peak |
 | Default budget | 30,000 optimizer updates |
-| Validation / checkpoint interval | 1,000 updates |
+| Validation / resumable-checkpoint interval | 1,000 updates |
+| Permanent-checkpoint interval | 5,000 updates |
 | Validation samples | `2,048` |
 | EMA / image augmentation | disabled / none |
 | Training seeds | `0`, `1`, `2` |
@@ -70,6 +71,16 @@ Tensor parallel size 2 shards one model and does not multiply the sample count. 
 model's grouped-MoE execution contract, so production training fails closed if batch or accumulation settings change
 it. The resolved config, source tree, data/model identities, normalization and prefix artifacts, optimizer
 parameter inventory, RNG state, and checkpoint lineage are authenticated for resume and serving.
+Every newly committed 1,000-update checkpoint is the journal tip and remains resumable. After the next tip is durable,
+the superseded checkpoint is retired unless its update is a 5,000-update permanent multiple. Retirement first
+authenticates the exact parent manifest and its parent anchor inside the immutable child manifest. The permanent cadence
+is read from `resolved_config.json` only after its semantic hash matches the run journal. The parent directory is then
+atomically moved into a durable `checkpoint_retention/` transaction. Its original manifest is preserved by exact
+SHA-256 before descriptor-relative, no-follow deletion of the payload. A restart completes any interrupted transaction
+before training resumes. Thus a run retains permanent multiples plus the current tip instead of accumulating all 30
+checkpoint payloads. Preserve `checkpoint_retention/` with the run: its small original-manifest records are required to
+authenticate an already-retired immediate parent. An unexpected older non-permanent backlog is rejected before any new
+retirement rather than silently left outside the stated bound.
 
 ## Data and normalization
 
@@ -226,6 +237,8 @@ the run complete, or introduce an off-schedule validation pass. Resume the same 
 `--resume checkpoints/update-NNNNNN`; changing the objective, update budget, seed, normalization, prefix artifact, or
 source identity is rejected. An unplanned interruption does not imply that a new checkpoint exists: resume is possible
 only from the latest transactionally committed checkpoint.
+An off-cadence clean-stop checkpoint is the current tip and is retained until a later tip commits; it does not become a
+permanent checkpoint unless its absolute update is a multiple of 5,000.
 
 The 500-update pilot may be evaluated only as held-out A/B/C development evidence using
 [calvin_development_evaluation.md](calvin_development_evaluation.md). It must not be reported as an official ABC→D

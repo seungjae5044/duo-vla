@@ -15,10 +15,15 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
+import serve_libero_policy as SERVER
 from libero_bridge import LIBERO_EXECUTION_GEOMETRY
 from serve_libero_policy import (
+    DATASET_CONTENT_INVENTORY_SHA256,
+    DATASET_FILES_VERIFIED,
     DATASET_ID,
     DATASET_REVISION,
+    DATASET_TOTAL_BYTES,
+    DATASET_TREE_SHA256,
     EXPERT_BATCH_ISOLATION,
     EXPERTS_IMPLEMENTATION,
     IMAGE_SHAPE,
@@ -32,6 +37,7 @@ from serve_libero_policy import (
     _training_source_tree_sha256,
     _validate_serving_process_environment,
     configure_and_identify_serving_runtime,
+    latency_runtime_identity,
     resolve_checkpoint,
 )
 
@@ -44,8 +50,76 @@ from duo_vla.prefix_geometry import (
     save_prefix_geometry_contract,
 )
 from duo_vla.run_config import canonical_config_sha256, load_resolved_toml, save_resolved_config
+from duo_vla.runtime_integrity import (
+    BASE_PYTHON_RUNTIME_IDENTITY_SCHEMA,
+    TRAIN_VENV_IDENTITY_SCHEMA,
+    canonical_sha256,
+    static_environment_identity,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _train_venv_identity() -> dict[str, object]:
+    venv_root = "/root/.cache/duo-vla/venvs/train"
+    base_python_runtime: dict[str, object] = {
+        "base_prefix": "/usr/local",
+        "configured_home": "/usr/local/bin",
+        "configured_home_resolved": "/usr/local/bin",
+        "content_inventory_sha256": "5" * 64,
+        "files_verified": 100,
+        "pyvenv_cfg_bytes": 128,
+        "pyvenv_cfg_sha256": "6" * 64,
+        "resolved_executable": "/usr/local/bin/python3.11",
+        "resolved_executable_bytes": 20_000,
+        "resolved_executable_sha256": "7" * 64,
+        "schema": BASE_PYTHON_RUNTIME_IDENTITY_SCHEMA,
+        "startup_hooks": [],
+        "startup_hooks_sha256": canonical_sha256([]),
+        "symlinks_verified": 4,
+        "total_bytes": 1_000_000,
+        "tree_metadata_sha256": "8" * 64,
+        "venv_python": f"{venv_root}/bin/python",
+        "venv_python_link_target": "/usr/local/bin/python3.11",
+        "venv_root": venv_root,
+    }
+    base_python_runtime["root_sha256"] = canonical_sha256(base_python_runtime)
+    identity: dict[str, object] = {
+        "base_python_runtime": base_python_runtime,
+        "content_inventory_sha256": "1" * 64,
+        "files_verified": 10,
+        "root": venv_root,
+        "schema": TRAIN_VENV_IDENTITY_SCHEMA,
+        "startup_hooks": ["lib/python3.11/site-packages/known.pth"],
+        "startup_hooks_sha256": "3" * 64,
+        "symlinks_verified": 3,
+        "total_bytes": 100,
+        "tree_metadata_sha256": "4" * 64,
+    }
+    identity["root_sha256"] = canonical_sha256(
+        {
+            "base_python_runtime_root_sha256": base_python_runtime["root_sha256"],
+            "content_inventory_sha256": identity["content_inventory_sha256"],
+            "files_verified": identity["files_verified"],
+            "schema": identity["schema"],
+            "startup_hooks_sha256": identity["startup_hooks_sha256"],
+            "symlinks_verified": identity["symlinks_verified"],
+            "total_bytes": identity["total_bytes"],
+            "tree_metadata_sha256": identity["tree_metadata_sha256"],
+        }
+    )
+    return identity
+
+
+@pytest.fixture(autouse=True)
+def _canonical_paths_and_fake_venv(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DUO_VLA_CACHE_ROOT", "/root/.cache/duo-vla")
+    monkeypatch.setenv("DUO_VLA_PROJECT_ROOT", str(PROJECT_ROOT))
+    monkeypatch.setenv("DUO_VLA_TRAIN_VENV", "/root/.cache/duo-vla/venvs/train")
+    monkeypatch.setenv("HF_HOME", "/root/.cache/huggingface")
+    monkeypatch.setattr(SERVER.sys, "prefix", "/root/.cache/duo-vla/venvs/train")
+    monkeypatch.setattr(SERVER.site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(SERVER, "content_address_train_venv", lambda _root: _train_venv_identity())
 
 
 class _Batch(dict[str, torch.Tensor]):
@@ -103,11 +177,38 @@ def _checkpoint_fixture(
     )
     config["benchmark"]["prefix_geometry_content_sha256"] = prefix_geometry["content_sha256"]
     config["artifact_trees"] = {
+        "dataset_content_inventory_sha256": DATASET_CONTENT_INVENTORY_SHA256,
+        "dataset_files_verified": DATASET_FILES_VERIFIED,
+        "dataset_total_bytes": DATASET_TOTAL_BYTES,
+        "dataset_tree_sha256": DATASET_TREE_SHA256,
         "model_content_inventory_sha256": model_report["content_inventory_sha256"],
+        "model_files_verified": model_report["files_verified"],
+        "model_total_bytes": model_report["total_bytes"],
         "model_tree_sha256": model_report["tree_metadata_sha256"],
     }
+    train_environment = {
+        **REQUIRED_SERVING_ENVIRONMENT,
+        "DUO_VLA_CACHE_ROOT": "/root/.cache/duo-vla",
+        "DUO_VLA_PROJECT_ROOT": str(PROJECT_ROOT),
+        "DUO_VLA_TRAIN_VENV": "/root/.cache/duo-vla/venvs/train",
+        "HF_HOME": "/root/.cache/huggingface",
+        "PYTHONHASHSEED": "1",
+    }
     training_environment: dict[str, object] = {
-        "authenticated_runtime": {"algorithm_override_environment": {}, "nccl_environment": {}},
+        "authenticated_runtime": {
+            "algorithm_override_environment": {},
+            "environment": dict(sorted(train_environment.items())),
+            "nccl_environment": {},
+            "static_environment_sha256": static_environment_identity(train_environment)["sha256"],
+            "torchrun": {
+                "group_world_size": 1,
+                "local_rank_equals_rank": True,
+                "local_world_size": 2,
+                "role_world_size": 2,
+                "world_size": 2,
+            },
+            "train_venv": _train_venv_identity(),
+        },
         "cublas_workspace_config": ":4096:8",
         "cudnn_benchmark": False,
         "cudnn_deterministic": True,
@@ -134,8 +235,12 @@ def _checkpoint_fixture(
             "resolved_config": {"path": "artifacts/resolved_config.json"},
         },
         "config_sha256": config_sha256,
+        "dataset_content_inventory_sha256": DATASET_CONTENT_INVENTORY_SHA256,
+        "dataset_files_verified": DATASET_FILES_VERIFIED,
         "dataset_id": DATASET_ID,
         "dataset_revision": DATASET_REVISION,
+        "dataset_total_bytes": DATASET_TOTAL_BYTES,
+        "dataset_tree_sha256": DATASET_TREE_SHA256,
         "execution_environment": training_environment,
         "execution_environment_sha256": canonical_config_sha256(training_environment),
         "kind": "resumable-libero-training",
@@ -146,7 +251,9 @@ def _checkpoint_fixture(
         "prefix_geometry_content_sha256": prefix_geometry["content_sha256"],
         "model_id": MODEL_ID,
         "model_content_inventory_sha256": model_report["content_inventory_sha256"],
+        "model_files_verified": model_report["files_verified"],
         "model_revision": MODEL_REVISION,
+        "model_total_bytes": model_report["total_bytes"],
         "model_tree_sha256": model_report["tree_metadata_sha256"],
         "normalization_sha256": NORMALIZATION_SHA256,
         "policy_contract": contract,
@@ -191,6 +298,60 @@ def test_server_resolves_objective_only_from_verified_config_and_manifest(
     assert report["policy_contract"] == contract
     assert prefix_geometry["content_sha256"] == config["benchmark"]["prefix_geometry_content_sha256"]
     assert report["execution_geometry"]["physical_batch_size"] == PHYSICAL_BATCH_SIZE
+    assert report["dataset_tree_sha256"] == DATASET_TREE_SHA256
+    assert report["dataset_content_inventory_sha256"] == DATASET_CONTENT_INVENTORY_SHA256
+    assert report["dataset_files_verified"] == DATASET_FILES_VERIFIED
+    assert report["dataset_total_bytes"] == DATASET_TOTAL_BYTES
+    assert report["model_tree_sha256"] == model_report["tree_metadata_sha256"]
+    assert report["model_content_inventory_sha256"] == model_report["content_inventory_sha256"]
+    assert report["train_venv"] == _train_venv_identity()
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_value"),
+    (
+        ("dataset_tree_sha256", "0" * 64),
+        ("dataset_content_inventory_sha256", "0" * 64),
+        ("dataset_files_verified", 381),
+        ("dataset_total_bytes", DATASET_TOTAL_BYTES - 1),
+    ),
+)
+def test_server_rejects_dataset_identity_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    wrong_value: object,
+) -> None:
+    import duo_vla.checkpointing
+
+    checkpoint, manifest, _, model_report = _checkpoint_fixture(tmp_path)
+    manifest[field] = wrong_value
+    monkeypatch.setattr(duo_vla.checkpointing, "load_checkpoint_manifest", lambda *args, **kwargs: manifest)
+
+    with pytest.raises(RuntimeError, match=field):
+        resolve_checkpoint(checkpoint, train_seed_override=None, model_snapshot_report=model_report)
+
+
+def test_server_rejects_live_train_venv_content_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import duo_vla.checkpointing
+    import duo_vla.data.libero_stats
+
+    checkpoint, manifest, _, model_report = _checkpoint_fixture(tmp_path)
+    monkeypatch.setattr(duo_vla.checkpointing, "load_checkpoint_manifest", lambda *args, **kwargs: manifest)
+    monkeypatch.setattr(
+        duo_vla.data.libero_stats,
+        "load_libero_normalizers",
+        lambda *args, **kwargs: (object(), object(), {"content_sha256": NORMALIZATION_SHA256}),
+    )
+    changed = _train_venv_identity()
+    changed["root_sha256"] = "f" * 64
+    monkeypatch.setattr(SERVER, "content_address_train_venv", lambda _root: changed)
+
+    with pytest.raises(RuntimeError, match="live train venv differs"):
+        resolve_checkpoint(checkpoint, train_seed_override=None, model_snapshot_report=model_report)
 
 
 def test_server_rejects_manifest_objective_that_disagrees_with_resolved_config(
@@ -273,7 +434,7 @@ def test_server_rejects_checkpoint_from_nondeterministic_training() -> None:
     }
 
     with pytest.raises(RuntimeError, match="strict deterministic controls"):
-        _authenticated_training_environment(config, manifest, train_seed=1)
+        _authenticated_training_environment(config, manifest, project_root=PROJECT_ROOT, train_seed=1)
 
     environment["cudnn_deterministic"] = True
     environment["deterministic_algorithms"] = True
@@ -281,10 +442,10 @@ def test_server_rejects_checkpoint_from_nondeterministic_training() -> None:
     manifest["execution_environment"] = copy.deepcopy(environment)
     manifest["execution_environment_sha256"] = canonical_config_sha256(environment)
     with pytest.raises(RuntimeError, match="preferred_blas_library"):
-        _authenticated_training_environment(config, manifest, train_seed=1)
+        _authenticated_training_environment(config, manifest, project_root=PROJECT_ROOT, train_seed=1)
 
 
-def test_v4_health_exposes_exact_real_geometry_and_null_fake_identities() -> None:
+def test_v5_health_exposes_exact_real_geometry_and_null_fake_identities() -> None:
     real_contract = {
         "objective": "rectified_flow",
         "sampler": "euler_uniform",
@@ -297,10 +458,12 @@ def test_v4_health_exposes_exact_real_geometry_and_null_fake_identities() -> Non
         train_seed=0,
         checkpoint_report=checkpoint_report,
         policy_contract=real_contract,
+        latency_runtime_sha256="b" * 64,
         serving_runtime_sha256="a" * 64,
     )
     assert real["execution_geometry"] == LIBERO_EXECUTION_GEOMETRY
     assert real["serving_runtime_sha256"] == "a" * 64
+    assert real["latency_runtime_sha256"] == "b" * 64
 
     fake = _health_payload(
         mode="fake",
@@ -316,6 +479,7 @@ def test_v4_health_exposes_exact_real_geometry_and_null_fake_identities() -> Non
     for name in (
         "checkpoint",
         "execution_geometry",
+        "latency_runtime_sha256",
         "model_revision",
         "normalization_content_sha256",
         "serving_runtime_sha256",
@@ -331,7 +495,27 @@ def _set_canonical_serving_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
     for name, value in REQUIRED_SERVING_ENVIRONMENT.items():
         monkeypatch.setenv(name, value)
-    monkeypatch.setenv("PYTHONPATH", f"{PROJECT_ROOT / 'src'}:{PROJECT_ROOT / 'scripts'}")
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.setattr(
+        SERVER.sys,
+        "flags",
+        SimpleNamespace(dont_write_bytecode=1, no_user_site=1, safe_path=1),
+    )
+    monkeypatch.setattr(SERVER.sys, "dont_write_bytecode", True)
+    monkeypatch.setattr(SERVER.sys, "pycache_prefix", "/dev/null")
+    version = f"python{SERVER.sys.version_info.major}.{SERVER.sys.version_info.minor}"
+    compact_version = f"python{SERVER.sys.version_info.major}{SERVER.sys.version_info.minor}"
+    monkeypatch.setattr(
+        SERVER.sys,
+        "path",
+        [
+            str(PROJECT_ROOT / "src"),
+            str(Path(SERVER.sys.base_prefix) / "lib" / f"{compact_version}.zip"),
+            str(Path(SERVER.sys.base_prefix) / "lib" / version),
+            str(Path(SERVER.sys.base_exec_prefix) / "lib" / version / "lib-dynload"),
+            f"/root/.cache/duo-vla/venvs/train/lib/{version}/site-packages",
+        ],
+    )
 
 
 def test_server_process_environment_is_closed_and_rejects_nccl_override(
@@ -341,8 +525,9 @@ def test_server_process_environment_is_closed_and_rejects_nccl_override(
 
     environment = _validate_serving_process_environment(PROJECT_ROOT)
 
-    assert environment["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
-    assert environment["PYTHONHASHSEED"] == "0"
+    assert environment["environment"]["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
+    assert environment["environment"]["PYTHONHASHSEED"] == "0"
+    assert environment["static_environment_sha256"] == static_environment_identity(environment["environment"])["sha256"]
     for name in (
         "CUBLAS_UNKNOWN_OVERRIDE",
         "CUDA_UNKNOWN_OVERRIDE",
@@ -371,6 +556,7 @@ def test_serving_runtime_is_strict_deterministic_and_content_addressed(
         get_device_properties=lambda index: SimpleNamespace(uuid=("GPU-0", "GPU-1")[index]),
         math_sdp_enabled=lambda: True,
         mem_efficient_sdp_enabled=lambda: True,
+        nccl=SimpleNamespace(version=lambda: (2, 29, 3)),
     )
     fake_torch = SimpleNamespace(
         __version__="2.13.0+cu126",
@@ -389,10 +575,41 @@ def test_serving_runtime_is_strict_deterministic_and_content_addressed(
         },
     )
     monkeypatch.setattr("serve_libero_policy._training_source_tree_sha256", lambda _root: "d" * 64)
+    hardware = {
+        "binaries": {
+            "nvidia_smi_sha256": "1" * 64,
+            "python_executable": "/runtime/python",
+            "python_executable_sha256": "2" * 64,
+            "torch_extension": "/runtime/torch.so",
+            "torch_extension_sha256": "3" * 64,
+        },
+        "logical_cuda_devices": [
+            {
+                "compute_capability": [8, 6],
+                "logical_index": index,
+                "name": "Test GPU",
+                "physical_index": index,
+                "uuid": f"GPU-{index}",
+            }
+            for index in range(2)
+        ],
+        "nvidia_smi_devices": [
+            {
+                "compute_capability": "8.6",
+                "driver_version": "test-driver",
+                "index": index,
+                "name": "Test GPU",
+                "uuid": f"GPU-GPU-{index}",
+            }
+            for index in range(2)
+        ],
+    }
+    monkeypatch.setattr("serve_libero_policy._driver_and_binary_identity", lambda _torch: hardware)
 
     checkpoint_report = {
         "execution_geometry": LIBERO_EXECUTION_GEOMETRY,
         "source_tree_sha256": "d" * 64,
+        "train_venv": _train_venv_identity(),
         "training_execution_environment_sha256": "e" * 64,
     }
     first, first_sha256 = configure_and_identify_serving_runtime(
@@ -417,22 +634,47 @@ def test_serving_runtime_is_strict_deterministic_and_content_addressed(
     assert first["determinism"]["preferred_blas_library"] == "_BlasBackend.Cublas"
     assert first["training_execution_environment_sha256"] == "e" * 64
     assert first["sdpa_backends"] == {"cudnn": True, "flash": True, "math": True, "memory_efficient": True}
+    latency_identity, latency_sha256 = latency_runtime_identity(first)
+    changed_training = copy.deepcopy(first)
+    changed_training["training_execution_environment_sha256"] = "f" * 64
+    changed_identity, changed_sha256 = latency_runtime_identity(changed_training)
+    assert changed_identity == latency_identity
+    assert changed_sha256 == latency_sha256 == canonical_config_sha256(latency_identity)
+    changed_hardware = copy.deepcopy(first)
+    changed_hardware["gpu_uuids"][0] = "GPU-other"
+    _, changed_hardware_sha256 = latency_runtime_identity(changed_hardware)
+    assert changed_hardware_sha256 != latency_sha256
+    changed_driver = copy.deepcopy(first)
+    changed_driver["hardware"]["nvidia_smi_devices"][0]["driver_version"] = "different-driver"
+    _, changed_driver_sha256 = latency_runtime_identity(changed_driver)
+    assert changed_driver_sha256 != latency_sha256
+    changed_binary = copy.deepcopy(first)
+    changed_binary["hardware"]["binaries"]["torch_extension_sha256"] = "f" * 64
+    _, changed_binary_sha256 = latency_runtime_identity(changed_binary)
+    assert changed_binary_sha256 != latency_sha256
 
 
 def test_canonical_libero_server_launcher_pins_deterministic_runtime() -> None:
     source = (PROJECT_ROOT / "scripts/run_libero_policy_server.sh").read_text(encoding="utf-8")
 
-    assert 'export CUBLAS_WORKSPACE_CONFIG=":4096:8"' in source
-    assert 'export CUDA_VISIBLE_DEVICES="0,1"' in source
-    assert 'export PYTHONHASHSEED="0"' in source
-    assert 'export TORCH_NCCL_ASYNC_ERROR_HANDLING="1"' in source
-    assert 'export PYTHONPATH="${project_dir}/src:${project_dir}/scripts"' in source
+    assert "exec /usr/bin/env -i" in source
+    assert '"CUBLAS_WORKSPACE_CONFIG=:4096:8"' in source
+    assert '"CUDA_VISIBLE_DEVICES=0,1"' in source
+    assert '"PYTHONHASHSEED=0"' in source
+    assert '"PYTHONSAFEPATH=1"' in source
+    assert '"PYTHONDONTWRITEBYTECODE=1"' in source
+    assert '"TORCH_NCCL_ASYNC_ERROR_HANDLING=1"' in source
+    assert "PYTHONPATH" not in source
+    assert '"PYTHONPYCACHEPREFIX=/dev/null"' in source
+    assert "-P -B -X pycache_prefix=/dev/null" in source
     assert "${PYTHONPATH:+" not in source
-    assert "CUBLAS_*|CUDA_*|CUDNN_*|NCCL_*|PYTORCH_*|TORCH_*" in source
-    assert "unset LD_LIBRARY_PATH LD_PRELOAD PYTHONHOME PYTHONINSPECT PYTHONSTARTUP" in source
 
 
-def test_policy_server_recomputes_exact_libero_trainer_source_tree_identity() -> None:
+def test_policy_server_recomputes_exact_libero_trainer_source_tree_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = str(PROJECT_ROOT / "src")
+    monkeypatch.setattr(sys, "path", [path for path in sys.path if path != source_root] + [source_root])
     spec = importlib.util.spec_from_file_location(
         "libero_train_source_identity",
         PROJECT_ROOT / "scripts/train_libero.py",

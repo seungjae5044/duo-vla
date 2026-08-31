@@ -7,19 +7,29 @@ from pathlib import Path
 import pytest
 
 import duo_vla.run_journal as run_journal_module
+from duo_vla.run_config import canonical_config_sha256, save_resolved_config
 from duo_vla.run_journal import (
     RUN_JOURNAL_FILENAME,
     CheckpointRecord,
+    apply_checkpoint_retention,
     create_run_journal,
     load_run_journal,
+    make_checkpoint_retention_contract,
     quarantine_uncommitted_training_artifacts,
     reconcile_metrics_jsonl,
     record_latest_checkpoint,
     validate_resume_checkpoint,
 )
 
-CONFIG_SHA = "a" * 64
+RETENTION_CONFIG = {
+    "training": {
+        "checkpoint_interval": 1000,
+        "permanent_checkpoint_interval": 5000,
+    }
+}
+CONFIG_SHA = canonical_config_sha256(RETENTION_CONFIG)
 RUN_UUID = "12345678-1234-4234-8234-123456789abc"
+_NO_RETENTION_CONTRACT = object()
 
 
 def _write_checkpoint(
@@ -28,6 +38,7 @@ def _write_checkpoint(
     metrics: dict | None = None,
     *,
     parent_sha: str | None = None,
+    retention_parent: CheckpointRecord | object | None = _NO_RETENTION_CONTRACT,
 ) -> tuple[Path, str, dict]:
     checkpoint = output / "checkpoints" / f"update-{update:06d}"
     checkpoint.mkdir(parents=True)
@@ -40,6 +51,20 @@ def _write_checkpoint(
         "schema": "test-checkpoint-v1",
         "trainer_state": {"next_update": update},
     }
+    if retention_parent is not _NO_RETENTION_CONTRACT:
+        parent = retention_parent
+        assert parent is None or isinstance(parent, CheckpointRecord)
+        manifest["checkpoint_retention"] = make_checkpoint_retention_contract(
+            permanent_checkpoint_interval=5000,
+            parent_checkpoint=(
+                None
+                if parent is None
+                else {
+                    "relative_path": parent.relative_path,
+                    "update": parent.update,
+                }
+            ),
+        )
     data = (json.dumps(manifest, allow_nan=False, sort_keys=True) + "\n").encode()
     (checkpoint / "manifest.json").write_bytes(data)
     return checkpoint, hashlib.sha256(data).hexdigest(), last_metrics
@@ -66,6 +91,36 @@ def _create_committed_checkpoint(
 
 def _write_metrics(path: Path, entries: list[object]) -> None:
     path.write_text("".join(json.dumps(entry, sort_keys=True) + "\n" for entry in entries), encoding="utf-8")
+
+
+def _advance_checkpoint(
+    output: Path,
+    update: int,
+    *,
+    parent: CheckpointRecord | None,
+) -> CheckpointRecord:
+    parent_sha256 = None if parent is None else parent.manifest_sha256
+    checkpoint, digest, metrics = _write_checkpoint(
+        output,
+        update,
+        parent_sha=parent_sha256,
+        retention_parent=parent,
+    )
+    journal = record_latest_checkpoint(
+        output,
+        checkpoint=checkpoint,
+        update=update,
+        manifest_sha256=digest,
+        parent_manifest_sha256=parent_sha256,
+        last_metrics=metrics,
+    )
+    assert journal.latest_checkpoint is not None
+    return journal.latest_checkpoint
+
+
+def _create_retention_run(output: Path) -> None:
+    save_resolved_config(output / "resolved_config.json", RETENTION_CONFIG)
+    create_run_journal(output, config_sha256=CONFIG_SHA, run_uuid=RUN_UUID)
 
 
 def test_create_and_strictly_load_run_journal(tmp_path: Path) -> None:
@@ -280,6 +335,361 @@ def test_validate_resume_rechecks_manifest_run_identity(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="run_uuid does not match"):
         validate_resume_checkpoint(output, checkpoint)
+
+
+def test_checkpoint_retention_keeps_permanent_multiples_and_current_tip(tmp_path: Path) -> None:
+    output = tmp_path / "run"
+    output.mkdir()
+    _create_retention_run(output)
+    parent = None
+
+    for update in range(1000, 7000, 1000):
+        record = _advance_checkpoint(output, update, parent=parent)
+        apply_checkpoint_retention(output)
+        if update == 1000:
+            assert (output / "checkpoints/update-001000").is_dir()
+            assert not (output / "checkpoint_retention").exists()
+        parent = record
+
+    assert sorted(path.name for path in (output / "checkpoints").iterdir()) == [
+        "update-005000",
+        "update-006000",
+    ]
+    assert validate_resume_checkpoint(output, "checkpoints/update-006000").update == 6000
+    transactions = sorted((output / "checkpoint_retention").iterdir())
+    assert len(transactions) == 4
+    assert all(json.loads((path / "retirement.json").read_text())["status"] == "complete" for path in transactions)
+    assert all((path / "checkpoint-manifest.json").is_file() for path in transactions)
+
+
+def test_checkpoint_retention_recovers_crash_after_atomic_move(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "run"
+    output.mkdir()
+    _create_retention_run(output)
+    first = _advance_checkpoint(output, 1000, parent=None)
+    _advance_checkpoint(output, 2000, parent=first)
+
+    real_remove = run_journal_module._remove_retired_tree
+
+    def fail_after_move(*_args, **_kwargs) -> None:
+        raise OSError("simulated crash after retirement move")
+
+    monkeypatch.setattr(run_journal_module, "_remove_retired_tree", fail_after_move)
+    with pytest.raises(OSError, match="simulated crash"):
+        apply_checkpoint_retention(output)
+    assert not (output / "checkpoints/update-001000").exists()
+    transaction = next((output / "checkpoint_retention").iterdir())
+    assert (transaction / "checkpoint").is_dir()
+
+    monkeypatch.setattr(run_journal_module, "_remove_retired_tree", real_remove)
+    recovered = apply_checkpoint_retention(output)
+
+    assert recovered.retired_paths == ()
+    assert recovered.recovered_transactions == (transaction.relative_to(output).as_posix(),)
+    assert not (transaction / "checkpoint").exists()
+    assert json.loads((transaction / "retirement.json").read_text())["status"] == "complete"
+    assert (output / "checkpoints/update-002000").is_dir()
+
+
+def test_checkpoint_retention_recovers_crash_after_delete_before_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "run"
+    output.mkdir()
+    _create_retention_run(output)
+    first = _advance_checkpoint(output, 1000, parent=None)
+    _advance_checkpoint(output, 2000, parent=first)
+    real_write = run_journal_module._write_retirement_manifest
+
+    def fail_complete(path: Path, value: dict, *, exclusive: bool) -> None:
+        if value["status"] == "complete":
+            raise OSError("simulated crash before retirement completion record")
+        real_write(path, value, exclusive=exclusive)
+
+    monkeypatch.setattr(run_journal_module, "_write_retirement_manifest", fail_complete)
+    with pytest.raises(OSError, match="simulated crash"):
+        apply_checkpoint_retention(output)
+    transaction = next((output / "checkpoint_retention").iterdir())
+    assert not (output / "checkpoints/update-001000").exists()
+    assert not (transaction / "checkpoint").exists()
+    assert json.loads((transaction / "retirement.json").read_text())["status"] == "moved"
+
+    monkeypatch.setattr(run_journal_module, "_write_retirement_manifest", real_write)
+    recovered = apply_checkpoint_retention(output)
+
+    assert recovered.retired_paths == ()
+    assert recovered.recovered_transactions == (transaction.relative_to(output).as_posix(),)
+    assert json.loads((transaction / "retirement.json").read_text())["status"] == "complete"
+    assert (output / "checkpoints/update-002000").is_dir()
+
+
+def test_checkpoint_retention_never_deletes_unauthenticated_parent(tmp_path: Path) -> None:
+    output = tmp_path / "run"
+    output.mkdir()
+    _create_retention_run(output)
+    first = _advance_checkpoint(output, 1000, parent=None)
+    _advance_checkpoint(output, 2000, parent=first)
+    manifest = output / "checkpoints/update-001000/manifest.json"
+    manifest.write_text(manifest.read_text() + " ", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="non-permanent backlog"):
+        apply_checkpoint_retention(output)
+
+    assert (output / "checkpoints/update-001000").is_dir()
+    assert (output / "checkpoints/update-002000").is_dir()
+    assert not (output / "checkpoint_retention").exists()
+
+
+def test_checkpoint_retention_rejects_replaced_staging_inode_without_deleting_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "run"
+    output.mkdir()
+    _create_retention_run(output)
+    first = _advance_checkpoint(output, 1000, parent=None)
+    _advance_checkpoint(output, 2000, parent=first)
+
+    def fail_after_move(*_args, **_kwargs) -> None:
+        raise OSError("simulated crash after retirement move")
+
+    monkeypatch.setattr(run_journal_module, "_remove_retired_tree", fail_after_move)
+    with pytest.raises(OSError):
+        apply_checkpoint_retention(output)
+    transaction = next((output / "checkpoint_retention").iterdir())
+    staged = transaction / "checkpoint"
+    original = output / "original-checkpoint"
+    staged.rename(original)
+    staged.mkdir()
+    marker = staged / "foreign"
+    marker.write_text("do not delete", encoding="utf-8")
+    monkeypatch.undo()
+
+    with pytest.raises(ValueError, match="checkpoint retirement staging"):
+        apply_checkpoint_retention(output)
+
+    assert marker.read_text() == "do not delete"
+    assert original.is_dir()
+
+
+def test_checkpoint_retention_rejects_nonpermanent_backlog_before_deleting(tmp_path: Path) -> None:
+    output = tmp_path / "run"
+    output.mkdir()
+    _create_retention_run(output)
+    first = _advance_checkpoint(output, 1000, parent=None)
+    second = _advance_checkpoint(output, 2000, parent=first)
+    _advance_checkpoint(output, 3000, parent=second)
+
+    with pytest.raises(ValueError, match="non-permanent backlog"):
+        apply_checkpoint_retention(output)
+
+    assert sorted(path.name for path in (output / "checkpoints").iterdir()) == [
+        "update-001000",
+        "update-002000",
+        "update-003000",
+    ]
+    assert not (output / "checkpoint_retention").exists()
+
+
+def test_checkpoint_retention_interval_comes_from_authenticated_resolved_config(tmp_path: Path) -> None:
+    output = tmp_path / "run"
+    output.mkdir()
+    _create_retention_run(output)
+    first = _advance_checkpoint(output, 1000, parent=None)
+    _advance_checkpoint(output, 2000, parent=first)
+    envelope_path = output / "resolved_config.json"
+    envelope = json.loads(envelope_path.read_text())
+    envelope["config"]["training"]["permanent_checkpoint_interval"] = 10000
+    envelope["config_sha256"] = canonical_config_sha256(envelope["config"])
+    envelope_path.write_text(json.dumps(envelope), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="expected run configuration"):
+        apply_checkpoint_retention(output)
+
+    assert (output / "checkpoints/update-001000").is_dir()
+    assert (output / "checkpoints/update-002000").is_dir()
+
+
+def test_checkpoint_retention_rejects_transaction_interval_drift(tmp_path: Path) -> None:
+    output = tmp_path / "run"
+    output.mkdir()
+    _create_retention_run(output)
+    first = _advance_checkpoint(output, 1000, parent=None)
+    _advance_checkpoint(output, 2000, parent=first)
+    apply_checkpoint_retention(output)
+    transaction = next((output / "checkpoint_retention").iterdir())
+    manifest_path = transaction / "retirement.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["permanent_checkpoint_interval"] = 10000
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="interval differs from the authenticated"):
+        apply_checkpoint_retention(output)
+
+
+def test_completed_retirement_cannot_mask_missing_permanent_parent(tmp_path: Path) -> None:
+    output = tmp_path / "run"
+    output.mkdir()
+    _create_retention_run(output)
+    permanent = _advance_checkpoint(output, 5000, parent=None)
+    tip = _advance_checkpoint(output, 6000, parent=permanent)
+    permanent_path = output / permanent.relative_path
+    permanent_manifest = (permanent_path / "manifest.json").read_bytes()
+    permanent_path.rename(output / "displaced-permanent-checkpoint")
+
+    root = output / "checkpoint_retention"
+    root.mkdir()
+    transaction = root / "retire-update-001000-0123456789abcdef0123456789abcdef"
+    transaction.mkdir()
+    (transaction / "checkpoint-manifest.json").write_bytes(permanent_manifest)
+    fake = CheckpointRecord(
+        relative_path="checkpoints/update-001000",
+        update=1000,
+        manifest_sha256=permanent.manifest_sha256,
+        parent_manifest_sha256=None,
+        last_metrics={"train_loss": 0.001, "update": 1000},
+    )
+    run_journal_module._write_retirement_manifest(
+        transaction / "retirement.json",
+        {
+            "schema": run_journal_module.CHECKPOINT_RETIREMENT_SCHEMA,
+            "status": "complete",
+            "run_uuid": RUN_UUID,
+            "config_sha256": CONFIG_SHA,
+            "checkpoint": fake,
+            "authorized_tip": tip,
+            "directory_device": 1,
+            "directory_inode": 1,
+            "permanent_checkpoint_interval": 5000,
+        },
+        exclusive=True,
+    )
+
+    with pytest.raises(ValueError, match="preserved retired checkpoint manifest"):
+        apply_checkpoint_retention(output)
+
+    assert (output / "checkpoints/update-006000").is_dir()
+
+
+def test_descriptor_relative_retirement_does_not_delete_replacement_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "checkpoint"
+    target.mkdir()
+    (target / "original").write_text("retire me", encoding="utf-8")
+    observed = target.stat()
+    displaced = tmp_path / "authorized-original"
+    real_remove_contents = run_journal_module._remove_directory_contents_fd
+    swapped = False
+
+    def swap_root_after_open(descriptor: int, *, context: str) -> None:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            target.rename(displaced)
+            target.mkdir()
+            (target / "foreign").write_text("must survive", encoding="utf-8")
+        real_remove_contents(descriptor, context=context)
+
+    monkeypatch.setattr(run_journal_module, "_remove_directory_contents_fd", swap_root_after_open)
+
+    with pytest.raises(ValueError, match="directory identity changed"):
+        run_journal_module._remove_retired_tree(
+            target,
+            device=observed.st_dev,
+            inode=observed.st_ino,
+        )
+
+    assert swapped
+    assert (target / "foreign").read_text() == "must survive"
+    assert displaced.is_dir()
+
+
+def test_descriptor_relative_retirement_unlinks_symlink_without_following_it(tmp_path: Path) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    marker = external / "must-survive"
+    marker.write_text("outside the retired tree", encoding="utf-8")
+    target = tmp_path / "checkpoint"
+    target.mkdir()
+    (target / "external-link").symlink_to(external, target_is_directory=True)
+    observed = target.stat()
+
+    run_journal_module._remove_retired_tree(
+        target,
+        device=observed.st_dev,
+        inode=observed.st_ino,
+    )
+
+    assert not target.exists()
+    assert marker.read_text(encoding="utf-8") == "outside the retired tree"
+
+
+def test_checkpoint_retention_recovers_crash_after_move_before_manifest_preservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "run"
+    output.mkdir()
+    _create_retention_run(output)
+    first = _advance_checkpoint(output, 1000, parent=None)
+    _advance_checkpoint(output, 2000, parent=first)
+    real_preserve = run_journal_module._preserve_retired_checkpoint_manifest
+
+    def fail_before_preservation(*_args, **_kwargs) -> None:
+        raise OSError("simulated crash before manifest preservation")
+
+    monkeypatch.setattr(run_journal_module, "_preserve_retired_checkpoint_manifest", fail_before_preservation)
+    with pytest.raises(OSError, match="before manifest preservation"):
+        apply_checkpoint_retention(output)
+    transaction = next((output / "checkpoint_retention").iterdir())
+    assert (transaction / "checkpoint").is_dir()
+    assert not (transaction / "checkpoint-manifest.json").exists()
+    assert json.loads((transaction / "retirement.json").read_text())["status"] == "planned"
+
+    monkeypatch.setattr(run_journal_module, "_preserve_retired_checkpoint_manifest", real_preserve)
+    recovered = apply_checkpoint_retention(output)
+
+    assert recovered.recovered_transactions == (transaction.relative_to(output).as_posix(),)
+    assert (transaction / "checkpoint-manifest.json").is_file()
+    assert json.loads((transaction / "retirement.json").read_text())["status"] == "complete"
+
+
+def test_checkpoint_retention_recovers_partial_payload_delete_after_manifest_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "run"
+    output.mkdir()
+    _create_retention_run(output)
+    first = _advance_checkpoint(output, 1000, parent=None)
+    _advance_checkpoint(output, 2000, parent=first)
+    real_remove = run_journal_module._remove_retired_tree
+
+    def remove_manifest_then_fail(path: Path, *, device: int, inode: int) -> None:
+        del device, inode
+        (path / "manifest.json").unlink()
+        raise OSError("simulated crash during payload deletion")
+
+    monkeypatch.setattr(run_journal_module, "_remove_retired_tree", remove_manifest_then_fail)
+    with pytest.raises(OSError, match="during payload deletion"):
+        apply_checkpoint_retention(output)
+    transaction = next((output / "checkpoint_retention").iterdir())
+    assert (transaction / "checkpoint").is_dir()
+    assert not (transaction / "checkpoint/manifest.json").exists()
+    assert (transaction / "checkpoint-manifest.json").is_file()
+
+    monkeypatch.setattr(run_journal_module, "_remove_retired_tree", real_remove)
+    recovered = apply_checkpoint_retention(output)
+
+    assert recovered.recovered_transactions == (transaction.relative_to(output).as_posix(),)
+    assert not (transaction / "checkpoint").exists()
+    assert json.loads((transaction / "retirement.json").read_text())["status"] == "complete"
 
 
 def test_reconcile_truncates_valid_uncommitted_metrics_atomically(tmp_path: Path) -> None:

@@ -37,17 +37,20 @@ export DUO_VLA_CACHE_ROOT=/root/.cache/duo-vla
 export MUJOCO_GL=egl
 ```
 
-Launch training through `scripts/run_libero_train.sh`. The wrapper removes the host's `LD_LIBRARY_PATH`: this host
-advertises system cuDNN 9.8 there, while the locked PyTorch wheel was compiled with and bundles cuDNN 9.10.2. Directly
-inheriting the host path fails before model loading. Set `PYTHONHASHSEED` to the run seed; for example:
+Launch training through `scripts/run_libero_train.sh`. The wrapper starts from a closed process environment instead of
+inheriting host thread, allocator, locale, library, or Python overrides. Pass the run seed explicitly; for example:
 
 ```bash
-PYTHONHASHSEED=0 ./scripts/run_libero_train.sh \
+./scripts/run_libero_train.sh \
   <libero-snapshot> <normalization.json> <output-dir> \
   --prefix-geometry-artifact \
   /root/.cache/duo-vla/contracts/prefix-geometry/libero-v2.json \
+  --seed 0 \
   [trainer options]
 ```
+
+The exact train-venv tree and canonical static process environment are content-addressed in every final run. See
+[Training and policy runtime integrity](runtime_integrity.md) for the resume, serving, and dataset identity gates.
 
 The artifact path is a required input, but its semantic SHA-256 and fixed width are not accepted from the command
 line. They are independently pinned by `configs/libero.toml`; training authenticates the artifact against those pins,

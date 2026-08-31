@@ -60,6 +60,70 @@ from duo_vla.run_config import (  # noqa: E402
     save_resolved_config,
 )
 from duo_vla.run_journal import create_run_journal, record_latest_checkpoint  # noqa: E402
+from duo_vla.runtime_integrity import (  # noqa: E402
+    BASE_PYTHON_RUNTIME_IDENTITY_SCHEMA,
+    TRAIN_VENV_IDENTITY_SCHEMA,
+    canonical_sha256,
+    static_environment_identity,
+)
+
+
+def _train_venv_identity() -> dict[str, object]:
+    venv_root = "/root/.cache/duo-vla/venvs/train"
+    base_python_runtime: dict[str, object] = {
+        "base_prefix": "/usr/local",
+        "configured_home": "/usr/local/bin",
+        "configured_home_resolved": "/usr/local/bin",
+        "content_inventory_sha256": "5" * 64,
+        "files_verified": 100,
+        "pyvenv_cfg_bytes": 128,
+        "pyvenv_cfg_sha256": "6" * 64,
+        "resolved_executable": "/usr/local/bin/python3.11",
+        "resolved_executable_bytes": 20_000,
+        "resolved_executable_sha256": "7" * 64,
+        "schema": BASE_PYTHON_RUNTIME_IDENTITY_SCHEMA,
+        "startup_hooks": [],
+        "startup_hooks_sha256": canonical_sha256([]),
+        "symlinks_verified": 4,
+        "total_bytes": 1_000_000,
+        "tree_metadata_sha256": "8" * 64,
+        "venv_python": f"{venv_root}/bin/python",
+        "venv_python_link_target": "/usr/local/bin/python3.11",
+        "venv_root": venv_root,
+    }
+    base_python_runtime["root_sha256"] = canonical_sha256(base_python_runtime)
+    identity: dict[str, object] = {
+        "base_python_runtime": base_python_runtime,
+        "content_inventory_sha256": "8" * 64,
+        "files_verified": 10,
+        "root": venv_root,
+        "schema": TRAIN_VENV_IDENTITY_SCHEMA,
+        "startup_hooks": ["lib/python3.11/site-packages/known.pth"],
+        "startup_hooks_sha256": "a" * 64,
+        "symlinks_verified": 3,
+        "total_bytes": 100,
+        "tree_metadata_sha256": "b" * 64,
+    }
+    identity["root_sha256"] = canonical_sha256(
+        {
+            "base_python_runtime_root_sha256": base_python_runtime["root_sha256"],
+            "content_inventory_sha256": identity["content_inventory_sha256"],
+            "files_verified": identity["files_verified"],
+            "schema": identity["schema"],
+            "startup_hooks_sha256": identity["startup_hooks_sha256"],
+            "symlinks_verified": identity["symlinks_verified"],
+            "total_bytes": identity["total_bytes"],
+            "tree_metadata_sha256": identity["tree_metadata_sha256"],
+        }
+    )
+    return identity
+
+
+@pytest.fixture(autouse=True)
+def _fake_live_train_venv(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DUO_VLA_CACHE_ROOT", "/root/.cache/duo-vla")
+    monkeypatch.setenv("HF_HOME", "/root/.cache/huggingface")
+    monkeypatch.setattr(SERVER, "content_address_train_venv", lambda _root: _train_venv_identity())
 
 
 def _split() -> dict[str, object]:
@@ -163,20 +227,38 @@ def _training_execution_environment(*, seed: int = 1) -> dict[str, object]:
             for module in SERVER._DISTRIBUTION_IMPORT_NAMES.values()
         },
     }
+    train_environment = {
+        **SERVER.REQUIRED_TRAIN_ENVIRONMENT,
+        "DUO_VLA_CACHE_ROOT": "/root/.cache/duo-vla",
+        "DUO_VLA_PROJECT_ROOT": str(ROOT),
+        "DUO_VLA_TRAIN_VENV": str(train_prefix),
+        "HF_HOME": "/root/.cache/huggingface",
+        "PYTHONHASHSEED": str(seed),
+    }
+    version = f"python{SERVER.sys.version_info.major}.{SERVER.sys.version_info.minor}"
+    compact_version = f"python{SERVER.sys.version_info.major}{SERVER.sys.version_info.minor}"
     authenticated_runtime = {
-        "environment": {
-            **SERVER.REQUIRED_TRAIN_ENVIRONMENT,
-            "PYTHONPATH": str((ROOT / "src").resolve()),
-        },
+        "environment": train_environment,
         "lock_sha256": SERVER.TRAIN_LOCK_SHA256,
         "module_origins": module_origins,
         "packages": SERVER.EXPECTED_TRAIN_PACKAGES,
         "python": SERVER.EXPECTED_TRAIN_PYTHON,
+        "static_environment_sha256": static_environment_identity(train_environment)["sha256"],
         "sys_path": [
-            str((ROOT / "scripts").resolve()),
             str((ROOT / "src").resolve()),
+            str(Path(SERVER.sys.base_prefix) / "lib" / f"{compact_version}.zip"),
+            str(Path(SERVER.sys.base_prefix) / "lib" / version),
+            str(Path(SERVER.sys.base_exec_prefix) / "lib" / version / "lib-dynload"),
             str(site_packages.resolve()),
         ],
+        "torchrun": {
+            "group_world_size": 1,
+            "local_rank_equals_rank": True,
+            "local_world_size": 2,
+            "role_world_size": 2,
+            "world_size": 2,
+        },
+        "train_venv": _train_venv_identity(),
     }
     return {
         "authenticated_runtime": authenticated_runtime,
@@ -602,6 +684,26 @@ def test_server_rejects_checkpoint_from_unpinned_training_runtime() -> None:
         )
 
 
+def test_server_rejects_live_train_venv_drift(monkeypatch: pytest.MonkeyPatch) -> None:
+    execution = _training_execution_environment(seed=1)
+    config = {"execution_environment": copy.deepcopy(execution)}
+    manifest = {
+        "execution_environment": copy.deepcopy(execution),
+        "execution_environment_sha256": canonical_config_sha256(execution),
+    }
+    changed = _train_venv_identity()
+    changed["content_inventory_sha256"] = "f" * 64
+    monkeypatch.setattr(SERVER, "content_address_train_venv", lambda _root: changed)
+
+    with pytest.raises(RuntimeError, match="live train venv differs"):
+        SERVER._validate_checkpoint_training_environment(
+            manifest,
+            config,
+            project_root=ROOT,
+            run_seed=1,
+        )
+
+
 def test_dataset_manifest_authenticates_archive_and_critical_files(tmp_path: Path) -> None:
     root = tmp_path / "task_ABC_D"
     critical: dict[str, str] = {}
@@ -824,17 +926,44 @@ def _set_canonical_serving_environment(monkeypatch: pytest.MonkeyPatch, *, distr
         SimpleNamespace(dont_write_bytecode=1, no_user_site=1, safe_path=True),
     )
     monkeypatch.setattr(SERVER.sys, "prefix", "/root/.cache/duo-vla/venvs/train")
+    monkeypatch.setattr(SERVER.sys, "pycache_prefix", "/dev/null")
+    version = f"python{SERVER.sys.version_info.major}.{SERVER.sys.version_info.minor}"
+    compact_version = f"python{SERVER.sys.version_info.major}{SERVER.sys.version_info.minor}"
+    monkeypatch.setattr(
+        SERVER.sys,
+        "path",
+        [
+            str((ROOT / "src").resolve()),
+            str(Path(SERVER.sys.base_prefix) / "lib" / f"{compact_version}.zip"),
+            str(Path(SERVER.sys.base_prefix) / "lib" / version),
+            str(Path(SERVER.sys.base_exec_prefix) / "lib" / version / "lib-dynload"),
+            f"/root/.cache/duo-vla/venvs/train/lib/{version}/site-packages",
+        ],
+    )
     for name, value in SERVER.REQUIRED_SERVING_ENVIRONMENT.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("DUO_VLA_CACHE_ROOT", "/root/.cache/duo-vla")
     monkeypatch.setenv("DUO_VLA_PROJECT_ROOT", str(ROOT))
     monkeypatch.setenv("DUO_VLA_TRAIN_VENV", "/root/.cache/duo-vla/venvs/train")
     monkeypatch.setenv("HF_HOME", "/root/.cache/huggingface")
-    monkeypatch.setenv("PYTHONPATH", f"{ROOT / 'src'}:{CALVIN_SCRIPTS}")
+    monkeypatch.delenv("PYTHONPATH", raising=False)
     if distributed:
+        monkeypatch.setenv("GROUP_RANK", "0")
+        monkeypatch.setenv("GROUP_WORLD_SIZE", "1")
         monkeypatch.setenv("LOCAL_RANK", "0")
         monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+        monkeypatch.setenv("MASTER_ADDR", "localhost")
+        monkeypatch.setenv("MASTER_PORT", "29400")
         monkeypatch.setenv("RANK", "0")
+        monkeypatch.setenv("ROLE_NAME", "default")
+        monkeypatch.setenv("ROLE_RANK", "0")
+        monkeypatch.setenv("ROLE_WORLD_SIZE", "2")
+        monkeypatch.setenv("TORCHELASTIC_ERROR_FILE", "/tmp/torchelastic/error.json")
+        monkeypatch.setenv("TORCHELASTIC_MAX_RESTARTS", "0")
+        monkeypatch.setenv("TORCHELASTIC_RESTART_COUNT", "0")
+        monkeypatch.setenv("TORCHELASTIC_RUN_ID", "test-run")
+        monkeypatch.setenv("TORCHELASTIC_SIGNALS_TO_HANDLE", "SIGTERM,SIGINT,SIGHUP,SIGQUIT")
+        monkeypatch.setenv("TORCHELASTIC_USE_AGENT_STORE", "True")
         monkeypatch.setenv("WORLD_SIZE", "2")
 
 
@@ -892,6 +1021,7 @@ def test_serving_runtime_is_deterministic_and_content_addressed(
         "checkpoint": {
             "execution_geometry": _execution_geometry(),
             "source_tree_sha256": "1" * 64,
+            "train_venv": _train_venv_identity(),
             "training_execution_environment": _training_execution_environment(),
             "training_execution_environment_sha256": "5" * 64,
         },
@@ -923,7 +1053,17 @@ def test_serving_runtime_is_deterministic_and_content_addressed(
     assert [gpu["physical_index"] for gpu in payload["hardware"]["logical_cuda_devices"]] == [0, 1]
     assert payload["process"] == process_identity
     assert payload["platform"]["nccl"] == [2, 29, 3]
+    assert "training_execution_environment_sha256" not in payload["authenticated_software"]
     assert identity == SERVER._canonical_sha256(payload)
+
+    different_training_identity = copy.deepcopy(report)
+    different_training_identity["checkpoint"]["training_execution_environment_sha256"] = "6" * 64
+    second_payload, second_identity = SERVER.configure_and_identify_serving_runtime(
+        fake_torch,
+        different_training_identity,
+    )
+    assert second_payload == payload
+    assert second_identity == identity
 
 
 def test_serving_runtime_rejects_unpinned_process_environment(
@@ -938,7 +1078,7 @@ def test_serving_runtime_rejects_unpinned_process_environment(
 @pytest.mark.parametrize(
     ("name", "value", "message"),
     (
-        ("PYTHONPATH", f"{ROOT / 'src'}:{CALVIN_SCRIPTS}:/tmp/shadow", "canonical launcher"),
+        ("PYTHONPATH", f"{ROOT / 'src'}:{CALVIN_SCRIPTS}:/tmp/shadow", "unpinned overrides"),
         ("CUDA_VISIBLE_DEVICES", "1,0", "canonical launcher"),
         ("NCCL_ALGO", "Ring", "unpinned overrides"),
         ("LD_PRELOAD", "/tmp/inject.so", "unpinned overrides"),
@@ -1048,15 +1188,16 @@ def test_launcher_enforces_train_env_and_tp2() -> None:
     assert "--nproc-per-node=2" in source
     assert "scripts/calvin/serve_policy.py" in source
     assert "--preflight-only" in source and "--fake-policy" in source
-    assert 'export PYTHONPATH="${project_dir}/src:${project_dir}/scripts/calvin"' in source
-    assert "${PYTHONPATH:+" not in source
-    assert "done < <(compgen -e)" in source
-    assert "LD_*" in source and "NCCL_*" in source and "PYTHON*" in source and "CUDA_*" in source
-    assert 'export PATH="/usr/bin:/bin"' in source
-    assert 'export CUDA_DEVICE_ORDER="PCI_BUS_ID"' in source
-    assert 'export CUDA_VISIBLE_DEVICES="0,1"' in source
-    assert 'export PYTHONSAFEPATH="1"' in source
-    assert 'export TORCH_NCCL_ASYNC_ERROR_HANDLING="1"' in source
+    assert "exec /usr/bin/env -i" in source
+    assert "PYTHONPATH" not in source
+    assert '"PATH=/usr/bin:/bin"' in source
+    assert '"CUDA_DEVICE_ORDER=PCI_BUS_ID"' in source
+    assert '"CUDA_VISIBLE_DEVICES=0,1"' in source
+    assert '"PYTHONSAFEPATH=1"' in source
+    assert '"PYTHONDONTWRITEBYTECODE=1"' in source
+    assert '"PYTHONPYCACHEPREFIX=/dev/null"' in source
+    assert "-P -B -X pycache_prefix=/dev/null" in source
+    assert '"TORCH_NCCL_ASYNC_ERROR_HANDLING=1"' in source
 
 
 def test_policy_server_recomputes_the_exact_trainer_source_tree_identity() -> None:

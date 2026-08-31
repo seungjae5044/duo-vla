@@ -1,6 +1,5 @@
 #!/bin/bash -p
 set -euo pipefail
-
 readonly requested_cache_root="${DUO_VLA_CACHE_ROOT:-/root/.cache/duo-vla}"
 export PATH="/usr/bin:/bin"
 unset BASH_ENV CDPATH ENV GLOBIGNORE
@@ -37,5 +36,5 @@ exec /usr/bin/env -i \
   "PYTHONSAFEPATH=1" \
   "PYTHONDONTWRITEBYTECODE=1" \
   "${environment_path}/bin/python" -P -B -X pycache_prefix=/dev/null \
-  "${project_dir}/scripts/preflight_libero_env.py" \
+  "${project_dir}/scripts/collect_libero_expert_replay.py" \
   "$@"

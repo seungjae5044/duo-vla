@@ -577,6 +577,11 @@ def test_full_resolver_accepts_only_total_and_progress_relaxations(
         "_committed_checkpoint_record",
         lambda *args, **kwargs: SimpleNamespace(update=120, manifest_sha256=manifest_sha256),
     )
+    monkeypatch.setattr(
+        SERVER.official_policy,
+        "content_address_train_venv",
+        lambda _root: helpers._train_venv_identity(),
+    )
 
     _, _, seed, report, resolved, contract, identities = SERVER.resolve_development_checkpoint(
         pilot_checkpoint,

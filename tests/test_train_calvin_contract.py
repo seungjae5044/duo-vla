@@ -300,6 +300,20 @@ def test_calvin_trainer_rejects_off_contract_interface_and_lora_hyperparameters(
         TRAIN._validate_and_build_interface_config(config)
 
 
+def test_calvin_checkpoint_retention_interval_must_be_a_positive_checkpoint_multiple(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_resolved_toml(ROOT / "configs/calvin_abc_to_d.toml")
+    monkeypatch.setattr(TRAIN.dist, "get_world_size", lambda: 2)
+
+    assert config["training"]["checkpoint_interval"] == 1000
+    assert config["training"]["permanent_checkpoint_interval"] == 5000
+    TRAIN._validate_and_build_interface_config(config)
+    config["training"]["permanent_checkpoint_interval"] = 1500
+    with pytest.raises(ValueError, match="positive multiple"):
+        TRAIN._validate_and_build_interface_config(config)
+
+
 def test_calvin_split_recipe_must_match_config_and_recompute_exactly() -> None:
     episodes = tuple(CalvinEpisode(index, 2 * index, 2 * index + 1, "calvin_scene_A") for index in range(10))
     annotations = tuple(
@@ -727,11 +741,15 @@ def test_canonical_calvin_training_launcher_scrubs_injection_and_pins_tp2() -> N
 
     assert "venvs/train" in source
     assert "--nproc-per-node=2" in source
-    assert 'export PYTHONPATH="${project_dir}/src"' in source
-    assert "unset LD_LIBRARY_PATH LD_PRELOAD PYTHONHOME PYTHONINSPECT PYTHONSTARTUP" in source
-    assert '"${name}" == NCCL_*' in source
-    assert 'export CUBLAS_WORKSPACE_CONFIG=":4096:8"' in source
-    assert 'export CUDA_VISIBLE_DEVICES="0,1"' in source
+    assert "exec /usr/bin/env -i" in source
+    assert "PYTHONPATH" not in source
+    assert '"CUBLAS_WORKSPACE_CONFIG=:4096:8"' in source
+    assert '"CUDA_VISIBLE_DEVICES=0,1"' in source
+    assert '"PYTHONSAFEPATH=1"' in source
+    assert '"PYTHONDONTWRITEBYTECODE=1"' in source
+    assert '"PYTHONPYCACHEPREFIX=/dev/null"' in source
+    assert "-P -B -X pycache_prefix=/dev/null" in source
+    assert '"LANG=C.UTF-8"' in source and '"LC_ALL=C.UTF-8"' in source and '"TZ=UTC"' in source
 
 
 def test_training_runtime_rejects_inherited_pythonpath_before_import_contract(
@@ -743,6 +761,26 @@ def test_training_runtime_rejects_inherited_pythonpath_before_import_contract(
     monkeypatch.setattr(TRAIN.platform, "python_version", lambda: TRAIN.EXPECTED_TRAIN_PYTHON)
     monkeypatch.setattr(TRAIN.sys, "prefix", str(train_prefix))
     monkeypatch.setattr(TRAIN.site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(
+        TRAIN.sys,
+        "flags",
+        SimpleNamespace(dont_write_bytecode=1, no_user_site=1, safe_path=1),
+    )
+    monkeypatch.setattr(TRAIN.sys, "dont_write_bytecode", True)
+    monkeypatch.setattr(TRAIN.sys, "pycache_prefix", "/dev/null")
+    version = f"python{TRAIN.sys.version_info.major}.{TRAIN.sys.version_info.minor}"
+    compact_version = f"python{TRAIN.sys.version_info.major}{TRAIN.sys.version_info.minor}"
+    monkeypatch.setattr(
+        TRAIN.sys,
+        "path",
+        [
+            str(ROOT / "src"),
+            str(Path(TRAIN.sys.base_prefix) / "lib" / f"{compact_version}.zip"),
+            str(Path(TRAIN.sys.base_prefix) / "lib" / version),
+            str(Path(TRAIN.sys.base_exec_prefix) / "lib" / version / "lib-dynload"),
+            str(train_prefix / "lib" / version / "site-packages"),
+        ],
+    )
     monkeypatch.setenv("DUO_VLA_CACHE_ROOT", str(cache_root))
     for name, value in TRAIN.REQUIRED_TRAIN_ENVIRONMENT.items():
         monkeypatch.setenv(name, value)
@@ -751,6 +789,10 @@ def test_training_runtime_rejects_inherited_pythonpath_before_import_contract(
     for name in tuple(TRAIN.os.environ):
         if name.startswith("NCCL_"):
             monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("DUO_VLA_PROJECT_ROOT", str(ROOT))
+    monkeypatch.setenv("DUO_VLA_TRAIN_VENV", str(train_prefix))
+    monkeypatch.setenv("HF_HOME", "/root/.cache/huggingface")
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
     monkeypatch.setenv("PYTHONPATH", "/tmp/untrusted")
 
     with pytest.raises(RuntimeError, match="PYTHONPATH"):
@@ -793,3 +835,23 @@ def test_resolved_config_pins_prefix_geometry_and_rejects_unsupported_behavior(m
         changed[section][field] = value
         with pytest.raises(ValueError, match=f"{section}.{field}"):
             TRAIN._validate_and_build_interface_config(changed)
+
+
+def test_calvin_checkpoint_manifest_binds_parent_and_retention_uses_authenticated_config() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    parent = {
+        "relative_path": "checkpoints/update-001000",
+        "update": 1000,
+    }
+
+    assert '"checkpoint_retention": make_checkpoint_retention_contract(' in source
+    assert "retention = apply_checkpoint_retention(output_dir)" in source
+    assert "apply_checkpoint_retention(\n" not in source
+    assert '"manifest_sha256": parent_manifest_sha256' not in source
+    assert (
+        TRAIN.make_checkpoint_retention_contract(
+            permanent_checkpoint_interval=5000,
+            parent_checkpoint=parent,
+        )["parent_checkpoint"]
+        == parent
+    )

@@ -11,17 +11,32 @@ is not the journal tip and reconciles any metrics written after that tip.
 An OS file lock gives the output directory one writer. Interrupted staging/checkpoint paths are moved into a recoverable
 `recovery_quarantine/` directory before replay; they are never silently deleted. If a run stops before its first
 checkpoint, launching the same resolved configuration at the same output path safely restarts it from update zero.
+Committed checkpoints at 5,000-update multiples are permanent. Every other committed checkpoint remains available
+while it is the journal tip, then an authenticated, durable retirement transaction removes it only after its successor
+tip commits. The immutable successor manifest authenticates the parent's update, path, and manifest SHA; the interval
+comes only from the journal-bound resolved config. Each transaction preserves the retired checkpoint's original
+manifest before inode-bound, descriptor-relative payload deletion. Interrupted retirement is completed before resume;
+the small completed transaction and preserved manifest remain required authentication state. A pre-existing
+non-permanent backlog is rejected before a new deletion.
 An invocation-local `--stop-after-updates` boundary writes a resumable checkpoint but does not introduce an
 out-of-schedule validation pass; validation remains tied to its declared interval and the configured final update.
 
 Use three training seeds for reported comparisons. Development smoke tests may use one seed but are labeled as such.
 The benchmark checkpoint is the predeclared final optimizer update (30,000 for the initial recipe); validation is a
 diagnostic and does not trigger early stopping or best-checkpoint selection. A different selection rule requires a new
-pre-registration and implementation before training. The evaluation seed set is independent of the training seed and
-is shared across checkpoint/objective/NFE/K comparisons as common random numbers. Policy-scored development uses
+training-recipe registration and implementation before training. The evaluation seed set is independent of the training
+seed and is shared across checkpoint/objective/NFE/K comparisons as common random numbers. Policy-scored development uses
 materialized, hashed development resets from training environments; it never uses published LIBERO fixed states or
 CALVIN-D. Benchmark test environments are scored once only after every checkpoint hash, factor cell, training seed,
 evaluation seed set, and aggregation rule is frozen and pre-registered.
+
+Freezing is deliberately split into two phases. Before training, a clean published source revision fixes the recipe:
+configs, data/model revisions, normalization and prefix identities, objectives, seeds, update budget, checkpoint rule,
+factor matrix, warm-up count, and aggregation implementation. After all final checkpoints exist, but before any
+benchmark policy call, the benchmark-specific evaluation pre-registration binds that recipe revision to the six exact
+checkpoint and serving-runtime identities, the complete 24-cell inventory, simulator/runtime attestation, evaluation
+seed, and external freeze token. The evaluation manifests cannot be created before training because their checkpoint
+hashes do not yet exist; they may not change the already registered recipe.
 
 ### Compute-budget gate
 
@@ -35,7 +50,7 @@ an earlier source qualification before CALVIN's now-pinned `P=538` prefix geomet
 Accordingly, G3--G5 development runs remain short and explicitly non-benchmark. Before authorizing G6, rerun a timed
 warm-up on the final source, exact benchmark prefix geometry, and fixed B=8 execution path; record throughput, projected
 wall time, checkpoint storage, and rollout cost. The full 30,000-update, three-seed campaign starts only after that
-resource estimate and the immutable pre-registration are accepted. Reducing updates or seeds creates a separately
+resource estimate and the immutable training-recipe registration are accepted. Reducing updates or seeds creates a separately
 labeled pilot protocol and must not be reported as the predeclared benchmark comparison.
 
 ## Staged runs
@@ -101,7 +116,8 @@ Initial values, subject to memory smoke tests:
 | action noise | iid standard normal |
 | sampler | uniform-step explicit Euler |
 | training schedule | 30,000 updates; 1,000-step warm-up; cosine to 0.1x peak LR |
-| checkpoint / validation interval | 1,000 updates |
+| resumable checkpoint / validation interval | 1,000 updates |
+| permanent checkpoint interval | 5,000 updates |
 | EMA | disabled |
 | image augmentation | none in the baseline |
 

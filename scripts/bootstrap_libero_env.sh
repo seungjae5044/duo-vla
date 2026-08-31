@@ -199,9 +199,4 @@ write_if_changed(runtime_root / "manifest.json", json.dumps(manifest, indent=2, 
 PY
 
 DUO_VLA_CACHE_ROOT="${cache_root}" \
-HF_HOME="${hf_home}" \
-LIBERO_CONFIG_PATH="${config_path}" \
-MUJOCO_GL=egl \
-PYOPENGL_PLATFORM=egl \
-MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-0}" \
-  "${environment_path}/bin/python" "${project_dir}/scripts/preflight_libero_env.py"
+  "${project_dir}/scripts/run_libero_preflight.sh"

@@ -9,7 +9,10 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import json
+import math
 import os
+import site
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -59,7 +62,7 @@ EXPECTED_TASK_INVENTORY_SHA256 = "d00c211a09f34003089ba5a4dbbbb0e11af2543f4bba9c
 SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
 CAMERA_KEYS = ("agentview_image", "robot0_eye_in_hand_image")
 CAMERA_NAMES = ("agentview", "robot0_eye_in_hand")
-ATTESTATION_SCHEMA = "duo-vla-libero-simulator-attestation-v2"
+ATTESTATION_SCHEMA = "duo-vla-libero-simulator-attestation-v3"
 REQUIRED_EVALUATOR_ENVIRONMENT = {
     "MKL_NUM_THREADS": "1",
     "MUJOCO_EGL_DEVICE_ID": "0",
@@ -71,6 +74,8 @@ REQUIRED_EVALUATOR_ENVIRONMENT = {
     "PYOPENGL_PLATFORM": "egl",
     "PYTHONHASHSEED": "0",
     "PYTHONNOUSERSITE": "1",
+    "PYTHONSAFEPATH": "1",
+    "PYTHONDONTWRITEBYTECODE": "1",
 }
 _ALGORITHM_ENVIRONMENT_PREFIXES = (
     "CUBLAS_",
@@ -89,7 +94,13 @@ _ALGORITHM_ENVIRONMENT_PREFIXES = (
 )
 _ALLOWED_ALGORITHM_ENVIRONMENT = frozenset(REQUIRED_EVALUATOR_ENVIRONMENT)
 _INJECTION_ENVIRONMENT_PREFIXES = ("LD_", "MALLOC_", "OPENSSL_", "PYTHON")
-_ALLOWED_INJECTION_ENVIRONMENT = {"PYTHONHASHSEED", "PYTHONNOUSERSITE", "PYTHONPATH"}
+_ALLOWED_INJECTION_ENVIRONMENT = {
+    "PYTHONHASHSEED",
+    "PYTHONNOUSERSITE",
+    "PYTHONPATH",
+    "PYTHONSAFEPATH",
+    "PYTHONDONTWRITEBYTECODE",
+}
 _CRITICAL_MODULE_DISTRIBUTIONS = {
     "OpenGL": "PyOpenGL",
     "bddl": "bddl",
@@ -159,6 +170,72 @@ def require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def activate_project_source_root(project_root: Path) -> Path:
+    source_path = project_root / "src"
+    source_identity = os.lstat(source_path)
+    require(stat.S_ISDIR(source_identity.st_mode), "project src import root must be a real directory")
+    source_root = source_path.resolve()
+    entries = list(os.scandir(source_root))
+    require(
+        len(entries) == 1 and entries[0].name == "duo_vla" and entries[0].is_dir(follow_symlinks=False),
+        "project src import root must contain only the real duo_vla package directory",
+    )
+
+    def visit(directory: Path, *, in_cache: bool) -> None:
+        for entry in os.scandir(directory):
+            mode = entry.stat(follow_symlinks=False).st_mode
+            path = directory / entry.name
+            if stat.S_ISDIR(mode):
+                visit(path, in_cache=in_cache or entry.name == "__pycache__")
+            elif stat.S_ISREG(mode):
+                allowed = entry.name.endswith(".pyc") if in_cache else entry.name.endswith(".py")
+                require(allowed, f"project package import tree contains a forbidden file: {path}")
+            else:
+                raise RuntimeError(f"project package import tree contains a linked or special entry: {path}")
+
+    visit(source_root / "duo_vla", in_cache=False)
+    source_text = str(source_root)
+    sys.path[:] = [source_text] + [
+        entry for entry in sys.path if str(Path(entry or os.getcwd()).resolve()) != source_text
+    ]
+    return source_root
+
+
+def validate_project_module_origins(source_root: Path, required_modules: set[str]) -> dict[str, str]:
+    package_root = (source_root / "duo_vla").resolve(strict=True)
+    loaded = {name: module for name, module in sys.modules.items() if name == "duo_vla" or name.startswith("duo_vla.")}
+    missing = sorted(required_modules - set(loaded))
+    require(not missing, f"required checkout modules are not loaded: {missing}")
+    origins: dict[str, str] = {}
+    for name, module in sorted(loaded.items()):
+        origin = getattr(getattr(module, "__spec__", None), "origin", None)
+        module_file = getattr(module, "__file__", None)
+        require(
+            isinstance(origin, str) and isinstance(module_file, str),
+            f"checkout module has no file origin: {name}",
+        )
+        resolved_origin = Path(origin).resolve(strict=True)
+        resolved_file = Path(module_file).resolve(strict=True)
+        require(
+            resolved_origin == resolved_file and resolved_file.is_relative_to(package_root),
+            f"checkout module origin escapes authenticated source root: {name}",
+        )
+        origins[name] = str(resolved_file)
+    return origins
+
+
+def _expected_eval_sys_path(project_root: Path, venv_root: Path) -> list[str]:
+    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    compact_version = f"python{sys.version_info.major}{sys.version_info.minor}"
+    return [
+        str((project_root / "src").resolve()),
+        str(Path(sys.base_prefix) / "lib" / f"{compact_version}.zip"),
+        str(Path(sys.base_prefix) / "lib" / version),
+        str(Path(sys.base_exec_prefix) / "lib" / version / "lib-dynload"),
+        str(venv_root / "lib" / version / "site-packages"),
+    ]
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -185,6 +262,17 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-finite simulator manifest constant {value}")
 
 
+def _require_finite_json_numbers(value: Any, *, name: str) -> None:
+    if isinstance(value, float):
+        require(math.isfinite(value), f"{name} contains a non-finite number")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _require_finite_json_numbers(item, name=f"{name}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _require_finite_json_numbers(item, name=f"{name}[{index}]")
+
+
 def load_strict_manifest(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(
@@ -195,6 +283,7 @@ def load_strict_manifest(path: Path) -> dict[str, Any]:
     except (OSError, UnicodeError, ValueError) as exc:
         raise RuntimeError(f"simulator manifest is not strict finite UTF-8 JSON: {path}") from exc
     require(isinstance(value, dict), "simulator manifest root must be an object")
+    _require_finite_json_numbers(value, name="simulator manifest")
     require(
         set(value) == {"assets", "environment", "paths", "schema", "source", "training_data_downloaded"},
         "simulator manifest top-level fields changed",
@@ -205,6 +294,8 @@ def load_strict_manifest(path: Path) -> dict[str, Any]:
 def validate_process_environment(project_root: Path, cache_root: Path) -> dict[str, Any]:
     """Require the closed launcher environment before importing simulator code."""
 
+    source_root = activate_project_source_root(project_root)
+    validate_project_module_origins(source_root, {"duo_vla"} if "duo_vla" in sys.modules else set())
     forbidden = ("GCONV_PATH", "GLIBC_TUNABLES", "LOCPATH")
     present_forbidden = [name for name in forbidden if os.environ.get(name)]
     injection_overrides = sorted(
@@ -225,13 +316,19 @@ def validate_process_environment(project_root: Path, cache_root: Path) -> dict[s
     )
     observed = {name: os.environ.get(name) for name in REQUIRED_EVALUATOR_ENVIRONMENT}
     require(observed == REQUIRED_EVALUATOR_ENVIRONMENT, f"LIBERO evaluator environment differs: {observed}")
-    expected_pythonpath = f"{(project_root / 'src').resolve()}:{(project_root / 'scripts').resolve()}"
-    require(
-        os.environ.get("PYTHONPATH") == expected_pythonpath,
-        f"LIBERO evaluator requires PYTHONPATH={expected_pythonpath}",
-    )
     expected_prefix = (cache_root / "venvs/libero-eval").resolve()
     require(Path(sys.prefix).resolve() == expected_prefix, f"LIBERO evaluator must run from {expected_prefix}")
+    require(sys.flags.safe_path == 1, "LIBERO evaluator requires Python safe-path mode")
+    require(sys.flags.dont_write_bytecode == 1 and sys.dont_write_bytecode, "LIBERO evaluator requires -B")
+    require(sys.flags.no_user_site == 1 and not site.ENABLE_USER_SITE, "LIBERO evaluator requires no user site")
+    require(sys.pycache_prefix == "/dev/null", "LIBERO evaluator requires an impossible pycache lookup prefix")
+    expected_invocation_flags = ["-P", "-B", "-X", "pycache_prefix=/dev/null"]
+    require(
+        sys.orig_argv[1:5] == expected_invocation_flags,
+        "LIBERO evaluator must be invoked with the exact safe Python flags",
+    )
+    expected_sys_path = _expected_eval_sys_path(project_root, expected_prefix)
+    require(sys.path == expected_sys_path, f"LIBERO evaluator import search path differs: {sys.path}")
     expected_path = f"{expected_prefix / 'bin'}:/usr/bin:/bin"
     require(os.environ.get("PATH") == expected_path, f"LIBERO evaluator requires PATH={expected_path}")
     require(os.environ.get("HF_HOME") == "/root/.cache/huggingface", "LIBERO evaluator requires pinned HF_HOME")
@@ -248,7 +345,6 @@ def validate_process_environment(project_root: Path, cache_root: Path) -> dict[s
         "LC_ALL": "C.UTF-8",
         "LIBERO_CONFIG_PATH": expected_libero_config,
         "PATH": expected_path,
-        "PYTHONPATH": expected_pythonpath,
     }
     require(
         dict(os.environ) == expected_environment,
@@ -256,8 +352,19 @@ def validate_process_environment(project_root: Path, cache_root: Path) -> dict[s
     )
     return {
         "environment": expected_environment,
+        "python_base_exec_prefix": sys.base_exec_prefix,
+        "python_base_prefix": sys.base_prefix,
         "python_executable": sys.executable,
+        "python_flags": {
+            "dont_write_bytecode": bool(sys.dont_write_bytecode),
+            "no_user_site": bool(sys.flags.no_user_site),
+            "safe_path": bool(sys.flags.safe_path),
+        },
+        "python_invocation_flags": expected_invocation_flags,
         "python_prefix": str(expected_prefix),
+        "python_pycache_prefix": sys.pycache_prefix,
+        "python_version": sys.version.split()[0],
+        "sys_path": expected_sys_path,
     }
 
 
@@ -452,6 +559,12 @@ def source_file_identities(project_root: Path) -> dict[str, str]:
         "evaluator": project_root / "scripts/evaluate_libero.py",
         "launcher": project_root / "scripts/run_libero_eval.sh",
         "preflight": Path(__file__),
+        "preflight_launcher": project_root / "scripts/run_libero_preflight.sh",
+        "replay_contract": project_root / "src/duo_vla/libero_replay_evidence.py",
+        "replay_binder_launcher": project_root / "scripts/run_bind_libero_expert_replay.sh",
+        "replay_collector_launcher": project_root / "scripts/run_collect_libero_expert_replay.sh",
+        "replay_qualification": project_root / "scripts/qualify_libero_expert_replay.py",
+        "replay_qualification_launcher": project_root / "scripts/run_qualify_libero_expert_replay.sh",
     }
     return {name: sha256_file(path) for name, path in paths.items()}
 
@@ -535,7 +648,16 @@ def main() -> None:
     args = parse_args()
     project_root = Path(__file__).resolve().parents[1]
     cache_root = Path(os.environ.get("DUO_VLA_CACHE_ROOT", "/root/.cache/duo-vla"))
+    source_root = activate_project_source_root(project_root)
     process_identity = validate_process_environment(project_root, cache_root)
+    from duo_vla.runtime_integrity import content_address_eval_venv, require_matching_eval_venv
+
+    validate_project_module_origins(
+        source_root,
+        {"duo_vla", "duo_vla.runtime_integrity"},
+    )
+
+    eval_venv_identity = content_address_eval_venv(cache_root / "venvs/libero-eval")
     runtime_root = cache_root / "simulators/libero"
     manifest_path = runtime_root / "manifest.json"
     require(manifest_path.is_file(), f"missing simulator manifest: {manifest_path}")
@@ -674,6 +796,7 @@ def main() -> None:
         "packages": package_versions,
         "torch": torch.__version__,
         "assets": {"path": str(assets_path), **assets_identity},
+        "eval_venv_identity": eval_venv_identity,
         "distribution_records": distribution_records,
         "evaluator_lock_sha256": lock_sha256,
         "installed_distributions": installed_distributions,
@@ -695,6 +818,14 @@ def main() -> None:
         "environment_constructed": False,
     }
     if args.imports_only:
+        require_matching_eval_venv(
+            eval_venv_identity,
+            content_address_eval_venv(cache_root / "venvs/libero-eval"),
+        )
+        validate_project_module_origins(
+            source_root,
+            {"duo_vla", "duo_vla.runtime_integrity"},
+        )
         emit_report(output, args.output_json)
         return
 
@@ -760,6 +891,14 @@ def main() -> None:
         }
     finally:
         environment.close()
+    require_matching_eval_venv(
+        eval_venv_identity,
+        content_address_eval_venv(cache_root / "venvs/libero-eval"),
+    )
+    validate_project_module_origins(
+        source_root,
+        {"duo_vla", "duo_vla.runtime_integrity"},
+    )
     emit_report(output, args.output_json)
 
 

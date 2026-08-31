@@ -91,9 +91,10 @@ actions would span at most 0.4 seconds.
 
 Only checkpoints carrying a verified resolved config plus the identical manifest `policy_contract` are eligible. The
 rectified-flow policy uses seeded Gaussian initialization and uniform Euler sampling; direct regression uses zero
-action queries at fixed `t=1` and exactly one forward. Strict IPC schema v4 repeats objective, sampler, actual NFE,
+action queries at fixed `t=1` and exactly one forward. Strict IPC schema v5 repeats objective, sampler, actual NFE,
 seed behavior, evaluation seed, and reset identity in health/prediction as applicable, and binds real-policy health to
-the content-addressed deterministic serving runtime. A flow checkpoint may be served
+the content-addressed deterministic serving runtime plus a latency-comparability identity that excludes only
+checkpoint-specific training-runtime provenance. A flow checkpoint may be served
 at NFE 1, 5, or 10 without rewriting its authenticated default contract; a direct checkpoint cannot accept an NFE
 override.
 
@@ -107,6 +108,14 @@ override.
 - budgets: Spatial 220, Object 280, Goal 300, Long (`libero_10`) 520 policy steps;
 - success: check `env.check_success()` after every action and immediately discard the remaining chunk on success;
 - execution: report `K=1` and `K=4` separately; regenerate when the queue empties.
+- latency: exactly two discarded deterministic warm-up calls, one with K=1 and one with K=4, at reserved
+  `replan_id=520` in official mode; validate their K-independent response identity immediately before scoring; client round-trip must be no smaller
+  than paired server time; aggregate episode-only client/server p50/p95, episodes/hour, and policy calls/second only
+  across cells with the identical latency-runtime identity; never pool K.
+- attempt lifecycle: pre-register dedicated real run/claim roots and derive one path pair per cell. Durably publish the
+  external claim before simulator construction or policy connection, journal every later failure, and accept a run
+  only when its exclusive completion marker binds the claim, pre-registration, 1,999 episodes, summary, and final run.
+  Aggregation derives paths only from the pre-registration and requires exact root inventories.
 
 This is the OpenPI-style reference rather than LeRobot's alternate 280-step Spatial budget. Source:
 [OpenPI evaluator](https://github.com/Physical-Intelligence/openpi/blob/main/examples/libero/main.py),
@@ -131,6 +140,15 @@ and `K=4` into one number.
 
 Before model training: schema/revision counts, exact gripper set, controller impulse directions, normalization round trip,
 episode-boundary chunk fixture, pre-action alignment replay, camera transform parity, and deterministic fixed-state reset
-must pass. Replay at least one regenerated expert demonstration for every task and require 40/40 success. Negative
-controls (zero action, shuffled language, swapped cameras, inverted gripper) guard against wrapper/success-accounting
-bugs.
+must pass. Replay exactly one canonically selected, first-success expert demonstration for every task and require 40/40
+success. Pre-dispatch integrity mutations (zero action, mismatched language, swapped cameras, and inverted gripper)
+must produce distinct provenance hashes; these checks are not simulator rollouts or success-rate measurements.
+
+These requirements are enforced by the strict evidence/report validator described in
+[libero_expert_replay_qualification.md](libero_expert_replay_qualification.md). The official pre-registration embeds
+the report's semantic source/config/data/runtime and raw-evidence identity, and its checkpoint cells must carry the
+same qualified dataset tree/content, full train-venv v2 identity (including its base-Python identity), validator-runtime
+identity, and source-tree hashes. The evaluator run journal and aggregator require exact equality with those frozen
+objects and with the simulator-attestation v3 evaluator runtime. The two-stage simulator collector
+and parquet binder are implemented, but the pinned 31.47-GiB original-HDF5 corpus is not materialized and no real
+40-task report exists, so this gate remains open and final benchmark readiness must not be claimed.

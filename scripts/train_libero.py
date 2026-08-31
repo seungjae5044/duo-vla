@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Resumable TP=2 Duo-VLA trainer for pinned LIBERO data."""
 
+# ruff: noqa: E402 -- authenticate project sources before importing project code.
+
 from __future__ import annotations
 
 import argparse
@@ -13,9 +15,12 @@ import os
 import platform
 import random
 import re
+import site
+import stat
 import sys
 import time
 from collections.abc import Sequence
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +29,92 @@ import torch
 import torch.distributed as dist
 from PIL import Image
 from transformers import AutoProcessor
+
+
+def _inventory_project_source_root() -> Path:
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    if source_root.resolve(strict=True) != source_root or not stat.S_ISDIR(os.lstat(source_root).st_mode):
+        raise RuntimeError("project src import root must be a canonical real directory")
+    identity_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns", "st_nlink")
+
+    def same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+        return all(getattr(left, name) == getattr(right, name) for name in identity_fields)
+
+    def walk(directory: int, prefix: tuple[str, ...]) -> None:
+        before = os.fstat(directory)
+        names = sorted(os.listdir(directory))
+        for name in names:
+            context = "/".join((*prefix, name))
+            observed = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if stat.S_ISDIR(observed.st_mode):
+                if name == "__pycache__":
+                    continue
+                child = os.open(
+                    name,
+                    os.O_RDONLY | os.O_NONBLOCK | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=directory,
+                )
+                try:
+                    if not same_identity(observed, os.fstat(child)):
+                        raise RuntimeError(f"project source directory changed while opening: {context}")
+                    walk(child, (*prefix, name))
+                finally:
+                    os.close(child)
+            elif not (stat.S_ISREG(observed.st_mode) and name.endswith(".py")):
+                raise RuntimeError(f"project source import entry is unsafe: {context}")
+        if names != sorted(os.listdir(directory)) or not same_identity(before, os.fstat(directory)):
+            raise RuntimeError(f"project source directory changed during inventory: {'/'.join(prefix) or '.'}")
+
+    root_descriptor = os.open(
+        source_root,
+        os.O_RDONLY | os.O_NONBLOCK | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    try:
+        if sorted(os.listdir(root_descriptor)) != ["duo_vla"]:
+            raise RuntimeError("project src import root must contain only the real duo_vla package directory")
+        package_descriptor = os.open(
+            "duo_vla",
+            os.O_RDONLY | os.O_NONBLOCK | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=root_descriptor,
+        )
+        try:
+            walk(package_descriptor, ("duo_vla",))
+        finally:
+            os.close(package_descriptor)
+    finally:
+        os.close(root_descriptor)
+    source_text = str(source_root)
+    resolved_entries = [str(Path(entry or os.getcwd()).resolve()) for entry in sys.path]
+    if source_text not in resolved_entries:
+        raise RuntimeError("sealed editable install does not expose the canonical project src import root")
+    sys.path[:] = [source_text] + [
+        entry for entry in sys.path if str(Path(entry or os.getcwd()).resolve()) != source_text
+    ]
+    return source_root
+
+
+_PROJECT_SOURCE_ROOT = _inventory_project_source_root()
+
+
+def _validate_project_module_origins(required_modules: set[str]) -> dict[str, str]:
+    package_root = (_PROJECT_SOURCE_ROOT / "duo_vla").resolve(strict=True)
+    loaded = {name: module for name, module in sys.modules.items() if name == "duo_vla" or name.startswith("duo_vla.")}
+    missing = sorted(required_modules - set(loaded))
+    if missing:
+        raise RuntimeError(f"required checkout modules are not loaded: {missing}")
+    origins: dict[str, str] = {}
+    for name, module in sorted(loaded.items()):
+        origin = getattr(getattr(module, "__spec__", None), "origin", None)
+        module_file = getattr(module, "__file__", None)
+        if not isinstance(origin, str) or not isinstance(module_file, str):
+            raise RuntimeError(f"checkout module has no file origin: {name}")
+        resolved_origin = Path(origin).resolve(strict=True)
+        resolved_file = Path(module_file).resolve(strict=True)
+        if resolved_origin != resolved_file or not resolved_file.is_relative_to(package_root):
+            raise RuntimeError(f"checkout module origin escapes authenticated source root: {name}")
+        origins[name] = str(resolved_file)
+    return origins
+
 
 from duo_vla.action_interface import ActionInputProjector, VelocityHead
 from duo_vla.backbones.diffusion_gemma import (
@@ -76,14 +167,21 @@ from duo_vla.run_config import (
     save_resolved_config,
 )
 from duo_vla.run_journal import (
+    apply_checkpoint_retention,
     create_run_journal,
     load_run_journal,
+    make_checkpoint_retention_contract,
     quarantine_uncommitted_training_artifacts,
     reconcile_metrics_jsonl,
     record_latest_checkpoint,
     validate_resume_checkpoint,
 )
 from duo_vla.runtime_determinism import configure_strict_cuda_determinism, deterministic_torch_runtime
+from duo_vla.runtime_integrity import (
+    content_address_train_venv,
+    static_environment_identity,
+    validate_torchrun_rank_environment,
+)
 from duo_vla.training import TrainerState, make_microbatch_plan, make_update_plan, masked_element_count, masked_sse
 from duo_vla.training_checkpoint import (
     capture_rng_state,
@@ -95,31 +193,88 @@ from duo_vla.training_checkpoint import (
     validate_training_progress,
 )
 
+_validate_project_module_origins({"duo_vla", "duo_vla.runtime_integrity"})
+
 PHYSICAL_BATCH_SIZE = 8
 EXPERT_BATCH_ISOLATION = "sample_isolated_grouped_mm_v1"
-_INTEGER_MANIFEST_RUN_CONTRACT_FIELDS = frozenset({"fixed_physical_prefix_width", "physical_batch_size"})
+LIBERO_DATASET_TREE_SHA256 = "d9c14b4aff28bcc56f341b171c6a5a3b10510d4bd0378662891c5156d245add8"
+LIBERO_DATASET_CONTENT_INVENTORY_SHA256 = "63fd7a951ebb397a33c43cad4a7c48c7c6911bd8d1481ff99b07da5f7890782c"
+LIBERO_DATASET_FILES_VERIFIED = 382
+LIBERO_DATASET_TOTAL_BYTES = 34_926_155_087
+LIBERO_DATASET_AUTHENTICATION_TIMEOUT = timedelta(hours=1)
+_INTEGER_MANIFEST_RUN_CONTRACT_FIELDS = frozenset(
+    {"dataset_files_verified", "dataset_total_bytes", "fixed_physical_prefix_width", "physical_batch_size"}
+)
 LIBERO_PREFIX_CAMERAS = (
     CameraGeometry("agentview", 256, 256),
     CameraGeometry("eye_in_hand", 256, 256),
 )
 REQUIRED_TRAIN_ENVIRONMENT = {
+    "BLIS_NUM_THREADS": "1",
     "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
     "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
     "CUDA_VISIBLE_DEVICES": "0,1",
+    "HF_HUB_DISABLE_PROGRESS_BARS": "1",
     "HF_HUB_OFFLINE": "1",
+    "HOME": "/root",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
     "MKL_NUM_THREADS": "1",
     "NUMEXPR_NUM_THREADS": "1",
     "OMP_DYNAMIC": "FALSE",
     "OMP_NUM_THREADS": "1",
     "OPENBLAS_NUM_THREADS": "1",
+    "PATH": "/usr/bin:/bin",
     "PYTHONNOUSERSITE": "1",
+    "PYTHONPYCACHEPREFIX": "/dev/null",
+    "PYTHONSAFEPATH": "1",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "RAYON_NUM_THREADS": "1",
     "TOKENIZERS_PARALLELISM": "false",
     "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
     "TRANSFORMERS_OFFLINE": "1",
+    "TZ": "UTC",
+    "VECLIB_MAXIMUM_THREADS": "1",
 }
-_ALGORITHM_ENVIRONMENT_PREFIXES = ("CUBLAS_", "CUDA_", "CUDNN_", "NCCL_", "PYTORCH_", "TORCH_")
+_ALGORITHM_ENVIRONMENT_PREFIXES = (
+    "BLIS_",
+    "CUBLAS_",
+    "CUDA_",
+    "CUDNN_",
+    "GCONV_PATH",
+    "GLIBC_",
+    "GOMP_",
+    "KMP_",
+    "LD_",
+    "LOCPATH",
+    "MALLOC_",
+    "MKL_",
+    "NCCL_",
+    "NIX_",
+    "NVIDIA_",
+    "NUMEXPR_",
+    "OMP_",
+    "OPENBLAS_",
+    "PYTORCH_",
+    "RAYON_",
+    "TORCH_",
+    "VECLIB_",
+)
 _ALLOWED_ALGORITHM_ENVIRONMENT = frozenset(
-    {"CUBLAS_WORKSPACE_CONFIG", "CUDA_DEVICE_ORDER", "CUDA_VISIBLE_DEVICES", "TORCH_NCCL_ASYNC_ERROR_HANDLING"}
+    {
+        "BLIS_NUM_THREADS",
+        "CUBLAS_WORKSPACE_CONFIG",
+        "CUDA_DEVICE_ORDER",
+        "CUDA_VISIBLE_DEVICES",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "OMP_DYNAMIC",
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "RAYON_NUM_THREADS",
+        "TORCH_NCCL_ASYNC_ERROR_HANDLING",
+        "VECLIB_MAXIMUM_THREADS",
+    }
 )
 
 
@@ -162,20 +317,80 @@ def _validate_resume_manifest_run_contract(
             raise ValueError(f"resume checkpoint run contract mismatch for {key}")
 
 
-def _snapshot_tree_sha256(snapshot_root: Path, *, expected_revision: str) -> str:
-    resolved = snapshot_root.resolve()
-    if resolved.name != expected_revision:
-        raise ValueError(f"snapshot path must end in pinned revision {expected_revision}, got {resolved.name}")
-    tree_path = resolved.parents[1] / "trees" / f"{expected_revision}.json"
-    if not tree_path.is_file():
-        raise FileNotFoundError(f"snapshot tree metadata is missing: {tree_path}")
-    return file_sha256(tree_path)
+def _authenticate_dataset_snapshot_distributed(snapshot_root: Path) -> dict[str, Any]:
+    """Authenticate every LIBERO dataset byte on rank zero before constructing a reader."""
+
+    authentication_group = dist.new_group(backend="gloo", timeout=LIBERO_DATASET_AUTHENTICATION_TIMEOUT)
+    result: list[dict[str, Any] | None] = [None]
+    try:
+        if dist.get_rank() == 0:
+            try:
+                report = verify_huggingface_snapshot(snapshot_root, expected_revision=LIBERO_DATASET_REVISION)
+                required = {
+                    "content_inventory_sha256": LIBERO_DATASET_CONTENT_INVENTORY_SHA256,
+                    "files_verified": LIBERO_DATASET_FILES_VERIFIED,
+                    "total_bytes": LIBERO_DATASET_TOTAL_BYTES,
+                    "tree_metadata_sha256": LIBERO_DATASET_TREE_SHA256,
+                }
+                mismatches = {
+                    name: {"expected": expected, "observed": report.get(name)}
+                    for name, expected in required.items()
+                    if report.get(name) != expected
+                }
+                if mismatches:
+                    raise ValueError(f"LIBERO dataset snapshot differs from the qualified identity: {mismatches}")
+                result[0] = report
+            except Exception as exc:
+                result[0] = {"error": f"{type(exc).__name__}: {exc}"}
+        dist.broadcast_object_list(result, src=0, group=authentication_group)
+    finally:
+        dist.destroy_process_group(authentication_group)
+    payload = result[0]
+    if not isinstance(payload, dict):
+        raise RuntimeError("rank 0 did not broadcast a LIBERO dataset authentication result")
+    if "error" in payload:
+        raise RuntimeError(f"LIBERO dataset authentication failed: {payload['error']}")
+    required = {
+        "content_inventory_sha256": LIBERO_DATASET_CONTENT_INVENTORY_SHA256,
+        "files_verified": LIBERO_DATASET_FILES_VERIFIED,
+        "total_bytes": LIBERO_DATASET_TOTAL_BYTES,
+        "tree_metadata_sha256": LIBERO_DATASET_TREE_SHA256,
+    }
+    if any(payload.get(name) != expected for name, expected in required.items()):
+        raise RuntimeError("broadcast LIBERO dataset identity differs from the qualified identity")
+    return payload
 
 
 def _configure_and_validate_training_runtime(project_root: Path) -> dict[str, Any]:
     """Reject inherited algorithm overrides and enable strict CUDA determinism."""
 
-    forbidden = ("LD_LIBRARY_PATH", "LD_PRELOAD", "PYTHONHOME", "PYTHONINSPECT", "PYTHONSTARTUP")
+    project_root = project_root.resolve()
+    _inventory_project_source_root()
+    _validate_project_module_origins({"duo_vla", "duo_vla.runtime_integrity"})
+    cache_root = Path(os.environ.get("DUO_VLA_CACHE_ROOT", "/root/.cache/duo-vla")).resolve()
+    train_venv = (cache_root / "venvs/train").resolve()
+    python_hash_seed = os.environ.get("PYTHONHASHSEED")
+    if python_hash_seed not in {"0", "1", "2"}:
+        raise RuntimeError("LIBERO training requires PYTHONHASHSEED in {0,1,2}")
+    expected_environment = {
+        **REQUIRED_TRAIN_ENVIRONMENT,
+        "DUO_VLA_CACHE_ROOT": str(cache_root),
+        "DUO_VLA_PROJECT_ROOT": str(project_root),
+        "DUO_VLA_TRAIN_VENV": str(train_venv),
+        "HF_HOME": str(Path(os.environ.get("HF_HOME", "/root/.cache/huggingface")).resolve()),
+        "PYTHONHASHSEED": python_hash_seed,
+    }
+    forbidden = (
+        "BASH_ENV",
+        "ENV",
+        "GLOBIGNORE",
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "PYTHONHOME",
+        "PYTHONINSPECT",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+    )
     present_forbidden = [name for name in forbidden if os.environ.get(name)]
     present_algorithm_overrides = sorted(
         name
@@ -187,17 +402,43 @@ def _configure_and_validate_training_runtime(project_root: Path) -> dict[str, An
             "LIBERO training environment contains injection/algorithm overrides: "
             f"forbidden={present_forbidden}, algorithm_overrides={present_algorithm_overrides}"
         )
-    observed_environment = {name: os.environ.get(name) for name in REQUIRED_TRAIN_ENVIRONMENT}
-    if observed_environment != REQUIRED_TRAIN_ENVIRONMENT:
+    observed_environment = {name: os.environ.get(name) for name in expected_environment}
+    if observed_environment != expected_environment:
         raise RuntimeError(f"LIBERO training environment differs from the canonical launcher: {observed_environment}")
-    expected_pythonpath = str((project_root / "src").resolve())
-    if os.environ.get("PYTHONPATH") != expected_pythonpath:
-        raise RuntimeError(f"LIBERO training requires PYTHONPATH={expected_pythonpath}")
+    if Path(sys.prefix).resolve() != train_venv:
+        raise RuntimeError(f"LIBERO training requires the pinned train venv: {train_venv}")
+    if sys.flags.safe_path != 1:
+        raise RuntimeError("LIBERO training requires Python safe-path mode")
+    if sys.flags.dont_write_bytecode != 1 or not sys.dont_write_bytecode:
+        raise RuntimeError("LIBERO training requires -B")
+    if sys.flags.no_user_site != 1 or site.ENABLE_USER_SITE:
+        raise RuntimeError("LIBERO training requires the user site to be disabled")
+    if sys.pycache_prefix != "/dev/null":
+        raise RuntimeError("LIBERO training requires an impossible pycache lookup prefix")
+    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    compact_version = f"python{sys.version_info.major}{sys.version_info.minor}"
+    expected_sys_path = [
+        str((project_root / "src").resolve()),
+        str(Path(sys.base_prefix) / "lib" / f"{compact_version}.zip"),
+        str(Path(sys.base_prefix) / "lib" / version),
+        str(Path(sys.base_exec_prefix) / "lib" / version / "lib-dynload"),
+        str(train_venv / "lib" / version / "site-packages"),
+    ]
+    if sys.path != expected_sys_path:
+        raise RuntimeError(f"LIBERO training import search path differs: {sys.path}")
+    rank_environment = validate_torchrun_rank_environment(
+        os.environ,
+        required=any(name in os.environ for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE")),
+    )
+    venv_identity = content_address_train_venv(train_venv)
     configure_strict_cuda_determinism(torch)
     return {
         "algorithm_override_environment": {},
-        "environment": {**observed_environment, "PYTHONPATH": expected_pythonpath},
+        "environment": dict(sorted(observed_environment.items())),
         "nccl_environment": {},
+        "static_environment_sha256": static_environment_identity(observed_environment)["sha256"],
+        "torchrun": rank_environment,
+        "train_venv": venv_identity,
     }
 
 
@@ -322,6 +563,7 @@ def _validate_and_build_interface_config(config: dict[str, Any]) -> ActionInterf
     lora = config["lora"]
     benchmark = config["benchmark"]
     optimization = config["optimization"]
+    training = config["training"]
     required = {
         "model.id": (model["id"], DEFAULT_DIFFUSION_GEMMA_SPEC.model_id),
         "model.revision": (model["revision"], DEFAULT_DIFFUSION_GEMMA_SPEC.revision),
@@ -360,6 +602,18 @@ def _validate_and_build_interface_config(config: dict[str, Any]) -> ActionInterf
     if mismatches:
         details = {name: required[name] for name in mismatches}
         raise ValueError(f"resolved config is unsupported by this trainer: {details}")
+    checkpoint_interval = training.get("checkpoint_interval")
+    permanent_checkpoint_interval = training.get("permanent_checkpoint_interval")
+    if (
+        type(checkpoint_interval) is not int
+        or checkpoint_interval <= 0
+        or type(permanent_checkpoint_interval) is not int
+        or permanent_checkpoint_interval <= 0
+        or permanent_checkpoint_interval % checkpoint_interval
+    ):
+        raise ValueError(
+            "training.permanent_checkpoint_interval must be a positive multiple of training.checkpoint_interval"
+        )
     _prefix_geometry_pins(config)
     return ActionInterfaceConfig(
         hidden_size=DEFAULT_DIFFUSION_GEMMA_SPEC.expected_hidden_size,
@@ -465,6 +719,7 @@ def _initialize_run_journal(
                 )
                 record = validate_resume_checkpoint(output_dir, resume)
                 recovery = quarantine_uncommitted_training_artifacts(output_dir)
+                retention = apply_checkpoint_retention(output_dir)
                 reconcile_metrics_jsonl(output_dir)
                 latest_manifest_sha256 = record.manifest_sha256
                 if recovery.changed:
@@ -473,6 +728,17 @@ def _initialize_run_journal(
                             {
                                 "recovery_quarantine": recovery.directory,
                                 "moved_paths": recovery.moved_paths,
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                if retention.changed:
+                    print(
+                        json.dumps(
+                            {
+                                "checkpoint_retention_recovered": retention.recovered_transactions,
+                                "checkpoint_retention_retired": retention.retired_paths,
                             },
                             sort_keys=True,
                         ),
@@ -1037,6 +1303,18 @@ def _commit_training_checkpoint(
                 parent_manifest_sha256=parent_manifest_sha256,
                 last_metrics=last_metrics,
             )
+            retention = apply_checkpoint_retention(output_dir)
+            if retention.changed:
+                print(
+                    json.dumps(
+                        {
+                            "checkpoint_retention_recovered": retention.recovered_transactions,
+                            "checkpoint_retention_retired": retention.retired_paths,
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
             result[0] = {"manifest_sha256": manifest_sha256}
         except Exception as exc:
             result[0] = {"error": f"{type(exc).__name__}: {exc}"}
@@ -1131,6 +1409,7 @@ def main() -> None:
     parser.add_argument("--validation-interval", type=int)
     parser.add_argument("--validation-samples", type=int)
     parser.add_argument("--checkpoint-interval", type=int)
+    parser.add_argument("--permanent-checkpoint-interval", type=int)
     parser.add_argument("--log-interval", type=int)
     parser.add_argument("--max-cached-files", type=int, default=128)
     parser.add_argument(
@@ -1197,6 +1476,11 @@ def main() -> None:
         checkpoint_interval = int(
             training["checkpoint_interval"] if args.checkpoint_interval is None else args.checkpoint_interval
         )
+        permanent_checkpoint_interval = int(
+            training["permanent_checkpoint_interval"]
+            if args.permanent_checkpoint_interval is None
+            else args.permanent_checkpoint_interval
+        )
         log_interval = int(training["log_interval"] if args.log_interval is None else args.log_interval)
         positive_values = {
             "microbatch_size": microbatch_size,
@@ -1204,6 +1488,7 @@ def main() -> None:
             "validation_interval": validation_interval,
             "validation_samples": validation_samples,
             "checkpoint_interval": checkpoint_interval,
+            "permanent_checkpoint_interval": permanent_checkpoint_interval,
             "log_interval": log_interval,
             "max_cached_files": args.max_cached_files,
         }
@@ -1214,6 +1499,8 @@ def main() -> None:
             raise ValueError(f"invalid training schedule fields: {invalid}, warmup={warmup_updates}")
         if validation_samples % PHYSICAL_BATCH_SIZE:
             raise ValueError(f"validation samples must be divisible by physical batch {PHYSICAL_BATCH_SIZE}")
+        if permanent_checkpoint_interval % checkpoint_interval:
+            raise ValueError("permanent_checkpoint_interval must be a multiple of checkpoint_interval")
         optimization["total_updates"] = total_updates
         optimization["warmup_updates"] = warmup_updates
         optimization["microbatch_size"] = microbatch_size
@@ -1222,6 +1509,7 @@ def main() -> None:
         training["validation_interval"] = validation_interval
         training["validation_samples"] = validation_samples
         training["checkpoint_interval"] = checkpoint_interval
+        training["permanent_checkpoint_interval"] = permanent_checkpoint_interval
         training["log_interval"] = log_interval
         config["run"] = {"seed": run_seed, "task": args.task, "max_cached_files": args.max_cached_files}
         expected_hash_seed = str(run_seed)
@@ -1231,10 +1519,11 @@ def main() -> None:
             )
         interface_config = _validate_and_build_interface_config(config)
         policy_contract = policy_contract_from_config(config)
-        dataset_tree_sha256 = _snapshot_tree_sha256(
-            args.snapshot_root,
-            expected_revision=LIBERO_DATASET_REVISION,
-        )
+        dataset_snapshot_report = _authenticate_dataset_snapshot_distributed(args.snapshot_root)
+        dataset_tree_sha256 = str(dataset_snapshot_report["tree_metadata_sha256"])
+        dataset_content_inventory_sha256 = str(dataset_snapshot_report["content_inventory_sha256"])
+        dataset_files_verified = int(dataset_snapshot_report["files_verified"])
+        dataset_total_bytes = int(dataset_snapshot_report["total_bytes"])
         hf_home = Path(os.environ.get("HF_HOME", "/root/.cache/huggingface"))
         model_snapshot = (
             hf_home / "hub/models--google--diffusiongemma-26B-A4B-it/snapshots" / DEFAULT_DIFFUSION_GEMMA_SPEC.revision
@@ -1258,8 +1547,13 @@ def main() -> None:
         execution_environment = _execution_environment(runtime_preflight)
         config["execution_environment"] = execution_environment
         config["artifact_trees"] = {
+            "dataset_content_inventory_sha256": dataset_content_inventory_sha256,
+            "dataset_files_verified": dataset_files_verified,
+            "dataset_total_bytes": dataset_total_bytes,
             "dataset_tree_sha256": dataset_tree_sha256,
             "model_content_inventory_sha256": model_snapshot_report["content_inventory_sha256"],
+            "model_files_verified": model_snapshot_report["files_verified"],
+            "model_total_bytes": model_snapshot_report["total_bytes"],
             "model_tree_sha256": model_tree_sha256,
         }
         source_sha256 = _source_tree_sha256(project_root)
@@ -1307,7 +1601,10 @@ def main() -> None:
         validation_sampler = TaskUniformAnchorSampler(dataset.episodes, validation_indices)
         run_contract = {
             "config_sha256": config_sha256,
+            "dataset_content_inventory_sha256": dataset_content_inventory_sha256,
+            "dataset_files_verified": str(dataset_files_verified),
             "dataset_revision": LIBERO_DATASET_REVISION,
+            "dataset_total_bytes": str(dataset_total_bytes),
             "dataset_tree_sha256": dataset_tree_sha256,
             "expert_batch_isolation": EXPERT_BATCH_ISOLATION,
             "execution_environment_sha256": canonical_config_sha256(execution_environment),
@@ -1449,6 +1746,14 @@ def main() -> None:
             _assert_distributed_trainer_state(trainer_state, resume_manifest)
         if trainer_state.next_update > total_updates:
             raise ValueError("resume checkpoint is beyond the configured training budget")
+        parent_checkpoint = (
+            None
+            if parent_manifest_sha256 is None
+            else {
+                "relative_path": args.resume.relative_to(args.output_dir).as_posix(),
+                "update": trainer_state.next_update,
+            }
+        )
 
         execution_end = total_updates
         if args.stop_after_updates is not None:
@@ -1592,8 +1897,11 @@ def main() -> None:
                     resolved_config_path=resolved_config_path,
                     manifest={
                         "config_sha256": config_sha256,
+                        "dataset_content_inventory_sha256": dataset_content_inventory_sha256,
+                        "dataset_files_verified": dataset_files_verified,
                         "dataset_id": "HuggingFaceVLA/libero",
                         "dataset_revision": LIBERO_DATASET_REVISION,
+                        "dataset_total_bytes": dataset_total_bytes,
                         "dataset_tree_sha256": dataset_tree_sha256,
                         "expert_batch_isolation": EXPERT_BATCH_ISOLATION,
                         "execution_environment": execution_environment,
@@ -1604,11 +1912,17 @@ def main() -> None:
                         "last_metrics": metric,
                         "model_id": DEFAULT_DIFFUSION_GEMMA_SPEC.model_id,
                         "model_content_inventory_sha256": model_snapshot_report["content_inventory_sha256"],
+                        "model_files_verified": model_snapshot_report["files_verified"],
                         "model_revision": DEFAULT_DIFFUSION_GEMMA_SPEC.revision,
+                        "model_total_bytes": model_snapshot_report["total_bytes"],
                         "model_tree_sha256": model_tree_sha256,
                         "normalization_sha256": normalization_sha256,
                         "optimizer_parameter_schema_sha256": run_contract["optimizer_parameter_schema_sha256"],
                         "parent_manifest_sha256": parent_manifest_sha256,
+                        "checkpoint_retention": make_checkpoint_retention_contract(
+                            permanent_checkpoint_interval=permanent_checkpoint_interval,
+                            parent_checkpoint=parent_checkpoint,
+                        ),
                         "physical_batch_size": PHYSICAL_BATCH_SIZE,
                         "platform": platform.platform(),
                         "policy_contract": policy_contract.to_dict(),
@@ -1632,6 +1946,10 @@ def main() -> None:
                     parent_manifest_sha256=parent_manifest_sha256,
                     last_metrics=metric,
                 )
+                parent_checkpoint = {
+                    "relative_path": checkpoint_dir.relative_to(args.output_dir).as_posix(),
+                    "update": trainer_state.next_update,
+                }
             _append_metric(
                 metrics_path,
                 metric,

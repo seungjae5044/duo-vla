@@ -85,13 +85,18 @@ scripts/calvin/run_official_evaluator.sh preflight \
 
 That report has `attestation: null`; the pre-registration creator and official evaluator cannot promote it.
 
-Official scoring accepts only a `duovla-calvin-official-preregistration-v6` manifest. It freezes all 1,000 canonical
+Official scoring accepts only a `duovla-calvin-official-preregistration-v8` manifest. It freezes all 1,000 canonical
 five-subtask sequences, evaluation seed 0 and its inference-seed domain, the runtime/data `attestation_sha256`, the
 raw SHA-256 of `aggregate_calvin_official.py`, the exact Python 3.8.20 aggregation runtime, and
 the exact 24-cell comparison matrix: training seeds `{0,1,2}` × flow NFE `{1,5,10}` or direct NFE `1` × execution
 horizon `{1,4}`. Arbitrary, missing, duplicate, or off-matrix cells are rejected. Each seed/objective pair contributes
 one distinct final checkpoint, reused across its NFE/K cells. Every cell also freezes the selected full policy-contract
-digest, serving-runtime digest, and one common grouped-MM/sample-isolated physical-B8 prefix geometry.
+digest, one common evaluation-only serving-runtime v4 digest across the complete matrix, and one common
+grouped-MM/sample-isolated physical-B8 prefix geometry. The manifest
+also freezes the discarded synthetic policy warm-up count (default two, minimum one) across every comparison cell.
+Two dedicated, existing, empty real directories are frozen as the canonical run and external-claim roots, including
+their absolute paths and device/inode identities. The creator derives each cell's sole
+`<run-root>/<cell-id>` directory and `<claim-root>/<cell-id>.json` claim; neither path is accepted from the cell input.
 
 Prepare a strict `{"cells": [...]}` input document with all 24 cells. A cell's `policy` object contains
 `train_seed`, `objective`, `nfe`, `sampler`, and `inference_seed_behavior`; the creator derives the selected policy's
@@ -103,7 +108,10 @@ scripts/calvin/run_create_preregistration.sh \
   --cells /read-only/freeze/calvin-cells.json \
   --runtime-attestation /read-only/freeze/calvin-runtime-data-preflight.json \
   --evaluation-seed 0 \
+  --policy-warmup-calls 2 \
   --final-freeze-token '<externally-held-token>' \
+  --official-output-root /dedicated/empty/calvin-runs \
+  --official-claim-root /dedicated/empty/calvin-claims \
   --output /read-only/freeze/calvin-preregistration.json
 ```
 
@@ -121,8 +129,9 @@ time would defeat the freeze gate.
 scripts/calvin/run_official_evaluator.sh official-score \
   --dataset-root "$CALVIN_DATASET_ROOT" \
   --execution-horizon 4 \
+  --policy-warmup-calls 2 \
   --socket /absolute/path/calvin-policy.sock \
-  --output-dir /new/official-run-directory \
+  --output-dir /dedicated/empty/calvin-runs/<frozen-cell-id> \
   --preregistration-manifest /read-only/frozen-preregistration.json \
   --preregistration-sha256 '<externally-recorded-64hex-digest>' \
   --cell-id '<frozen-cell-id>' \
@@ -156,15 +165,35 @@ legacy flat `normalization_metadata_sha256` health field to equal `calvin_identi
 Infrastructure mode accepts none of the scoring/freeze arguments and cannot connect to a policy or inspect oracle
 outcomes.
 
-After all 24 cells finish, prepare and externally hash a strict run inventory:
+Official scoring performs the frozen warm-up calls on deterministic synthetic RGB/state inputs before constructing
+the validation-D environment or task oracle. Warm-up requests use reserved replan indices starting at 360, outside the
+official per-subtask action budget, so they cannot collide with a scored request identity. Before constructing a policy
+client, the evaluator requires the exact pre-registered output path, rechecks both root inodes, exclusively creates the
+canonical run directory, and exclusively publishes the external claim plus `.sha256` sidecar. An existing run path or
+claim is a permanent collision; deleting a failed run directory does not make the surviving external claim reusable.
+The evaluator durably records health plus partial warm-up progress,
+including each request intent before dispatch and its completed report afterward. Their outputs are discarded and their request identity, input/output
+digests, and request/server latency are durably recorded under `policy_warmup` in `run.json`; they are excluded from
+all episode latency and throughput fields. `summary.json` reports authenticated episode-only request/server p50 and
+p95 latency, total latency, call throughput, rollout elapsed time, and environment-action throughput, all recomputed
+from the raw episode JSONL during aggregation.
+
+Successful completion exclusively publishes `completion.json` and `completion.json.sha256` as the final commit marker.
+The marker mutually binds the cell, pre-registration, external claim, episode JSONL, summary, final complete run JSON,
+and the exact 1,000-record count. The journal schema is `duovla-calvin-official-run-v5`; a running or failed journal,
+or a run without this marker, is not complete.
+
+After all 24 cells finish, prepare and externally hash a strict run inventory. Paths are deliberately absent because
+the aggregator derives them only from the frozen pre-registration:
 
 ```json
 {
-  "schema": "duovla-calvin-official-run-inventory-v2",
+  "schema": "duovla-calvin-official-run-inventory-v3",
   "preregistration_sha256": "<frozen manifest raw SHA-256>",
   "runs": [{
     "cell_id": "seed-0-flow-nfe-1-k-1",
-    "output_dir": "/absolute/path/to/that/run",
+    "claim_json_sha256": "<64hex>",
+    "completion_json_sha256": "<64hex>",
     "run_json_sha256": "<64hex>",
     "episodes_jsonl_sha256": "<64hex>",
     "summary_json_sha256": "<64hex>"
@@ -189,14 +218,19 @@ Aggregation must also run under Python 3.8.20. Before importing evaluator code i
 to preregistration and the other three sources to every run attestation, then verifies the snapshot in both the pre- and
 post-commit publication guards. Those guards also bind the exclusive output and SHA-256 sidecar to the created inode,
 content, and link count, rejecting target-entry substitution. It authenticates the validation-language YAML and requires every persisted instruction to be exactly
-that task's first fixed phrase. It authenticates every raw artifact, attestation, cell, live-policy identity, and all
-1,000 ordered episode records per cell; recomputes each `summary.json`; and rejects incomplete, duplicate, or
-off-matrix results. The `duovla-calvin-official-matrix-summary-v3` output is also an exclusive, durable payload/sidecar
-pair. Its eight comparison rows report AvgLen and SR1–SR5 as three-seed means and sample standard deviations using the
-`n-1` denominator while retaining every per-seed value and artifact digest.
+that task's first fixed phrase. It requires the run root to contain exactly the 24 canonical directories and the claim
+root to contain exactly 24 claims plus their 24 sidecars, rejecting alternate, reused, missing, extra, symlinked, or
+hard-linked paths. It authenticates every raw claim/completion/run/episode/summary artifact, attestation, cell,
+live-policy identity, and all 1,000 ordered episode records per cell; recomputes each `summary.json`; and rejects
+incomplete, failed, running, duplicate, or off-matrix results. The
+`duovla-calvin-official-matrix-summary-v5` output is also an exclusive, durable payload/sidecar
+pair. Its eight comparison rows report AvgLen, SR1–SR5, episode-only request/server latency and throughput, and rollout
+action throughput as three-seed means and sample standard deviations using the `n-1` denominator while retaining every
+per-seed value and artifact digest. The matrix records the frozen warm-up count and requires paired K=1/K=4 warm-up
+action hashes to be identical for each seed/objective/NFE.
 
 Passing these protocol and mutation tests is not an official benchmark result. A result claim requires the complete
-real 24-cell run inventory and an independently authenticated v3 matrix summary; partial, synthetic, or dry-run
+real 24-cell run inventory and an independently authenticated v5 matrix summary; partial, synthetic, or dry-run
 artifacts are never reportable as official CALVIN performance.
 
 Production keeps the verified 555,309,812,705-byte ZIP, a compact SQLite index, and six projected metadata files.
