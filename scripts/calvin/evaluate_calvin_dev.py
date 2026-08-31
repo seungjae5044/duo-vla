@@ -491,75 +491,93 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    require(type(args.evaluation_seed) is int and 0 <= args.evaluation_seed < 2**63, "evaluation seed is invalid")
-    inputs = authenticate_dev_inputs(
-        args.training_root,
-        args.normalization,
-        args.source_root,
-        args.revision_file,
-    )
-    manifest, robot_obs, scene_obs = load_bank(args.reset_bank)
-    assert_bank_matches_inputs(manifest, inputs)
-    reset_indices = (
-        list(range(len(manifest["records"]))) if args.all_resets else list(manifest["selection"]["smoke_reset_indices"])
-    )
-    task_oracle = instantiate_task_oracle(
-        args.source_root,
-        task_oracle_bytes=inputs.source_files["task_oracle.yaml"],
-    )
-
-    def environment_factory(scene: str) -> Any:
-        return instantiate_abc_environment(
+    # Keep fd 1 on stderr through native simulator teardown and write the one
+    # machine-readable report directly to a duplicate of the original stdout.
+    sys.stdout.flush()
+    report_descriptor = os.dup(sys.stdout.fileno())
+    try:
+        os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    except BaseException:
+        os.close(report_descriptor)
+        raise
+    try:
+        require(type(args.evaluation_seed) is int and 0 <= args.evaluation_seed < 2**63, "evaluation seed is invalid")
+        inputs = authenticate_dev_inputs(
             args.training_root,
+            args.normalization,
             args.source_root,
-            scene,
-            merged_config_bytes=inputs.metadata["training/.hydra/merged_config.yaml"],
-            scene_config_bytes=inputs.source_files["scene/" + scene + ".yaml"],
+            args.revision_file,
+        )
+        manifest, robot_obs, scene_obs = load_bank(args.reset_bank)
+        assert_bank_matches_inputs(manifest, inputs)
+        reset_indices = (
+            list(range(len(manifest["records"])))
+            if args.all_resets
+            else list(manifest["selection"]["smoke_reset_indices"])
+        )
+        task_oracle = instantiate_task_oracle(
+            args.source_root,
+            task_oracle_bytes=inputs.source_files["task_oracle.yaml"],
         )
 
-    started = time.perf_counter()
-    with DevPolicyClient(args.socket) as client:
-        health = client.health()
-        train_seed = validate_live_policy(
-            health,
-            manifest,
-            inputs,
-            args.execution_horizon,
-            allow_fake=args.allow_fake_policy,
-        )
-        with DevelopmentJournal(args.output_dir) as journal:
-            run = {
-                "evaluation_seed": args.evaluation_seed,
-                "execution_horizon": args.execution_horizon,
-                "policy_health": health,
-                "replay_bundle_sha256": manifest["replay_bundle"]["root_sha256"],
-                "reset_bank_sha256": manifest["root_sha256"],
-                "reset_indices": reset_indices,
-                "schema": DEVELOPMENT_RUN_SCHEMA,
-                "split_sha256": canonical_sha256(inputs.split),
-                "status": "running",
-            }
-            journal.start_run(run)
-            results = evaluate_reset_indices(
-                manifest,
-                robot_obs,
-                scene_obs,
-                reset_indices,
-                client,
-                task_oracle,
-                environment_factory,
-                train_seed=train_seed,
-                evaluation_seed=args.evaluation_seed,
-                execution_horizon=args.execution_horizon,
-                callback=journal.append,
+        def environment_factory(scene: str) -> Any:
+            return instantiate_abc_environment(
+                args.training_root,
+                args.source_root,
+                scene,
+                merged_config_bytes=inputs.metadata["training/.hydra/merged_config.yaml"],
+                scene_config_bytes=inputs.source_files["scene/" + scene + ".yaml"],
             )
-            summary = summarize_development(results, policy_mode=health["mode"])
-            summary["elapsed_seconds"] = time.perf_counter() - started
-            summary["replay_bundle_sha256"] = manifest["replay_bundle"]["root_sha256"]
-            summary["reset_bank_sha256"] = manifest["root_sha256"]
-            journal.write_json("summary.json", summary)
-            journal.complete()
-    print(json.dumps(summary, allow_nan=False, sort_keys=True))
+
+        started = time.perf_counter()
+        with DevPolicyClient(args.socket) as client:
+            health = client.health()
+            train_seed = validate_live_policy(
+                health,
+                manifest,
+                inputs,
+                args.execution_horizon,
+                allow_fake=args.allow_fake_policy,
+            )
+            with DevelopmentJournal(args.output_dir) as journal:
+                run = {
+                    "evaluation_seed": args.evaluation_seed,
+                    "execution_horizon": args.execution_horizon,
+                    "policy_health": health,
+                    "replay_bundle_sha256": manifest["replay_bundle"]["root_sha256"],
+                    "reset_bank_sha256": manifest["root_sha256"],
+                    "reset_indices": reset_indices,
+                    "schema": DEVELOPMENT_RUN_SCHEMA,
+                    "split_sha256": canonical_sha256(inputs.split),
+                    "status": "running",
+                }
+                journal.start_run(run)
+                results = evaluate_reset_indices(
+                    manifest,
+                    robot_obs,
+                    scene_obs,
+                    reset_indices,
+                    client,
+                    task_oracle,
+                    environment_factory,
+                    train_seed=train_seed,
+                    evaluation_seed=args.evaluation_seed,
+                    execution_horizon=args.execution_horizon,
+                    callback=journal.append,
+                )
+                summary = summarize_development(results, policy_mode=health["mode"])
+                summary["elapsed_seconds"] = time.perf_counter() - started
+                summary["replay_bundle_sha256"] = manifest["replay_bundle"]["root_sha256"]
+                summary["reset_bank_sha256"] = manifest["root_sha256"]
+                journal.write_json("summary.json", summary)
+                journal.complete()
+        payload = (json.dumps(summary, allow_nan=False, sort_keys=True) + "\n").encode("utf-8")
+        while payload:
+            written = os.write(report_descriptor, payload)
+            require(written > 0, "development evaluator report write made no progress")
+            payload = payload[written:]
+    finally:
+        os.close(report_descriptor)
 
 
 if __name__ == "__main__":

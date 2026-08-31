@@ -3102,14 +3102,34 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         platform.python_version() == PYTHON_VERSION,
         f"CALVIN evaluator requires Python {PYTHON_VERSION}, found {platform.python_version()}",
     )
-    random.seed(EVALUATION_SEED)
-    np.random.seed(EVALUATION_SEED)
-    if args.mode == "infrastructure":
-        report = run_infrastructure_mode(args.dataset_root, args.evaluation_seed, args.source_root)
-    else:
-        report = run_official_score_mode(args)
-    _require_evaluator_sources_unchanged(_IMPORT_EVALUATOR_SOURCE_IDENTITIES)
-    print(json.dumps(report, allow_nan=False, ensure_ascii=True, indent=2, sort_keys=True))
+    # Reserve the original stdout exclusively for the single JSON report, then
+    # leave fd 1 directed to stderr. Native CALVIN/PyBullet libraries can write
+    # to C stdout during mode execution and process teardown; restoring fd 1
+    # after the report would let those diagnostics corrupt the JSON stream.
+    sys.stdout.flush()
+    report_descriptor = os.dup(sys.stdout.fileno())
+    try:
+        os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    except BaseException:
+        os.close(report_descriptor)
+        raise
+    try:
+        random.seed(EVALUATION_SEED)
+        np.random.seed(EVALUATION_SEED)
+        if args.mode == "infrastructure":
+            report = run_infrastructure_mode(args.dataset_root, args.evaluation_seed, args.source_root)
+        else:
+            report = run_official_score_mode(args)
+        _require_evaluator_sources_unchanged(_IMPORT_EVALUATOR_SOURCE_IDENTITIES)
+        payload = (json.dumps(report, allow_nan=False, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode(
+            "ascii"
+        )
+        while payload:
+            written = os.write(report_descriptor, payload)
+            require(written > 0, "CALVIN evaluator report write made no progress")
+            payload = payload[written:]
+    finally:
+        os.close(report_descriptor)
 
 
 if __name__ == "__main__":

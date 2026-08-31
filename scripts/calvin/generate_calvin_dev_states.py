@@ -471,57 +471,69 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    inputs = authenticate_dev_inputs(
-        args.training_root,
-        args.normalization,
-        args.source_root,
-        args.revision_file,
-    )
-    replay_manifest, replays = load_replay_bundle(args.replay_bundle, inputs)
-    task_oracle = instantiate_task_oracle(
-        args.source_root,
-        task_oracle_bytes=inputs.source_files["task_oracle.yaml"],
-    )
-
-    def environment_factory(scene: str) -> Any:
-        return instantiate_abc_environment(
+    # Keep fd 1 on stderr through native simulator teardown and write the one
+    # machine-readable report directly to a duplicate of the original stdout.
+    sys.stdout.flush()
+    report_descriptor = os.dup(sys.stdout.fileno())
+    try:
+        os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    except BaseException:
+        os.close(report_descriptor)
+        raise
+    try:
+        inputs = authenticate_dev_inputs(
             args.training_root,
+            args.normalization,
             args.source_root,
-            scene,
-            merged_config_bytes=inputs.metadata["training/.hydra/merged_config.yaml"],
-            scene_config_bytes=inputs.source_files["scene/" + scene + ".yaml"],
+            args.revision_file,
+        )
+        replay_manifest, replays = load_replay_bundle(args.replay_bundle, inputs)
+        task_oracle = instantiate_task_oracle(
+            args.source_root,
+            task_oracle_bytes=inputs.source_files["task_oracle.yaml"],
         )
 
-    materialized, rejections = materialize_replay_valid_resets(
-        replays,
-        task_oracle,
-        environment_factory,
-        args.base_seed,
-    )
-    manifest, artifacts = build_bank(
-        materialized,
-        inputs.identity,
-        inputs.split,
-        replay_manifest,
-        args.base_seed,
-        smoke_tasks_per_scene=args.smoke_tasks_per_scene,
-        rejections=rejections,
-    )
-    write_bank_exclusive(args.output_dir, manifest, artifacts)
-    print(
-        json.dumps(
-            {
-                "bank": str(args.output_dir.resolve()),
-                "records": len(manifest["records"]),
-                "rejections": len(manifest["rejections"]),
-                "root_sha256": manifest["root_sha256"],
-                "scenes": list(ABC_SCENES),
-                "smoke_resets": len(manifest["selection"]["smoke_reset_indices"]),
-                "status": "ok",
-            },
-            sort_keys=True,
+        def environment_factory(scene: str) -> Any:
+            return instantiate_abc_environment(
+                args.training_root,
+                args.source_root,
+                scene,
+                merged_config_bytes=inputs.metadata["training/.hydra/merged_config.yaml"],
+                scene_config_bytes=inputs.source_files["scene/" + scene + ".yaml"],
+            )
+
+        materialized, rejections = materialize_replay_valid_resets(
+            replays,
+            task_oracle,
+            environment_factory,
+            args.base_seed,
         )
-    )
+        manifest, artifacts = build_bank(
+            materialized,
+            inputs.identity,
+            inputs.split,
+            replay_manifest,
+            args.base_seed,
+            smoke_tasks_per_scene=args.smoke_tasks_per_scene,
+            rejections=rejections,
+        )
+        write_bank_exclusive(args.output_dir, manifest, artifacts)
+        report = {
+            "bank": str(args.output_dir.resolve()),
+            "records": len(manifest["records"]),
+            "rejections": len(manifest["rejections"]),
+            "root_sha256": manifest["root_sha256"],
+            "scenes": list(ABC_SCENES),
+            "smoke_resets": len(manifest["selection"]["smoke_reset_indices"]),
+            "status": "ok",
+        }
+        payload = (json.dumps(report, sort_keys=True) + "\n").encode("utf-8")
+        while payload:
+            written = os.write(report_descriptor, payload)
+            require(written > 0, "development reset generator report write made no progress")
+            payload = payload[written:]
+    finally:
+        os.close(report_descriptor)
 
 
 if __name__ == "__main__":

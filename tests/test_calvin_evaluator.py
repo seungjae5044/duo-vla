@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import shutil
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -1656,6 +1657,120 @@ def test_journal_rejects_complete_run_inode_substitution_during_post_guard(
     assert guard_calls == 3
     assert run["status"] == "failed"
     assert "complete run JSON" in run["error"]["message"]
+
+
+def _run_stdout_isolation_harness(mode: str, outcome: str) -> subprocess.CompletedProcess[str]:
+    if mode == "infrastructure":
+        argv = ["--mode", mode, "--dataset-root", "/dataset"]
+    else:
+        argv = [
+            "--mode",
+            mode,
+            "--dataset-root",
+            "/dataset",
+            "--execution-horizon",
+            "4",
+            "--socket",
+            "/policy.sock",
+            "--output-dir",
+            "/output",
+            "--preregistration-manifest",
+            "/frozen.json",
+            "--preregistration-sha256",
+            "a" * 64,
+            "--cell-id",
+            "cell",
+            "--final-freeze-token",
+            "frozen",
+            "--policy-warmup-calls",
+            "2",
+        ]
+    harness = f"""
+import os
+import sys
+
+sys.path.insert(0, {str(CALVIN_SCRIPTS)!r})
+import evaluate_calvin as evaluator
+
+evaluator._require_evaluator_sources_unchanged = lambda _expected: None
+evaluator._preflight.require_canonical_evaluator_runtime = lambda: None
+evaluator.platform.python_version = lambda: evaluator.PYTHON_VERSION
+
+def run_mode(*_args):
+    os.write(1, b"native-before-report\\n")
+    if {outcome!r} == "mode-failure":
+        raise RuntimeError("simulated mode failure")
+    if {outcome!r} == "serialization-failure":
+        return {{"mode": {mode!r}, "value": float("nan")}}
+    return {{"mode": {mode!r}, "status": "ok"}}
+
+evaluator.run_infrastructure_mode = run_mode
+evaluator.run_official_score_mode = run_mode
+try:
+    evaluator.main({argv!r})
+except BaseException:
+    if {outcome!r} == "success":
+        raise
+    os.write(1, b"native-after-main\\n")
+else:
+    if {outcome!r} != "success":
+        raise RuntimeError("expected evaluator failure")
+    os.write(1, b"native-after-main\\n")
+"""
+    return subprocess.run(
+        [sys.executable, "-c", harness],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_main_help_remains_on_stdout_before_report_isolation() -> None:
+    harness = f"""
+import sys
+
+sys.path.insert(0, {str(CALVIN_SCRIPTS)!r})
+import evaluate_calvin as evaluator
+
+evaluator._require_evaluator_sources_unchanged = lambda _expected: None
+evaluator._preflight.require_canonical_evaluator_runtime = lambda: None
+evaluator.main(["--help"])
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", harness],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.startswith("usage:")
+    assert "usage:" not in completed.stderr
+
+
+@pytest.mark.parametrize("mode", ["infrastructure", "official-score"])
+def test_main_reserves_stdout_for_one_json_report_through_native_teardown(mode: str) -> None:
+    completed = _run_stdout_isolation_harness(mode, "success")
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == json.dumps({"mode": mode, "status": "ok"}, indent=2, sort_keys=True) + "\n"
+    assert "native-before-report\n" in completed.stderr
+    assert "native-after-main\n" in completed.stderr
+
+
+@pytest.mark.parametrize("mode", ["infrastructure", "official-score"])
+@pytest.mark.parametrize("outcome", ["mode-failure", "serialization-failure"])
+def test_main_failure_paths_emit_no_stdout_and_keep_native_teardown_on_stderr(mode: str, outcome: str) -> None:
+    completed = _run_stdout_isolation_harness(mode, outcome)
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == ""
+    assert "native-before-report\n" in completed.stderr
+    assert "native-after-main\n" in completed.stderr
 
 
 def test_mode_arguments_make_official_score_opt_in() -> None:
