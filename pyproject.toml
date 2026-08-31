@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "duo-vla"
+version = "0.1.0"
+description = "Continuous-action rectified-flow policy built on DiffusionGemma"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "numpy>=1.26,<3",
+    "torch>=2.5,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9",
+    "ruff>=0.11,<1",
+]
+data = [
+    "pyarrow==20.0.0",
+]
+train = [
+    "accelerate==1.14.0",
+    "huggingface-hub==1.29.0",
+    "peft==0.20.0",
+    "pillow>=11,<13",
+    "safetensors==0.8.0",
+    "tokenizers==0.22.2",
+    "torch==2.13.0",
+    "torchvision==0.28.0",
+    "transformers==5.15.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/duo_vla"]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

@@ -1,0 +1,116 @@
+{
+  "created_at_utc": "2026-08-30T01:22:42Z",
+  "execution_geometry": {
+    "expert_batch_isolation": "sample_isolated_grouped_mm_v1",
+    "experts_implementation": "grouped_mm",
+    "fixed_physical_prefix_width": 545,
+    "physical_batch_size": 8,
+    "prefix_geometry_content_sha256": "cc907e22ccd5ae704767edba606233dede39989a119ac544764b47aaa4fbe634"
+  },
+  "independent_validation": {
+    "full_pytest": {
+      "passed": 402,
+      "status": "pass"
+    },
+    "libero_auditor_broad": {
+      "passed": 95,
+      "status": "pass"
+    },
+    "libero_auditor_focused": {
+      "passed": 48,
+      "status": "pass"
+    },
+    "ruff_check": "pass",
+    "ruff_format_check": "pass",
+    "shell_syntax": "pass"
+  },
+  "qualification": "libero-fixed-b8-strict-training-and-serving-determinism",
+  "schema": "duo-vla-qualification-report-v1",
+  "serving_restart_equivalence": {
+    "action": {
+      "dtype": "float32",
+      "finite": true,
+      "sha256": "91e34e14a7873187f409bdd09a1df01ad0bd0abac92d7d8d008187f8a98170c4",
+      "shape": [
+        8,
+        7
+      ]
+    },
+    "checkpoint_manifest_sha256": "f45f631a105e9ea6897e26fc107913291e6224568f4b6bc34881b583a07e8ddd",
+    "inference_request": {
+      "evaluation_seed": 0,
+      "execution_horizon": 1,
+      "inference_seed": 9060445470447606341,
+      "instruction": "pick up the alphabet soup and place it in the basket",
+      "nfe": 10,
+      "replan_id": 0,
+      "reset_id": 0,
+      "reset_source": "official",
+      "suite": "libero_spatial",
+      "task_id": 0,
+      "train_seed": 0,
+      "zero_agentview_rgb": true,
+      "zero_state": true,
+      "zero_wrist_rgb": true
+    },
+    "preflight": "pass",
+    "processes": 2,
+    "serving_runtime_sha256": "dba1fcb27b576ccf8a907cb7ae235b66f541a73b808b9cfdec26b084d3287cb5",
+    "status": "bitwise-equal-across-process-restarts",
+    "tp_rank_output_gate": "pass"
+  },
+  "source_tree_sha256": "2389dfdc04acc4b805da8c69f7b0ce6a6bfbeb1042855314c9c24fa6d0050038",
+  "status": "pass",
+  "training_restart_equivalence": {
+    "execution_environment_sha256": "b85c9f30608a6972679d7195dcbba2ed38fbd765bec1b467a498c63d09e70fc1",
+    "interrupted_then_resumed": {
+      "run_path": "/root/.cache/duo-vla/runs/libero-fixed-b8-resume-strict-v4-20260830",
+      "update_1": {
+        "examples_seen": 64,
+        "gradient_norm": 73.98223876953125,
+        "train_loss": 1.3000499600432847
+      },
+      "update_2": {
+        "examples_seen": 128,
+        "gradient_norm": 87.04121398925781,
+        "train_loss": 2.2103736394283873
+      }
+    },
+    "logical_rank_state_comparison": {
+      "ignored_fields": [
+        "run_contract.run_uuid"
+      ],
+      "rank_0": {
+        "differences": 0,
+        "tensor_bytes": 200147352,
+        "tensors": 735
+      },
+      "rank_1": {
+        "differences": 0,
+        "tensor_bytes": 200147352,
+        "tensors": 735
+      }
+    },
+    "uninterrupted": {
+      "run_path": "/root/.cache/duo-vla/runs/libero-fixed-b8-uninterrupted-strict-v4-20260830",
+      "update_1": {
+        "examples_seen": 64,
+        "gradient_norm": 73.98223876953125,
+        "train_loss": 1.3000499600432847
+      },
+      "update_2": {
+        "examples_seen": 128,
+        "gradient_norm": 87.04121398925781,
+        "train_loss": 2.2103736394283873
+      }
+    },
+    "update_2_artifacts": {
+      "interface_safetensors_sha256": "4168be536764e48a20d128b425b12ba587654c4fdf5efde4629eaa2fb573695d",
+      "lora_adapter_safetensors_sha256": "47806baaf16caedb7c5455d9c7fb96517027ec3f9a6938a196d7ddacd4ba0c0e",
+      "replicated_optimizer_sha256": "39f5406980eaec0daf4a09665a84c28ac5066b1a7589146dcd3ecbf51bd60f26",
+      "replicated_parameter_sha256": "d481ea7c8c93bba156bca18e1228a0268f742d19f0d65d41367d12839c83658b",
+      "resolved_config_sha256": "bb4e27f734d1bfc889c7fe0109105b11282445a3e5c7673860bb46454f35413e"
+    },
+    "update_2_status": "bitwise-equal-excluding-run-identity-and-wall-clock-metadata"
+  }
+}

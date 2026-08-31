@@ -1,0 +1,64 @@
+{
+  "archive_contract": {
+    "expected_bytes": 555309812705,
+    "expected_sha256": "c2036c67eb4c06966af1d1e1665bdb572c69e1404f5e77ffd46b384ff2b79f74",
+    "http_accept_ranges": "bytes",
+    "http_content_length": 555309812705,
+    "http_last_modified": "Thu, 15 Sep 2022 17:47:47 GMT",
+    "url": "http://calvin.cs.uni-freiburg.de/dataset/task_ABC_D.zip"
+  },
+  "created_at_utc": "2026-08-30T01:50:40Z",
+  "disk_projection_at_scan": {
+    "archive_allocated_bytes": 307667107840,
+    "archive_download_percent": 55.40,
+    "available_bytes": 1022084636672,
+    "available_bytes_after_completed_archive": 774441931807,
+    "available_bytes_after_completed_archive_and_payload": 216323364412,
+    "extraction_reserve_bytes": 161061273600,
+    "margin_above_extraction_reserve_bytes": 55262090812
+  },
+  "local_archive_status": "download-in-progress-not-yet-sha256-verified",
+  "remote_zip64_central_directory": {
+    "compressed_payload_bytes": 554896672329,
+    "compression_methods": {
+      "deflate_files": 1894106,
+      "stored_directories": 20
+    },
+    "compression_ratio_uncompressed_over_compressed": 1.0058062973282524,
+    "directory_entries": 20,
+    "entries": 1894126,
+    "file_entries": 1894106,
+    "maximum_path_bytes": 70,
+    "maximum_path_components": 3,
+    "offset": 555080601096,
+    "sha256": "b4f79bda7f6b966b51aa419badd0f7db7a8972a7b58d6d342af60aceff0ea31b",
+    "size": 229211511,
+    "suffix_counts": {
+      ".npy": 29,
+      ".npz": 1894067,
+      ".yaml": 10
+    },
+    "uncompressed_payload_bytes": 558118567395
+  },
+  "remote_zip64_member_safety_scan": {
+    "decoded_names_unique": 1894126,
+    "encrypted_entries": 0,
+    "extraction_names_unique": 1894126,
+    "extra_field_ids": {
+      "0x0001_zip64": 1879436,
+      "0x5455_extended_timestamp": 1894126,
+      "0x7875_unix_uid_gid": 1894126
+    },
+    "file_directory_namespace_collisions": 0,
+    "general_purpose_flags_nonzero": 0,
+    "non_ascii_names": 0,
+    "non_regular_or_symlink_entries": 0,
+    "path_violations": 0,
+    "unicode_path_0x7075_entries": 0,
+    "unicode_path_name_differences": 0,
+    "utf8_flagged_names": 0,
+    "violations": 0
+  },
+  "schema": "duo-vla-calvin-archive-readiness-v1",
+  "status": "ready-for-pinned-download-verification-and-staged-extraction"
+}

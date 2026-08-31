@@ -1,0 +1,17 @@
+extends = "calvin_abc_to_d.toml"
+
+[policy]
+objective = "direct_regression"
+sampler = "single_forward"
+nfe = 1
+inference_seed_behavior = "episode_identity_echo_only"
+
+[action]
+flow_steps = 1
+
+[sampling]
+flow_path = "none"
+timestep_distribution = "fixed_one"
+integrator = "single_forward"
+clip_intermediate_actions = false
+clip_final_normalized_actions = true

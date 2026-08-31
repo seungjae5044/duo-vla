@@ -1,0 +1,49 @@
+{
+  "checkpoint": {
+    "execution_environment_sha256": "b85c9f30608a6972679d7195dcbba2ed38fbd765bec1b467a498c63d09e70fc1",
+    "manifest_sha256": "aba3c517fae5ef7e863ff89df06431a21c6b580614eceb75228ca35a149356f9",
+    "path": "/root/.cache/duo-vla/runs/libero-direct-fixed-b8-strict-smoke-v1-20260830/checkpoints/update-000001",
+    "policy_contract_sha256": "24e42a832d1a47843a58c163545f504d9a92db12d0686712c40289ec388a0999",
+    "replicated_optimizer_sha256": "eef67522c99a9e24269b14415cb823372e11ae17dd3b4f8c11f8f5c9b109057e",
+    "replicated_parameter_sha256": "fdd20bf0957ae9d071b0cad75ac31a1bede8f92896780a481982010ee0024f18",
+    "source_tree_sha256": "2389dfdc04acc4b805da8c69f7b0ce6a6bfbeb1042855314c9c24fa6d0050038"
+  },
+  "execution_geometry": {
+    "expert_batch_isolation": "sample_isolated_grouped_mm_v1",
+    "experts_implementation": "grouped_mm",
+    "fixed_physical_prefix_width": 545,
+    "physical_batch_size": 8,
+    "prefix_geometry_content_sha256": "cc907e22ccd5ae704767edba606233dede39989a119ac544764b47aaa4fbe634"
+  },
+  "qualification": "libero-direct-regression-fixed-b8-strict-technical-smoke",
+  "schema": "duo-vla-qualification-report-v1",
+  "serving": {
+    "action_dtype": "float32",
+    "action_finite": true,
+    "action_sha256": "dba8dc8529188984336c329281e150b17b2d63d09a9c62ca559d73aa8c48a5bd",
+    "action_shape": [
+      8,
+      7
+    ],
+    "inference_seed": 9060445470447606341,
+    "nfe": 1,
+    "objective": "direct_regression",
+    "preflight": "pass",
+    "processes": 2,
+    "sampler": "single_forward",
+    "serving_runtime_sha256": "5f882f2df47d268dbf28fd4ddb009543b40954a733e2e4e338eb3892c0a5e54c",
+    "restart_status": "bitwise-equal-across-process-restarts",
+    "tp_rank_output_gate": "pass"
+  },
+  "status": "pass",
+  "training": {
+    "examples_seen": 64,
+    "gradient_norm": 9.050121307373047,
+    "objective": "direct_regression",
+    "peak_memory_gib": 26.8826584815979,
+    "run_path": "/root/.cache/duo-vla/runs/libero-direct-fixed-b8-strict-smoke-v1-20260830",
+    "train_loss": 0.273766724623241,
+    "update": 1
+  },
+  "warning": "This one-update run is a technical path smoke, not a policy-quality comparison."
+}

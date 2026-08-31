@@ -1,0 +1,28 @@
+# Exact versions exercised by scripts/calvin/preflight.py. The two PyTorch
+# wheels are installed from PyTorch's CPU index by bootstrap_env.sh.
+GitPython==3.1.44
+PyYAML==6.0.3
+cloudpickle==2.2.1
+gym==0.23.1
+hydra-colorlog==1.1.0
+hydra-core==1.1.1
+lightning-utilities==0.3.0
+matplotlib==3.7.5
+numba==0.58.1
+numpy-quaternion==2023.0.4
+numpy==1.24.4
+omegaconf==2.1.2
+opencv-python-headless==4.8.1.78
+pandas==2.0.3
+pybullet==3.2.6
+pyhash==0.9.3
+pytorch-lightning==1.8.6
+rich==13.9.4
+scipy==1.10.1
+setuptools==57.5.0
+tensorboardX==2.6.2.2
+termcolor==2.4.0
+torch==1.13.1+cpu
+torchmetrics==0.11.4
+torchvision==0.14.1+cpu
+wheel==0.38.4

@@ -1,0 +1,73 @@
+[model]
+id = "google/diffusiongemma-26B-A4B-it"
+revision = "f7f5b7f5fa82ffc52addd066915886d497f5517b"
+dtype = "bfloat16"
+tensor_parallel_size = 2
+attention_implementation = "sdpa"
+
+[policy]
+objective = "rectified_flow"
+sampler = "euler_uniform"
+nfe = 10
+inference_seed_behavior = "episode_identity_gaussian_noise"
+
+[action]
+horizon = 8
+dimension = 7
+flow_steps = 10
+timestep_embedding_dimension = 256
+timestep_scale = 1000.0
+timestep_max_period = 10000.0
+conditioning_mlp_activation = "silu"
+output_head_initialization_std = 1e-3
+
+[lora]
+rank = 16
+alpha = 32
+dropout = 0.0
+projections = ["q_proj", "k_proj", "v_proj", "o_proj"]
+scope = "decoder_self_attention_only"
+
+[optimization]
+optimizer = "adamw"
+lora_learning_rate = 1e-4
+interface_learning_rate = 1e-3
+global_batch_size = 64
+microbatch_size = 1
+gradient_accumulation_steps = 64
+adam_beta1 = 0.9
+adam_beta2 = 0.95
+adam_epsilon = 1e-8
+weight_decay = 1e-10
+gradient_clip_norm = 1.0
+tensor_parallel_gradient_norm = "replicas_once_plus_all_shards"
+loss_accumulation_dtype = "float32"
+total_updates = 30000
+schedule = "linear_warmup_cosine_decay"
+warmup_updates = 1000
+final_learning_rate_scale = 0.1
+ema_decay = 0.0
+
+[training]
+validation_episode_fraction = 0.1
+validation_split_seed = 1729
+validation_interval = 1000
+validation_samples = 2048
+checkpoint_interval = 1000
+permanent_checkpoint_interval = 5000
+log_interval = 50
+data_loader_workers_per_rank = 4
+image_augmentation = "none"
+seeds = [0, 1, 2]
+
+[sampling]
+flow_path = "linear"
+timestep_distribution = "uniform"
+integrator = "euler"
+clip_intermediate_actions = false
+clip_final_normalized_actions = true
+
+[reproducibility]
+seed = 0
+deterministic_evaluation = true
+save_trainable_weights_only = true

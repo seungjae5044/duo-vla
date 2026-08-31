@@ -1,0 +1,58 @@
+{
+  "primary_reporting_rule": {
+    "clean_holdout_episodes_per_policy_seed_k": 1999,
+    "exclude_symmetrically_across": [
+      "policy_objective",
+      "flow_nfe",
+      "execution_horizon",
+      "training_seed"
+    ],
+    "excluded_cells": [
+      {
+        "init_state_id": 0,
+        "suite": "libero_goal",
+        "task_id": 7,
+        "task_name": "turn_on_the_stove"
+      }
+    ],
+    "official_2000_episode_result_label": "non_blind_full_set_comparability_only"
+  },
+  "records": [
+    {
+      "benchmark": "LIBERO",
+      "checkpoint_manifest_sha256": "1d7587dded7905e0b26ca20f12f962e14cc06fe281822850c94cc579e6812c20",
+      "checkpoint_update": 100,
+      "downstream_decisions_influenced": [
+        "continue the single-task flow pilot beyond update 100",
+        "retain normalized clip fraction as a bring-up diagnostic",
+        "implement and validate the direct-regression comparison contract before scaling"
+      ],
+      "flow_nfe": 10,
+      "init_state_id": 0,
+      "objective": "rectified_flow",
+      "observations": [
+        {
+          "created_utc": "2026-08-29T12:34:35.183610+00:00",
+          "episodes_sha256": "6efaf1fc059a9696043f89a603e8c7f4163365cc32889ecc03c80894e56cd000",
+          "execution_horizon": 4,
+          "normalized_action_clip_fraction": 0.3747619245449702,
+          "success": false,
+          "summary_sha256": "0524de93c0d7bb7339c41c78b9ff9eff08dd021d0e14625e7cc19108b13fe0da"
+        },
+        {
+          "created_utc": "2026-08-29T12:37:25.657445+00:00",
+          "episodes_sha256": "9f9580960bd3b717f9c1a7c23bc4b0e9ca66c17e63ed664c9140edd726e23b46",
+          "execution_horizon": 1,
+          "normalized_action_clip_fraction": 0.3730357331534227,
+          "success": false,
+          "summary_sha256": "cc8da9219ed52b943daf76a43861c2b8cd9b7823fbdb578dc038c85f955d531f"
+        }
+      ],
+      "suite": "libero_goal",
+      "task_id": 7,
+      "task_name": "turn_on_the_stove",
+      "training_seed": 0
+    }
+  ],
+  "schema": "duo-vla-evaluation-contamination-v1"
+}

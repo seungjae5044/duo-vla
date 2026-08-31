@@ -1,0 +1,31 @@
+extends = "base.toml"
+protocol = "duovla-libero-v1"
+
+[model]
+experts_implementation = "grouped_mm"
+expert_batch_isolation = "sample_isolated_grouped_mm_v1"
+
+[optimization]
+physical_batch_size = 8
+microbatch_size = 8
+gradient_accumulation_steps = 8
+global_batch_size = 64
+
+[benchmark]
+dataset_id = "HuggingFaceVLA/libero"
+dataset_revision = "86958911c0f959db2bbbdb107eb3e17c5f9c798e"
+suites = ["libero_spatial", "libero_object", "libero_goal", "libero_10"]
+state_dimension = 8
+camera_order = ["agentview", "eye_in_hand"]
+execution_horizons = [1, 4]
+control_frequency_hz = 20
+environment_seed = 7
+final_episodes_per_task = 50
+prefix_geometry_content_sha256 = "cc907e22ccd5ae704767edba606233dede39989a119ac544764b47aaa4fbe634"
+fixed_physical_prefix_width = 545
+
+[benchmark.max_policy_steps]
+libero_spatial = 220
+libero_object = 280
+libero_goal = 300
+libero_10 = 520

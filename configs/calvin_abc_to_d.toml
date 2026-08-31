@@ -1,0 +1,33 @@
+extends = "base.toml"
+protocol = "duovla-calvin-abc-to-d-v1"
+
+[model]
+experts_implementation = "grouped_mm"
+expert_batch_isolation = "sample_isolated_grouped_mm_v1"
+
+[optimization]
+physical_batch_size = 8
+microbatch_size = 8
+gradient_accumulation_steps = 8
+global_batch_size = 64
+
+[benchmark]
+dataset = "task_ABC_D"
+prefix_geometry_content_sha256 = "edaef86df702e34c9be6c9103e4f3c9ccc4022df8def46df7d1f00084d0831c9"
+fixed_physical_prefix_width = 538
+train_split = "training"
+evaluation_split = "validation"
+train_environments = ["A", "B", "C"]
+evaluation_environment = "D"
+state_dimension = 8
+camera_order = ["rgb_static", "rgb_gripper"]
+execution_horizons = [1, 4]
+control_frequency_hz = 30
+num_sequences = 1000
+subtasks_per_sequence = 5
+max_steps_per_subtask = 360
+evaluation_seed = 0
+
+[training]
+data_loader_workers_per_rank = 0
+permanent_checkpoint_interval = 1000
