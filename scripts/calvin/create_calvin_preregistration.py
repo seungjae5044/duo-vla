@@ -122,6 +122,7 @@ from evaluate_calvin import (
     OFFICIAL_TRAIN_SEEDS,
     PREREGISTRATION_SCHEMA,
     PROTOCOL,
+    SINGLE_GPU_PREREGISTRATION_SCHEMA,
     SEQUENCE_SHA256,
     SUBTASKS_PER_SEQUENCE,
     SUPPORTED_EXECUTION_HORIZONS,
@@ -282,6 +283,10 @@ def build_manifest(
             }
         )
     cells.sort(key=_canonical_cell_sort_key)
+    execution_geometries = {canonical_json_bytes(cell["execution_geometry"]) for cell in cells}
+    require(len(execution_geometries) == 1, "all official cells must share one execution geometry")
+    single_gpu = cells[0]["execution_geometry"].get("tensor_parallel_size", 2) == 1
+    preregistration_schema = SINGLE_GPU_PREREGISTRATION_SCHEMA if single_gpu else PREREGISTRATION_SCHEMA
     manifest = {
         "aggregation_python_version": PYTHON_VERSION,
         "aggregator_sha256": aggregator_sha256,
@@ -297,7 +302,7 @@ def build_manifest(
         "policy_warmup_calls": policy_warmup_calls,
         "official_output_roots": roots,
         "runtime_attestation_sha256": attestation_sha256,
-        "schema": PREREGISTRATION_SCHEMA,
+        "schema": preregistration_schema,
         "sequence_count": NUM_SEQUENCES,
         "sequence_sha256": SEQUENCE_SHA256,
         "sequences": sequences,

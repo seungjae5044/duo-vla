@@ -15,7 +15,7 @@ fi
 
 if [[ ! -d "$source_root/.git" ]]; then
   mkdir -p "$(dirname -- "$source_root")"
-  git clone --filter=blob:none --no-checkout "$CALVIN_REPOSITORY_URL" "$source_root"
+  git clone --filter=blob:none "$CALVIN_REPOSITORY_URL" "$source_root"
 fi
 
 actual_remote=$(git -C "$source_root" remote get-url origin)

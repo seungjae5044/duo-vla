@@ -68,6 +68,90 @@ def test_noop_filter_matches_previous_retained_action_contract() -> None:
         EVIDENCE.retained_action_indices(np.zeros((2, EVIDENCE.ACTION_DIM), dtype=np.float32))
 
 
+def test_controller_direction_gate_allows_small_composition_leakage_only() -> None:
+    assert COLLECTOR._controller_direction_matches(1.0, 0.05, 7e-5)
+    assert COLLECTOR._controller_direction_matches(-1.0, -0.5, 0.0025)
+    assert not COLLECTOR._controller_direction_matches(1.0, -0.05, 0.0)
+    assert not COLLECTOR._controller_direction_matches(1.0, 0.5, 0.006)
+
+
+def test_observation_alignment_features_accept_small_drift_and_reject_camera_swap() -> None:
+    width = EVIDENCE.OBSERVATION_ALIGNMENT_GRID_SIZE**2 * 3
+    simulator_frame = {
+        "agentview_block_means": list(range(width)),
+        "state": [0.0] * EVIDENCE.STATE_DIM,
+        "wrist_block_means": list(reversed(range(width))),
+    }
+    dataset_frame = {
+        "agentview_block_means": [min(value + 1, 255) for value in simulator_frame["agentview_block_means"]],
+        "state": [0.01] * EVIDENCE.STATE_DIM,
+        "wrist_block_means": [max(value - 1, 0) for value in simulator_frame["wrist_block_means"]],
+    }
+    features = {
+        "frames": [simulator_frame],
+        "grid_size": EVIDENCE.OBSERVATION_ALIGNMENT_GRID_SIZE,
+        "schema": EVIDENCE.OBSERVATION_ALIGNMENT_FEATURE_SCHEMA,
+    }
+    assert EVIDENCE.validate_observation_alignment_metrics(
+        EVIDENCE.observation_alignment_metrics(features, [dataset_frame])
+    )["passed"]
+
+    swapped = {
+        **dataset_frame,
+        "agentview_block_means": dataset_frame["wrist_block_means"],
+        "wrist_block_means": dataset_frame["agentview_block_means"],
+    }
+    assert not EVIDENCE.observation_alignment_metrics(features, [swapped])["passed"]
+
+
+def test_observation_alignment_features_reject_one_frame_state_shift() -> None:
+    width = EVIDENCE.OBSERVATION_ALIGNMENT_GRID_SIZE**2 * 3
+    frames = [
+        {
+            "agentview_block_means": list(range(width)),
+            "state": [0.01 * index] * EVIDENCE.STATE_DIM,
+            "wrist_block_means": list(reversed(range(width))),
+        }
+        for index in range(3)
+    ]
+    features = {
+        "frames": frames,
+        "grid_size": EVIDENCE.OBSERVATION_ALIGNMENT_GRID_SIZE,
+        "schema": EVIDENCE.OBSERVATION_ALIGNMENT_FEATURE_SCHEMA,
+    }
+    assert EVIDENCE.observation_alignment_metrics(features, frames)["passed"]
+    shifted = frames[1:] + frames[-1:]
+    assert not EVIDENCE.observation_alignment_metrics(features, shifted)["passed"]
+
+
+def test_simulator_environment_mutations_are_exactly_restored(monkeypatch: pytest.MonkeyPatch) -> None:
+    module_root = Path("/pinned/eval/lib/python3.12/site-packages/cv2")
+    monkeypatch.setitem(sys.modules, "cv2", SimpleNamespace(__file__=str(module_root / "__init__.py")))
+    expected = {
+        "LD_LIBRARY_PATH": f"{module_root / '../../lib64'}:",
+        "PYGAME_HIDE_SUPPORT_PROMPT": "hide",
+        "QT_QPA_FONTDIR": str(module_root / "qt/fonts"),
+        "QT_QPA_PLATFORM_PLUGIN_PATH": str(module_root / "qt/plugins"),
+    }
+    for name, value in expected.items():
+        monkeypatch.setenv(name, value)
+
+    COLLECTOR._restore_authenticated_simulator_environment_mutations()
+
+    assert not set(expected) & set(os.environ)
+
+
+def test_simulator_environment_mutations_reject_injected_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    module_root = Path("/pinned/eval/lib/python3.12/site-packages/cv2")
+    monkeypatch.setitem(sys.modules, "cv2", SimpleNamespace(__file__=str(module_root / "__init__.py")))
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/untrusted")
+    monkeypatch.setenv("PYGAME_HIDE_SUPPORT_PROMPT", "hide")
+    monkeypatch.setenv("QT_QPA_FONTDIR", str(module_root / "qt/fonts"))
+    monkeypatch.setenv("QT_QPA_PLATFORM_PLUGIN_PATH", str(module_root / "qt/plugins"))
+    with pytest.raises(EVIDENCE.ReplayEvidenceError, match="authenticated wheel loaders"):
+        COLLECTOR._restore_authenticated_simulator_environment_mutations()
+
+
 def test_action_and_observation_digests_are_canonical_and_order_sensitive() -> None:
     actions = np.arange(21, dtype=np.float64).reshape(3, 7) / 10.0
     assert EVIDENCE.action_sequence_sha256(actions) == EVIDENCE.action_sequence_sha256(actions.astype(np.float32))
@@ -289,9 +373,9 @@ def test_replay_seeds_once_and_dispatches_source_precision_without_float32_round
     assert replay["action_sequence_sha256"] == EVIDENCE.action_sequence_sha256(action.astype(np.float32))
 
 
-def test_first_success_replay_consumes_demo_resets_in_order_without_reseeding(monkeypatch) -> None:
+def test_first_training_linked_success_consumes_demo_resets_in_order_without_reseeding(monkeypatch) -> None:
     monkeypatch.setattr(COLLECTOR, "canonical_proprioceptive_state", lambda observation: observation["fake_state"])
-    environment = _FakeReplayEnvironment([False, True])
+    environment = _FakeReplayEnvironment([True, True])
     COLLECTOR._seed_environment(environment)
     first_action = np.asarray([[0.25, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0]], dtype=np.float64)
     second_action = np.asarray([[0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]], dtype=np.float64)
@@ -313,11 +397,12 @@ def test_first_success_replay_consumes_demo_resets_in_order_without_reseeding(mo
         ]
     }
 
-    attempts, selected = COLLECTOR._replay_first_success(
+    attempts, selected = COLLECTOR._replay_first_training_linked_success(
         environment,
         data,
         ("demo_0", "demo_1"),
         scan,
+        frozenset({1}),
         suite="libero_spatial",
         task_id=0,
     )
@@ -325,7 +410,8 @@ def test_first_success_replay_consumes_demo_resets_in_order_without_reseeding(mo
     assert environment.events.count("seed:0") == 1
     assert environment.events.count("reset") == 2
     assert [attempt["source_episode_index"] for attempt in attempts] == [0, 1]
-    assert [attempt["success"] for attempt in attempts] == [False, True]
+    assert [attempt["success"] for attempt in attempts] == [True, True]
+    assert [attempt["training_linked"] for attempt in attempts] == [False, True]
     assert selected["source_episode_index"] == 1
 
 
@@ -363,6 +449,12 @@ def test_pre_dispatch_integrity_controls_use_mutation_detected_semantics() -> No
 
 def _valid_simulator_task_document() -> dict[str, object]:
     digest = "a" * 64
+    alignment_width = EVIDENCE.OBSERVATION_ALIGNMENT_GRID_SIZE**2 * 3
+    alignment_frame = {
+        "agentview_block_means": list(range(alignment_width)),
+        "state": [0.0] * EVIDENCE.STATE_DIM,
+        "wrist_block_means": list(reversed(range(alignment_width))),
+    }
     return {
         "attempts": [
             {
@@ -370,6 +462,7 @@ def _valid_simulator_task_document() -> dict[str, object]:
                 "source_episode_index": 0,
                 "step_count": 1,
                 "success": True,
+                "training_linked": True,
             }
         ],
         "collector_source_sha256": "b" * 64,
@@ -397,6 +490,11 @@ def _valid_simulator_task_document() -> dict[str, object]:
             },
             "initial_state_sha256": digest,
             "inverted_gripper_action_sequence_sha256": "e" * 64,
+            "observation_alignment_features": {
+                "frames": [alignment_frame],
+                "grid_size": EVIDENCE.OBSERVATION_ALIGNMENT_GRID_SIZE,
+                "schema": EVIDENCE.OBSERVATION_ALIGNMENT_FEATURE_SCHEMA,
+            },
             "observation_sequence_sha256": digest,
             "source_episode_index": 0,
             "step_count": 1,
@@ -488,6 +586,7 @@ def test_collect_and_bind_launchers_are_closed_and_executable() -> None:
     for name, venv in (
         ("run_collect_libero_expert_replay.sh", "libero-eval"),
         ("run_bind_libero_expert_replay.sh", "train"),
+        ("run_bind_libero_expert_replay_single_gpu.sh", "train-single-gpu"),
         ("run_libero_preflight.sh", "libero-eval"),
     ):
         path = ROOT / "scripts" / name
@@ -502,8 +601,23 @@ def test_collect_and_bind_launchers_are_closed_and_executable() -> None:
         assert " -P -B -X pycache_prefix=/dev/null " in launcher
         assert f'readonly environment_path="${{cache_root}}/venvs/{venv}"' in launcher
         assert os.access(path, os.X_OK)
+    single_gpu_binder = (ROOT / "scripts/run_bind_libero_expert_replay_single_gpu.sh").read_text(encoding="utf-8")
+    assert "bootstrap_train_single_gpu_env.sh" in single_gpu_binder
     bootstrap = (ROOT / "scripts/bootstrap_libero_env.sh").read_text(encoding="utf-8")
     assert '"${project_dir}/scripts/run_libero_preflight.sh"' in bootstrap
+    assert 'readonly python_version="3.12.13"' in bootstrap
+    assert 'uv python install "${python_version}"' in bootstrap
+    assert 'uv sync --project "${project_dir}/envs/libero-eval" --python "${python_version}" --frozen' in bootstrap
+    assert 'external_metadata = destination.parents[1] / "download-metadata"' in bootstrap
+    downloader = (ROOT / "scripts/download_libero_original_hdf5.sh").read_text(encoding="utf-8")
+    assert 'readonly repository_id="yifengzhu-hf/LIBERO-datasets"' in downloader
+    assert 'readonly revision="f13aa24a3da8c43c7225569f28c562979fa0e35a"' in downloader
+    assert "mapfile -t expected_paths" in downloader
+    assert 'download "${repository_id}" "${expected_paths[@]}"' in downloader
+    assert "--include '*.hdf5'" not in downloader
+    assert "root contains out-of-scope files" in downloader
+    assert 'mv "${destination}/.cache" "${metadata}"' in downloader
+    assert os.access(ROOT / "scripts/download_libero_original_hdf5.sh", os.X_OK)
 
 
 def test_inventory_rejects_semantic_content_tampering() -> None:
@@ -616,7 +730,8 @@ else:
 
 
 def test_safe_path_ignores_scripts_json_shadow_and_valid_adjacent_poisoned_pyc(tmp_path: Path) -> None:
-    eval_python = Path("/root/.cache/duo-vla/venvs/libero-eval/bin/python")
+    cache_root = Path(os.environ.get("DUO_VLA_CACHE_ROOT", "/root/.cache/duo-vla"))
+    eval_python = cache_root / "venvs/libero-eval/bin/python"
     if not eval_python.is_file():
         pytest.skip("pinned libero-eval interpreter is unavailable")
     scripts = tmp_path / "scripts"
@@ -681,13 +796,13 @@ def test_safe_path_ignores_scripts_json_shadow_and_valid_adjacent_poisoned_pyc(t
 
 
 def test_python_side_runtime_rejects_manual_invocation_without_explicit_p_flag() -> None:
-    eval_python = Path("/root/.cache/duo-vla/venvs/libero-eval/bin/python")
+    cache_root = Path(os.environ.get("DUO_VLA_CACHE_ROOT", "/root/.cache/duo-vla"))
+    eval_python = cache_root / "venvs/libero-eval/bin/python"
     if not eval_python.is_file():
         pytest.skip("pinned libero-eval interpreter is unavailable")
-    cache_root = Path("/root/.cache/duo-vla")
     environment = {
         "DUO_VLA_CACHE_ROOT": str(cache_root),
-        "HF_HOME": "/root/.cache/huggingface",
+        "HF_HOME": os.environ.get("HF_HOME", "/root/.cache/huggingface"),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "LIBERO_CONFIG_PATH": str(cache_root / "simulators/libero/config"),

@@ -1,0 +1,14 @@
+extends = "calvin_abc_to_d_direct_single_gpu.toml"
+execution_profile = "duovla-calvin-tp1-fused-v2-train-b64-serve-b8-v1"
+
+[model]
+expert_batch_isolation = "sample_isolated_grouped_mm_v2"
+
+[optimization]
+physical_batch_size = 64
+microbatch_size = 64
+gradient_accumulation_steps = 1
+serving_batch_size = 8
+
+[training]
+max_cached_frames = 4096

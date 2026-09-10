@@ -1,0 +1,7 @@
+extends = "libero_single_gpu_fused_v2_b8.toml"
+execution_profile = "duovla-single-gpu-tp1-fused-v2-train-b64-serve-b8-v1"
+
+[optimization]
+physical_batch_size = 64
+microbatch_size = 64
+gradient_accumulation_steps = 1

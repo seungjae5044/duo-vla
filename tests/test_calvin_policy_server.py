@@ -229,6 +229,7 @@ def _training_execution_environment(*, seed: int = 1) -> dict[str, object]:
     }
     train_environment = {
         **SERVER.REQUIRED_TRAIN_ENVIRONMENT,
+        "CUDA_VISIBLE_DEVICES": "0,1",
         "DUO_VLA_CACHE_ROOT": "/root/.cache/duo-vla",
         "DUO_VLA_PROJECT_ROOT": str(ROOT),
         "DUO_VLA_TRAIN_VENV": str(train_prefix),
@@ -246,9 +247,9 @@ def _training_execution_environment(*, seed: int = 1) -> dict[str, object]:
         "static_environment_sha256": static_environment_identity(train_environment)["sha256"],
         "sys_path": [
             str((ROOT / "src").resolve()),
-            str(Path(SERVER.sys.base_prefix) / "lib" / f"{compact_version}.zip"),
-            str(Path(SERVER.sys.base_prefix) / "lib" / version),
-            str(Path(SERVER.sys.base_exec_prefix) / "lib" / version / "lib-dynload"),
+            str((Path(SERVER.sys.base_prefix) / "lib" / f"{compact_version}.zip").resolve()),
+            str((Path(SERVER.sys.base_prefix) / "lib" / version).resolve()),
+            str((Path(SERVER.sys.base_exec_prefix) / "lib" / version / "lib-dynload").resolve()),
             str(site_packages.resolve()),
         ],
         "torchrun": {
@@ -934,10 +935,10 @@ def _set_canonical_serving_environment(monkeypatch: pytest.MonkeyPatch, *, distr
         "path",
         [
             str((ROOT / "src").resolve()),
-            str(Path(SERVER.sys.base_prefix) / "lib" / f"{compact_version}.zip"),
-            str(Path(SERVER.sys.base_prefix) / "lib" / version),
-            str(Path(SERVER.sys.base_exec_prefix) / "lib" / version / "lib-dynload"),
-            f"/root/.cache/duo-vla/venvs/train/lib/{version}/site-packages",
+            str((Path(SERVER.sys.base_prefix) / "lib" / f"{compact_version}.zip").resolve()),
+            str((Path(SERVER.sys.base_prefix) / "lib" / version).resolve()),
+            str((Path(SERVER.sys.base_exec_prefix) / "lib" / version / "lib-dynload").resolve()),
+            str(Path(f"/root/.cache/duo-vla/venvs/train/lib/{version}/site-packages").resolve()),
         ],
     )
     for name, value in SERVER.REQUIRED_SERVING_ENVIRONMENT.items():
@@ -1193,6 +1194,36 @@ def test_launcher_enforces_train_env_and_tp2() -> None:
     assert '"PATH=/usr/bin:/bin"' in source
     assert '"CUDA_DEVICE_ORDER=PCI_BUS_ID"' in source
     assert '"CUDA_VISIBLE_DEVICES=0,1"' in source
+    assert '"PYTHONSAFEPATH=1"' in source
+    assert '"PYTHONDONTWRITEBYTECODE=1"' in source
+    assert '"PYTHONPYCACHEPREFIX=/dev/null"' in source
+    assert "-P -B -X pycache_prefix=/dev/null" in source
+    assert '"TORCH_NCCL_ASYNC_ERROR_HANDLING=1"' in source
+
+
+@pytest.mark.parametrize(
+    ("launcher", "environment", "visible_devices", "world_size"),
+    [
+        ("run_policy_server_dev.sh", "venvs/train", "0,1", 2),
+        ("run_policy_server_dev_single_gpu.sh", "venvs/train-single-gpu", "0", 1),
+    ],
+)
+def test_development_launcher_uses_closed_python_environment(
+    launcher: str,
+    environment: str,
+    visible_devices: str,
+    world_size: int,
+) -> None:
+    source = (CALVIN_SCRIPTS / launcher).read_text(encoding="utf-8")
+    assert environment in source
+    assert f"--nproc-per-node={world_size}" in source
+    assert "scripts/calvin/serve_policy_dev.py" in source
+    assert "--preflight-only" in source and "--fake-policy" in source
+    assert "exec /usr/bin/env -i" in source
+    assert "PYTHONPATH" not in source
+    assert '"PATH=/usr/bin:/bin"' in source
+    assert '"CUDA_DEVICE_ORDER=PCI_BUS_ID"' in source
+    assert f'"CUDA_VISIBLE_DEVICES={visible_devices}"' in source
     assert '"PYTHONSAFEPATH=1"' in source
     assert '"PYTHONDONTWRITEBYTECODE=1"' in source
     assert '"PYTHONPYCACHEPREFIX=/dev/null"' in source

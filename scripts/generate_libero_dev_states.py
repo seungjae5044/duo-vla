@@ -77,6 +77,58 @@ class GeneratedTaskBank:
     rejections: dict[str, int]
 
 
+class _StableHardResetEnvironment:
+    """Keep pinned LIBERO property samplers from accumulating across hard resets."""
+
+    def __init__(self, environment: Any) -> None:
+        self._environment = environment
+        domain = getattr(environment, "env", None)
+        require(domain is not None, "LIBERO environment is missing its pinned domain")
+        require(getattr(domain, "hard_reset", None) is True, "development-state sampling requires hard resets")
+        self._domain = domain
+        self._property_initializer_contract = self._initializer_contract()
+
+    def _initializer_contract(self) -> tuple[tuple[str, str, str, tuple[float, ...]], ...]:
+        initializers = getattr(self._domain, "object_property_initializers", None)
+        require(type(initializers) is list, "LIBERO object-property initializer storage changed")
+        result: list[tuple[str, str, str, tuple[float, ...]]] = []
+        for initializer in initializers:
+            name = getattr(initializer, "name", None)
+            state_type = getattr(initializer, "state_type", None)
+            joint_ranges = getattr(initializer, "joint_ranges", None)
+            require(type(name) is str and name, "LIBERO object-property initializer name changed")
+            require(type(state_type) is str and state_type, "LIBERO object-property initializer state type changed")
+            require(
+                isinstance(joint_ranges, (list, tuple)) and len(joint_ranges) == 2,
+                "LIBERO object-property initializer joint range changed",
+            )
+            result.append(
+                (
+                    f"{type(initializer).__module__}.{type(initializer).__qualname__}",
+                    name,
+                    state_type,
+                    tuple(float(value) for value in joint_ranges),
+                )
+            )
+        return tuple(result)
+
+    def reset(self) -> Any:
+        require(
+            self._initializer_contract() == self._property_initializer_contract,
+            "LIBERO object-property initializers drifted before hard reset",
+        )
+        self._domain.object_property_initializers.clear()
+        result = self._environment.reset()
+        require(
+            self._initializer_contract() == self._property_initializer_contract,
+            "LIBERO hard reset did not rebuild object-property initializers exactly once",
+        )
+        return result
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._environment, name)
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise RuntimeError(message)
@@ -273,7 +325,7 @@ def build_bank(
     task_records: list[dict[str, Any]] = []
     bank_hashes: set[str] = set()
     for inputs in task_inputs:
-        environment = environment_class(
+        raw_environment = environment_class(
             bddl_file_name=str(inputs.bddl_path),
             camera_heights=256,
             camera_widths=256,
@@ -281,6 +333,7 @@ def build_bank(
             control_freq=20,
             render_gpu_device_id=render_gpu_device_id,
         )
+        environment = _StableHardResetEnvironment(raw_environment)
         try:
             generated = generate_task_bank(
                 environment,
@@ -294,7 +347,7 @@ def build_bank(
                 bank_hashes=bank_hashes,
             )
         finally:
-            environment.close()
+            raw_environment.close()
         path = task_artifact_path(inputs.suite, inputs.task_id)
         data = deterministic_npy_bytes(generated.states)
         artifacts[path] = data

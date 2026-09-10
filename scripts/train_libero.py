@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resumable TP=2 Duo-VLA trainer for pinned LIBERO data."""
+"""Resumable distributed Duo-VLA trainer for pinned LIBERO data."""
 
 # ruff: noqa: E402 -- authenticate project sources before importing project code.
 
@@ -19,7 +19,7 @@ import site
 import stat
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -129,6 +129,11 @@ from duo_vla.backbones.sample_isolated_experts import (
     install_sample_isolated_grouped_mm_experts,
     verify_sample_isolated_grouped_mm_experts,
 )
+from duo_vla.backbones.sample_isolated_experts_v2 import (
+    SAMPLE_ISOLATED_GROUPED_MM_V2,
+    install_sample_isolated_grouped_mm_experts_v2,
+    verify_sample_isolated_grouped_mm_experts_v2,
+)
 from duo_vla.checkpointing import (
     load_checkpoint_manifest,
     load_interface_state_dict,
@@ -140,9 +145,20 @@ from duo_vla.data.batching import LiberoBatch, collate_libero_samples
 from duo_vla.data.libero import LiberoParquetDataset
 from duo_vla.data.libero_stats import LIBERO_DATASET_REVISION, load_libero_normalizers
 from duo_vla.data.sampling import LiberoAnchor, TaskUniformAnchorSampler
+from duo_vla.dp2_fork import (
+    DP2_FORK_CHECKPOINT_CONTRACT_FIELDS,
+    authenticate_dp2_child_environment,
+    authenticate_dp2_fork_parent,
+    dp2_fork_run_contract,
+    dp2_semantic_recipe_sha256,
+    has_dp2_checkpoint_lineage,
+    load_published_dp2_fork_manifest,
+    restore_tp1_fork_training_state,
+    validate_dp2_checkpoint_lineage,
+)
 from duo_vla.hf_snapshot import verify_huggingface_snapshot
 from duo_vla.modeling import DuoVLADenoiser
-from duo_vla.objectives import make_seeded_policy_training_pair
+from duo_vla.objectives import PolicyTrainingPair, make_seeded_policy_training_pair
 from duo_vla.optimization import (
     OptimizationConfig,
     assert_replicated_parameter_values,
@@ -178,11 +194,29 @@ from duo_vla.run_journal import (
 )
 from duo_vla.runtime_determinism import configure_strict_cuda_determinism, deterministic_torch_runtime
 from duo_vla.runtime_integrity import (
+    canonical_visible_cuda_world_size,
     content_address_train_venv,
     static_environment_identity,
     validate_torchrun_rank_environment,
 )
-from duo_vla.training import TrainerState, make_microbatch_plan, make_update_plan, masked_element_count, masked_sse
+from duo_vla.topology_fork import (
+    TOPOLOGY_FORK_CHECKPOINT_FIELDS,
+    authenticate_topology_child_environment,
+    authenticate_topology_fork_parent,
+    has_topology_fork_lineage,
+    load_published_topology_fork_manifest,
+    restore_topology_fork_training_state,
+    topology_fork_run_contract,
+    validate_topology_checkpoint_lineage,
+)
+from duo_vla.training import (
+    MicrobatchPlan,
+    TrainerState,
+    make_microbatch_plan,
+    make_update_plan,
+    masked_element_count,
+    masked_sse,
+)
 from duo_vla.training_checkpoint import (
     capture_rng_state,
     file_sha256,
@@ -195,15 +229,50 @@ from duo_vla.training_checkpoint import (
 
 _validate_project_module_origins({"duo_vla", "duo_vla.runtime_integrity"})
 
-PHYSICAL_BATCH_SIZE = 8
+CANONICAL_STREAM_BATCH_SIZE = 8
+CANONICAL_MICROSTEPS_PER_UPDATE = 8
+GLOBAL_BATCH_SIZE = CANONICAL_STREAM_BATCH_SIZE * CANONICAL_MICROSTEPS_PER_UPDATE
+SUPPORTED_PHYSICAL_BATCH_SIZES = frozenset({8, 16, 32, 64})
+DATA_PARALLEL_STRATEGY = "data_parallel"
+DATA_PARALLEL_PLAN_PARTITION = "contiguous-b8-chunks-by-rank"
+DATA_PARALLEL_GRADIENT_REDUCTION = "sum_globally_normalized_sse_gradients"
+DP2_DATA_PARALLEL_SIZE = 2
+DP2_TENSOR_PARALLEL_SIZE = 1
+DP2_RANK_PHYSICAL_BATCH_SIZE = 32
+DP2_MAX_CACHED_FILES = 377
+DP2_EXECUTION_PROFILE = "duovla-dp2-tp1-fused-v2-train-b32-serve-b8-v1"
+_DP2_FORK_ONLY_RUN_CONTRACT_FIELDS = DP2_FORK_CHECKPOINT_CONTRACT_FIELDS
+_DP2_FORK_RUN_CONTRACT_FIELDS = _DP2_FORK_ONLY_RUN_CONTRACT_FIELDS | {
+    "data_parallel_size",
+    "execution_profile",
+    "max_cached_files",
+    "run_uuid",
+    "source_tree_sha256",
+}
+# Retain the established public name for callers that need the canonical B8
+# stream width.  Runtime physical forwards may coalesce multiple such chunks.
+PHYSICAL_BATCH_SIZE = CANONICAL_STREAM_BATCH_SIZE
+DEFAULT_SERVING_BATCH_SIZE = CANONICAL_STREAM_BATCH_SIZE
 EXPERT_BATCH_ISOLATION = "sample_isolated_grouped_mm_v1"
+SUPPORTED_EXPERT_BATCH_ISOLATIONS = frozenset({EXPERT_BATCH_ISOLATION, SAMPLE_ISOLATED_GROUPED_MM_V2})
 LIBERO_DATASET_TREE_SHA256 = "d9c14b4aff28bcc56f341b171c6a5a3b10510d4bd0378662891c5156d245add8"
 LIBERO_DATASET_CONTENT_INVENTORY_SHA256 = "63fd7a951ebb397a33c43cad4a7c48c7c6911bd8d1481ff99b07da5f7890782c"
 LIBERO_DATASET_FILES_VERIFIED = 382
 LIBERO_DATASET_TOTAL_BYTES = 34_926_155_087
 LIBERO_DATASET_AUTHENTICATION_TIMEOUT = timedelta(hours=1)
 _INTEGER_MANIFEST_RUN_CONTRACT_FIELDS = frozenset(
-    {"dataset_files_verified", "dataset_total_bytes", "fixed_physical_prefix_width", "physical_batch_size"}
+    {
+        "dataset_files_verified",
+        "dataset_total_bytes",
+        "data_parallel_size",
+        "fixed_physical_prefix_width",
+        "max_cached_files",
+        "physical_batch_size",
+        "rank_physical_batch_size",
+        "serving_batch_size",
+        "tensor_parallel_size",
+        "world_size",
+    }
 )
 LIBERO_PREFIX_CAMERAS = (
     CameraGeometry("agentview", 256, 256),
@@ -289,7 +358,14 @@ def _source_tree_sha256(root: Path) -> str:
         path
         for path in (
             root / "scripts/run_libero_train.sh",
+            root / "scripts/run_libero_train_single_gpu.sh",
+            root / "scripts/run_libero_train_dp2.sh",
+            root / "scripts/create_libero_dp2_fork.py",
+            root / "scripts/create_libero_topology_fork.py",
+            root / "scripts/bootstrap_train_single_gpu_env.sh",
             root / "scripts/train_libero.py",
+            root / "envs/train-single-gpu/pyproject.toml",
+            root / "envs/train-single-gpu/uv.lock",
             root / "pyproject.toml",
             root / "uv.lock",
         )
@@ -315,6 +391,46 @@ def _validate_resume_manifest_run_contract(
             matches = observed == expected
         if not matches:
             raise ValueError(f"resume checkpoint run contract mismatch for {key}")
+
+
+def _merge_dp2_fork_run_contract(
+    run_contract: dict[str, str],
+    fork_contract: dict[str, str],
+) -> None:
+    """Attach an authenticated fork contract without overriding child identity."""
+
+    if set(fork_contract) != _DP2_FORK_RUN_CONTRACT_FIELDS or any(
+        not isinstance(name, str) or not isinstance(value, str) for name, value in fork_contract.items()
+    ):
+        raise ValueError("DP2 fork run-contract field inventory differs")
+    conflicts = {
+        name: {"expected": run_contract[name], "observed": fork_contract[name]}
+        for name in set(run_contract) & set(fork_contract)
+        if run_contract[name] != fork_contract[name]
+    }
+    if conflicts:
+        raise ValueError(f"DP2 fork conflicts with the child run contract: {conflicts}")
+    run_contract.update(fork_contract)
+
+
+def _merge_topology_fork_run_contract(
+    run_contract: dict[str, str],
+    fork_contract: dict[str, str],
+) -> None:
+    """Attach the generic topology lineage without overriding child identity."""
+
+    if set(fork_contract) != TOPOLOGY_FORK_CHECKPOINT_FIELDS or any(
+        not isinstance(name, str) or not isinstance(value, str) for name, value in fork_contract.items()
+    ):
+        raise ValueError("topology fork run-contract field inventory differs")
+    conflicts = {
+        name: {"expected": run_contract[name], "observed": fork_contract[name]}
+        for name in set(run_contract) & set(fork_contract)
+        if run_contract[name] != fork_contract[name]
+    }
+    if conflicts:
+        raise ValueError(f"topology fork conflicts with the child run contract: {conflicts}")
+    run_contract.update(fork_contract)
 
 
 def _authenticate_dataset_snapshot_distributed(snapshot_root: Path) -> dict[str, Any]:
@@ -361,19 +477,49 @@ def _authenticate_dataset_snapshot_distributed(snapshot_root: Path) -> dict[str,
     return payload
 
 
-def _configure_and_validate_training_runtime(project_root: Path) -> dict[str, Any]:
-    """Reject inherited algorithm overrides and enable strict CUDA determinism."""
+def _training_environment_name(
+    *,
+    expected_world_size: int,
+    resolved_config: dict[str, Any] | None,
+) -> str:
+    """Resolve the pinned venv from process and explicit parallel topology."""
+
+    distributed = (
+        None if resolved_config is None else _data_parallel_contract(resolved_config, world_size=expected_world_size)
+    )
+    return "train-single-gpu" if expected_world_size == 1 or distributed is not None else "train"
+
+
+def _configure_and_validate_training_runtime(
+    project_root: Path,
+    *,
+    resolved_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Reject inherited algorithm overrides and enable strict CUDA determinism.
+
+    A two-process job is not sufficient to distinguish legacy TP2 from DP2.
+    When the caller supplies the resolved recipe, validate its explicit
+    distributed contract and select the TP1-compatible environment for DP2.
+    """
 
     project_root = project_root.resolve()
     _inventory_project_source_root()
     _validate_project_module_origins({"duo_vla", "duo_vla.runtime_integrity"})
     cache_root = Path(os.environ.get("DUO_VLA_CACHE_ROOT", "/root/.cache/duo-vla")).resolve()
-    train_venv = (cache_root / "venvs/train").resolve()
+    expected_world_size = canonical_visible_cuda_world_size(os.environ)
+    environment_name = _training_environment_name(
+        expected_world_size=expected_world_size,
+        resolved_config=resolved_config,
+    )
+    train_venv = Path(os.environ.get("DUO_VLA_TRAIN_VENV", "")).resolve()
+    if train_venv != (cache_root / f"venvs/{environment_name}").resolve():
+        raise RuntimeError("LIBERO training venv differs from the canonical execution topology")
     python_hash_seed = os.environ.get("PYTHONHASHSEED")
     if python_hash_seed not in {"0", "1", "2"}:
         raise RuntimeError("LIBERO training requires PYTHONHASHSEED in {0,1,2}")
     expected_environment = {
         **REQUIRED_TRAIN_ENVIRONMENT,
+        "CUDA_VISIBLE_DEVICES": os.environ["CUDA_VISIBLE_DEVICES"],
         "DUO_VLA_CACHE_ROOT": str(cache_root),
         "DUO_VLA_PROJECT_ROOT": str(project_root),
         "DUO_VLA_TRAIN_VENV": str(train_venv),
@@ -429,6 +575,7 @@ def _configure_and_validate_training_runtime(project_root: Path) -> dict[str, An
     rank_environment = validate_torchrun_rank_environment(
         os.environ,
         required=any(name in os.environ for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE")),
+        expected_world_size=expected_world_size,
     )
     venv_identity = content_address_train_venv(train_venv)
     configure_strict_cuda_determinism(torch)
@@ -443,13 +590,16 @@ def _configure_and_validate_training_runtime(project_root: Path) -> dict[str, An
 
 
 def _execution_environment(runtime_preflight: dict[str, Any]) -> dict[str, Any]:
+    gpu_properties = [torch.cuda.get_device_properties(index) for index in range(torch.cuda.device_count())]
     return {
         "authenticated_runtime": runtime_preflight,
         "cuda_runtime": torch.version.cuda,
         "cudnn": torch.backends.cudnn.version(),
         **deterministic_torch_runtime(torch),
         "gpu_capability": [list(torch.cuda.get_device_capability(index)) for index in range(torch.cuda.device_count())],
-        "gpu_names": [torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())],
+        "gpu_names": [properties.name for properties in gpu_properties],
+        "gpu_total_memory_bytes": [int(properties.total_memory) for properties in gpu_properties],
+        "gpu_uuids": [str(properties.uuid) for properties in gpu_properties],
         "peft": importlib.metadata.version("peft"),
         "python": sys.version.split()[0],
         "torch": torch.__version__,
@@ -557,6 +707,292 @@ def _authenticate_prefix_geometry_distributed(
     return validated, snapshot_report
 
 
+def _plain_config_integer(value: object, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+    return value
+
+
+def _data_parallel_contract(config: dict[str, Any], *, world_size: int | None = None) -> dict[str, Any] | None:
+    """Validate and return the explicit DP2 topology, leaving legacy TP recipes unchanged."""
+
+    distributed = config.get("distributed")
+    if distributed is None:
+        return None
+    if not isinstance(distributed, dict):
+        raise ValueError("resolved config distributed section must be a table")
+    expected: dict[str, object] = {
+        "strategy": DATA_PARALLEL_STRATEGY,
+        "world_size": DP2_DATA_PARALLEL_SIZE,
+        "data_parallel_size": DP2_DATA_PARALLEL_SIZE,
+        "tensor_parallel_size": DP2_TENSOR_PARALLEL_SIZE,
+        "rank_physical_batch_size": DP2_RANK_PHYSICAL_BATCH_SIZE,
+        "canonical_plan_partition": DATA_PARALLEL_PLAN_PARTITION,
+        "gradient_reduction": DATA_PARALLEL_GRADIENT_REDUCTION,
+    }
+    if set(distributed) != set(expected):
+        raise ValueError(
+            "resolved config distributed fields differ from the DP2 contract: "
+            f"expected={sorted(expected)}, observed={sorted(distributed)}"
+        )
+    mismatches = {
+        name: {"expected": expected_value, "observed": distributed.get(name)}
+        for name, expected_value in expected.items()
+        if distributed.get(name) != expected_value
+    }
+    if world_size is not None and world_size != DP2_DATA_PARALLEL_SIZE:
+        mismatches["runtime_world_size"] = {
+            "expected": DP2_DATA_PARALLEL_SIZE,
+            "observed": world_size,
+        }
+    if mismatches:
+        raise ValueError(f"resolved config has an unsupported data-parallel topology: {mismatches}")
+    training = config.get("training")
+    if not isinstance(training, dict) or training.get("max_cached_files") != DP2_MAX_CACHED_FILES:
+        raise ValueError(f"DP2 requires training.max_cached_files={DP2_MAX_CACHED_FILES} in the frozen recipe")
+    return distributed
+
+
+def _validate_dp2_fork_cli(args: argparse.Namespace) -> None:
+    """Keep the frozen child recipe authoritative at the fork boundary."""
+
+    contract_overrides = {
+        name: getattr(args, name)
+        for name in (
+            "task",
+            "seed",
+            "total_updates",
+            "warmup_updates",
+            "microbatch_size",
+            "gradient_accumulation_steps",
+            "validation_interval",
+            "validation_samples",
+            "checkpoint_interval",
+            "permanent_checkpoint_interval",
+            "log_interval",
+        )
+        if getattr(args, name) is not None
+    }
+    if args.max_cached_files != DP2_MAX_CACHED_FILES:
+        contract_overrides["max_cached_files"] = args.max_cached_files
+    if contract_overrides:
+        raise ValueError(
+            f"--fork-from uses the frozen child recipe and rejects run-contract overrides: {sorted(contract_overrides)}"
+        )
+
+
+def _validate_dp2_fork_digest_argument(
+    *,
+    fork_from: Path | None,
+    resume: Path | None,
+    expected_sha256: list[str] | None,
+) -> str | None:
+    """Make the preregistered digest, rather than its adjacent sidecar, authoritative."""
+
+    if fork_from is None:
+        if expected_sha256 is not None:
+            raise ValueError("--expected-fork-manifest-sha256 is valid only with --fork-from, never --resume")
+        return None
+    if resume is not None:  # argparse already prevents this; keep the helper fail-closed in isolation.
+        raise ValueError("--fork-from and --resume are mutually exclusive")
+    if (
+        not isinstance(expected_sha256, list)
+        or len(expected_sha256) != 1
+        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256[0]) is None
+    ):
+        raise ValueError("--fork-from requires one preregistered --expected-fork-manifest-sha256 64-hex digest")
+    return expected_sha256[0]
+
+
+def _validate_topology_fork_cli(args: argparse.Namespace, manifest: Mapping[str, Any]) -> None:
+    """Keep the generic topology-fork child recipe authoritative."""
+
+    child = manifest.get("child")
+    if not isinstance(child, Mapping):
+        raise ValueError("topology fork manifest has no child contract")
+    contract_overrides = {
+        name: getattr(args, name)
+        for name in (
+            "task",
+            "total_updates",
+            "warmup_updates",
+            "microbatch_size",
+            "gradient_accumulation_steps",
+            "validation_interval",
+            "validation_samples",
+            "checkpoint_interval",
+            "permanent_checkpoint_interval",
+            "log_interval",
+        )
+        if getattr(args, name) is not None
+    }
+    if args.seed is not None:
+        contract_overrides["seed"] = args.seed
+    if args.max_cached_files != child.get("max_cached_files"):
+        contract_overrides["max_cached_files"] = args.max_cached_files
+    if contract_overrides:
+        raise ValueError(
+            "--topology-fork-from uses the frozen child recipe and rejects "
+            f"run-contract overrides: {sorted(contract_overrides)}"
+        )
+
+
+def _validate_topology_fork_digest_argument(
+    *,
+    topology_fork_from: Path | None,
+    resume: Path | None,
+    legacy_fork_from: Path | None,
+    expected_sha256: list[str] | None,
+) -> str | None:
+    if topology_fork_from is None:
+        if expected_sha256 is not None:
+            raise ValueError("--expected-topology-fork-manifest-sha256 is valid only with --topology-fork-from")
+        return None
+    if resume is not None or legacy_fork_from is not None:
+        raise ValueError("topology fork, legacy fork, and resume modes are mutually exclusive")
+    if (
+        not isinstance(expected_sha256, list)
+        or len(expected_sha256) != 1
+        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256[0]) is None
+    ):
+        raise ValueError(
+            "--topology-fork-from requires one preregistered --expected-topology-fork-manifest-sha256 64-hex digest"
+        )
+    return expected_sha256[0]
+
+
+def _validate_dp2_restore_mode(
+    *,
+    is_data_parallel: bool,
+    has_fork_manifest: bool,
+    has_resume_checkpoint: bool,
+    has_topology_fork_manifest: bool = False,
+) -> None:
+    """Forbid an unlineaged DP2 start even when the trainer bypasses its launcher."""
+
+    if has_fork_manifest and not is_data_parallel:
+        raise ValueError("--fork-from requires the exact DP2 distributed recipe")
+    if is_data_parallel and sum((has_fork_manifest, has_topology_fork_manifest, has_resume_checkpoint)) != 1:
+        raise ValueError("DP2 requires exactly one authenticated legacy/topology fork or lineage-valid --resume")
+
+
+def _validate_batch_contract(config: dict[str, Any]) -> tuple[int, int, int]:
+    """Validate the fixed-global-batch geometry and return train/accum/serve sizes."""
+
+    optimization = config.get("optimization")
+    if not isinstance(optimization, dict):
+        raise ValueError("resolved config has no optimization table")
+    physical_batch_size = _plain_config_integer(
+        optimization.get("physical_batch_size"),
+        name="optimization.physical_batch_size",
+    )
+    microbatch_size = _plain_config_integer(
+        optimization.get("microbatch_size"),
+        name="optimization.microbatch_size",
+    )
+    accumulation_steps = _plain_config_integer(
+        optimization.get("gradient_accumulation_steps"),
+        name="optimization.gradient_accumulation_steps",
+    )
+    global_batch_size = _plain_config_integer(
+        optimization.get("global_batch_size"),
+        name="optimization.global_batch_size",
+    )
+    serving_batch_size = _plain_config_integer(
+        optimization.get("serving_batch_size", DEFAULT_SERVING_BATCH_SIZE),
+        name="optimization.serving_batch_size",
+    )
+    if physical_batch_size not in SUPPORTED_PHYSICAL_BATCH_SIZES:
+        supported = ", ".join(str(value) for value in sorted(SUPPORTED_PHYSICAL_BATCH_SIZES))
+        raise ValueError(f"optimization.physical_batch_size must be one of {{{supported}}}")
+    if serving_batch_size not in SUPPORTED_PHYSICAL_BATCH_SIZES:
+        supported = ", ".join(str(value) for value in sorted(SUPPORTED_PHYSICAL_BATCH_SIZES))
+        raise ValueError(f"optimization.serving_batch_size must be one of {{{supported}}}")
+    if serving_batch_size != DEFAULT_SERVING_BATCH_SIZE:
+        raise ValueError(
+            f"optimization.serving_batch_size must remain {DEFAULT_SERVING_BATCH_SIZE} "
+            "until another singleton-serving geometry is qualified"
+        )
+    if microbatch_size != physical_batch_size:
+        raise ValueError("optimization.microbatch_size must equal optimization.physical_batch_size")
+    if global_batch_size != GLOBAL_BATCH_SIZE:
+        raise ValueError(f"optimization.global_batch_size must equal {GLOBAL_BATCH_SIZE}")
+    distributed = _data_parallel_contract(config)
+    data_parallel_size = 1 if distributed is None else int(distributed["data_parallel_size"])
+    if distributed is not None and physical_batch_size != int(distributed["rank_physical_batch_size"]):
+        raise ValueError("optimization.physical_batch_size must equal distributed.rank_physical_batch_size")
+    expected_accumulation = GLOBAL_BATCH_SIZE // (physical_batch_size * data_parallel_size)
+    if accumulation_steps != expected_accumulation:
+        raise ValueError(
+            "optimization.gradient_accumulation_steps must equal "
+            f"{expected_accumulation} for physical batch {physical_batch_size}"
+        )
+    if physical_batch_size % CANONICAL_STREAM_BATCH_SIZE:
+        raise ValueError("optimization.physical_batch_size must coalesce complete canonical B8 stream chunks")
+    return physical_batch_size, accumulation_steps, serving_batch_size
+
+
+def _expected_execution_profile(
+    *,
+    world_size: int,
+    expert_batch_isolation: str,
+    physical_batch_size: int,
+    serving_batch_size: int,
+    data_parallel_size: int = 1,
+) -> str | None:
+    """Name the exact batch/backend topology without changing legacy profiles."""
+
+    if expert_batch_isolation not in SUPPORTED_EXPERT_BATCH_ISOLATIONS:
+        raise ValueError(f"unsupported expert batch-isolation backend: {expert_batch_isolation!r}")
+    if data_parallel_size == DP2_DATA_PARALLEL_SIZE:
+        if (
+            world_size != DP2_DATA_PARALLEL_SIZE
+            or expert_batch_isolation != SAMPLE_ISOLATED_GROUPED_MM_V2
+            or physical_batch_size != DP2_RANK_PHYSICAL_BATCH_SIZE
+            or serving_batch_size != DEFAULT_SERVING_BATCH_SIZE
+        ):
+            raise ValueError("DP=2 is qualified only for fused-v2 rank-B32/global-B64/serve-B8")
+        return DP2_EXECUTION_PROFILE
+    if data_parallel_size != 1:
+        raise ValueError(f"unsupported data-parallel size: {data_parallel_size}")
+    if world_size == 2:
+        if (
+            expert_batch_isolation != EXPERT_BATCH_ISOLATION
+            or physical_batch_size != PHYSICAL_BATCH_SIZE
+            or serving_batch_size != DEFAULT_SERVING_BATCH_SIZE
+        ):
+            raise ValueError("TP=2 is qualified only for the legacy v1/B8 execution geometry")
+        return None
+    if world_size != 1:
+        raise ValueError(f"unsupported tensor-parallel world size: {world_size}")
+    if (
+        expert_batch_isolation == EXPERT_BATCH_ISOLATION
+        and physical_batch_size == PHYSICAL_BATCH_SIZE
+        and serving_batch_size == DEFAULT_SERVING_BATCH_SIZE
+    ):
+        return "duovla-single-gpu-tp1-v1"
+    backend = "fused-v2" if expert_batch_isolation == SAMPLE_ISOLATED_GROUPED_MM_V2 else "sequential-v1"
+    return f"duovla-single-gpu-tp1-{backend}-train-b{physical_batch_size}-serve-b{serving_batch_size}-v1"
+
+
+def _install_expert_batch_isolation(model: torch.nn.Module, *, backend: str, physical_batch_size: int) -> None:
+    if backend == EXPERT_BATCH_ISOLATION:
+        install_sample_isolated_grouped_mm_experts(model, physical_batch_size=physical_batch_size)
+    elif backend == SAMPLE_ISOLATED_GROUPED_MM_V2:
+        install_sample_isolated_grouped_mm_experts_v2(model, physical_batch_size=physical_batch_size)
+    else:  # pragma: no cover - config validation rejects this before model construction
+        raise ValueError(f"unsupported expert batch-isolation backend: {backend!r}")
+
+
+def _verify_expert_batch_isolation(model: torch.nn.Module, *, backend: str, physical_batch_size: int) -> None:
+    if backend == EXPERT_BATCH_ISOLATION:
+        verify_sample_isolated_grouped_mm_experts(model, physical_batch_size=physical_batch_size)
+    elif backend == SAMPLE_ISOLATED_GROUPED_MM_V2:
+        verify_sample_isolated_grouped_mm_experts_v2(model, physical_batch_size=physical_batch_size)
+    else:  # pragma: no cover - config validation rejects this before model construction
+        raise ValueError(f"unsupported expert batch-isolation backend: {backend!r}")
+
+
 def _validate_and_build_interface_config(config: dict[str, Any]) -> ActionInterfaceConfig:
     model = config["model"]
     action = config["action"]
@@ -564,17 +1000,31 @@ def _validate_and_build_interface_config(config: dict[str, Any]) -> ActionInterf
     benchmark = config["benchmark"]
     optimization = config["optimization"]
     training = config["training"]
+    physical_batch_size, accumulation_steps, serving_batch_size = _validate_batch_contract(config)
+    distributed = _data_parallel_contract(config, world_size=dist.get_world_size())
+    data_parallel_size = 1 if distributed is None else int(distributed["data_parallel_size"])
+    tensor_parallel_size = dist.get_world_size() if distributed is None else int(distributed["tensor_parallel_size"])
+    expert_batch_isolation = model.get("expert_batch_isolation")
+    if not isinstance(expert_batch_isolation, str):
+        raise ValueError("model.expert_batch_isolation must be a string")
+    expected_execution_profile = _expected_execution_profile(
+        world_size=dist.get_world_size(),
+        expert_batch_isolation=expert_batch_isolation,
+        physical_batch_size=physical_batch_size,
+        serving_batch_size=serving_batch_size,
+        data_parallel_size=data_parallel_size,
+    )
     required = {
         "model.id": (model["id"], DEFAULT_DIFFUSION_GEMMA_SPEC.model_id),
         "model.revision": (model["revision"], DEFAULT_DIFFUSION_GEMMA_SPEC.revision),
         "model.dtype": (model["dtype"], "bfloat16"),
-        "model.tensor_parallel_size": (int(model["tensor_parallel_size"]), dist.get_world_size()),
+        "model.tensor_parallel_size": (int(model["tensor_parallel_size"]), tensor_parallel_size),
         "model.attention_implementation": (model["attention_implementation"], "sdpa"),
         "model.experts_implementation": (
             model["experts_implementation"],
             GROUPED_MM_EXPERTS_IMPLEMENTATION,
         ),
-        "model.expert_batch_isolation": (model["expert_batch_isolation"], EXPERT_BATCH_ISOLATION),
+        "model.expert_batch_isolation": (model["expert_batch_isolation"], expert_batch_isolation),
         "action.horizon": (int(action["horizon"]), 8),
         "action.dimension": (int(action["dimension"]), 7),
         "action.timestep_embedding_dimension": (int(action["timestep_embedding_dimension"]), 256),
@@ -590,17 +1040,21 @@ def _validate_and_build_interface_config(config: dict[str, Any]) -> ActionInterf
         "benchmark.dataset_id": (benchmark["dataset_id"], "HuggingFaceVLA/libero"),
         "benchmark.dataset_revision": (benchmark["dataset_revision"], LIBERO_DATASET_REVISION),
         "benchmark.state_dimension": (int(benchmark["state_dimension"]), 8),
-        "optimization.physical_batch_size": (int(optimization["physical_batch_size"]), PHYSICAL_BATCH_SIZE),
-        "optimization.microbatch_size": (int(optimization["microbatch_size"]), PHYSICAL_BATCH_SIZE),
+        "optimization.physical_batch_size": (int(optimization["physical_batch_size"]), physical_batch_size),
+        "optimization.microbatch_size": (int(optimization["microbatch_size"]), physical_batch_size),
         "optimization.gradient_accumulation_steps": (
             int(optimization["gradient_accumulation_steps"]),
-            8,
+            accumulation_steps,
         ),
-        "optimization.global_batch_size": (int(optimization["global_batch_size"]), 64),
+        "optimization.global_batch_size": (int(optimization["global_batch_size"]), GLOBAL_BATCH_SIZE),
     }
     mismatches = [name for name, (observed, expected) in required.items() if observed != expected]
+    if config.get("execution_profile") != expected_execution_profile:
+        mismatches.append("execution_profile")
     if mismatches:
-        details = {name: required[name] for name in mismatches}
+        details = {name: required[name] for name in mismatches if name in required}
+        if "execution_profile" in mismatches:
+            details["execution_profile"] = (config.get("execution_profile"), expected_execution_profile)
         raise ValueError(f"resolved config is unsupported by this trainer: {details}")
     checkpoint_interval = training.get("checkpoint_interval")
     permanent_checkpoint_interval = training.get("permanent_checkpoint_interval")
@@ -629,13 +1083,35 @@ def _validate_and_build_interface_config(config: dict[str, Any]) -> ActionInterf
 
 def _execution_geometry(config: dict[str, Any]) -> dict[str, str | int]:
     content_sha256, fixed_width = _prefix_geometry_pins(config)
-    return {
+    physical_batch_size, _, serving_batch_size = _validate_batch_contract(config)
+    geometry: dict[str, str | int] = {
         "experts_implementation": str(config["model"]["experts_implementation"]),
         "expert_batch_isolation": str(config["model"]["expert_batch_isolation"]),
-        "physical_batch_size": int(config["optimization"]["physical_batch_size"]),
+        "physical_batch_size": physical_batch_size,
+        "serving_batch_size": serving_batch_size,
         "fixed_physical_prefix_width": fixed_width,
         "prefix_geometry_content_sha256": content_sha256,
     }
+    if config.get("execution_profile") is not None:
+        geometry.update(
+            execution_profile=str(config["execution_profile"]),
+            tensor_parallel_size=int(config["model"]["tensor_parallel_size"]),
+        )
+    distributed = _data_parallel_contract(config)
+    if distributed is not None:
+        geometry.update(
+            strategy=str(distributed["strategy"]),
+            world_size=int(distributed["world_size"]),
+            data_parallel_size=int(distributed["data_parallel_size"]),
+            rank_physical_batch_size=int(distributed["rank_physical_batch_size"]),
+            canonical_plan_partition=str(distributed["canonical_plan_partition"]),
+            gradient_reduction=str(distributed["gradient_reduction"]),
+        )
+    if config["model"]["expert_batch_isolation"] == SAMPLE_ISOLATED_GROUPED_MM_V2:
+        geometry["shared_weight_kernel_sha256"] = file_sha256(
+            Path(__file__).resolve().parents[1] / "src/duo_vla/backbones/shared_weight_grouped_mm_triton.py"
+        )
+    return geometry
 
 
 def _validate_checkpoint_execution_geometry(
@@ -649,6 +1125,11 @@ def _validate_checkpoint_execution_geometry(
         for name, value in expected.items()
         if manifest.get(name) != value
     }
+    if manifest.get("execution_geometry") != expected:
+        mismatches["execution_geometry"] = {
+            "expected": expected,
+            "observed": manifest.get("execution_geometry"),
+        }
     if mismatches:
         raise ValueError(f"checkpoint fixed-batch execution geometry differs: {mismatches}")
     artifact = manifest.get("artifacts", {}).get("prefix_geometry")
@@ -679,12 +1160,17 @@ def _initialize_run_journal(
     config_sha256: str,
     resume: Path | None,
     recover_bootstrap: bool,
+    new_run_uuid: str | None = None,
 ) -> tuple[str, str | None]:
     result: list[dict[str, Any] | None] = [None]
     if dist.get_rank() == 0:
         try:
             if resume is None and not recover_bootstrap:
-                journal = create_run_journal(output_dir, config_sha256=config_sha256)
+                journal = create_run_journal(
+                    output_dir,
+                    config_sha256=config_sha256,
+                    run_uuid=new_run_uuid,
+                )
                 latest_manifest_sha256 = None
             elif recover_bootstrap:
                 if resume is not None:
@@ -695,7 +1181,13 @@ def _initialize_run_journal(
                         expected_config_sha256=config_sha256,
                     )
                 except FileNotFoundError:
-                    journal = create_run_journal(output_dir, config_sha256=config_sha256)
+                    journal = create_run_journal(
+                        output_dir,
+                        config_sha256=config_sha256,
+                        run_uuid=new_run_uuid,
+                    )
+                if new_run_uuid is not None and journal.run_uuid != new_run_uuid:
+                    raise ValueError("bootstrap journal run UUID differs from the frozen fork manifest")
                 if journal.latest_checkpoint is not None:
                     raise ValueError("bootstrap recovery requires a journal without a checkpoint")
                 recovery = quarantine_uncommitted_training_artifacts(output_dir)
@@ -713,6 +1205,8 @@ def _initialize_run_journal(
                     )
             else:
                 assert resume is not None
+                if new_run_uuid is not None:
+                    raise ValueError("ordinary resume cannot select a new run UUID")
                 journal = load_run_journal(
                     output_dir,
                     expected_config_sha256=config_sha256,
@@ -900,7 +1394,7 @@ def _raise_if_rank_errors(context: str, local_error: str | None) -> None:
     errors: list[str | None] = [None] * dist.get_world_size()
     dist.all_gather_object(errors, local_error)
     if any(error is not None for error in errors):
-        raise RuntimeError(f"{context} failed across TP ranks: {errors}")
+        raise RuntimeError(f"{context} failed across distributed ranks: {errors}")
 
 
 def _assert_fp32_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
@@ -953,7 +1447,7 @@ def _assert_replicated_optimizer_state(
     hashes = [payload[0] for payload in payloads if payload is not None]
     assert local_hash is not None
     if any(value != local_hash for value in hashes):
-        raise RuntimeError(f"replicated optimizer state diverged across TP ranks: {hashes}")
+        raise RuntimeError(f"replicated optimizer state diverged across distributed ranks: {hashes}")
     return local_hash
 
 
@@ -962,12 +1456,14 @@ def _assert_distributed_gradient_health(parameters: list[torch.nn.Parameter]) ->
     audits: list[tuple[int, int] | None] = [None] * dist.get_world_size()
     dist.all_gather_object(audits, local)
     if any(audit != (0, 0) for audit in audits):
-        raise RuntimeError(f"gradient audit failed across TP ranks: {audits}")
+        raise RuntimeError(f"gradient audit failed across distributed ranks: {audits}")
 
 
 def _assert_initial_gradients_present(
     lora_partition,
     interface_named_parameters: list[tuple[str, torch.nn.Parameter]],
+    *,
+    data_parallel: bool = False,
 ) -> None:
     local_missing = [
         name for name, parameter in [*lora_partition.replicated, *interface_named_parameters] if parameter.grad is None
@@ -976,12 +1472,127 @@ def _assert_initial_gradients_present(
     dist.all_gather_object(missing_by_rank, local_missing)
     if any(missing for missing in missing_by_rank):
         raise RuntimeError(f"initial replicated gradients are missing: {missing_by_rank}")
+    # DP ranks intentionally own disjoint canonical plans, so their local
+    # gradients differ until the explicit SUM collective below.
+    if data_parallel:
+        return
     for name, parameter in lora_partition.replicated:
         assert parameter.grad is not None
         assert_replicated_tensor(f"initial_gradient.{name}", parameter.grad)
     for name, parameter in interface_named_parameters:
         assert parameter.grad is not None
         assert_replicated_tensor(f"initial_interface_gradient.{name}", parameter.grad)
+
+
+def _assert_data_parallel_trainables_are_replicated(
+    lora_partition,
+    lora_named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
+) -> None:
+    """Fail closed if a TP shard accidentally enters the pure-DP optimizer."""
+
+    if lora_partition.sharded:
+        raise RuntimeError("DP2 requires every trainable LoRA parameter to be a full replica")
+    expected = {id(parameter) for _, parameter in lora_named_parameters}
+    observed = {id(parameter) for _, parameter in lora_partition.replicated}
+    if observed != expected or len(observed) != len(tuple(lora_named_parameters)):
+        raise RuntimeError("DP2 LoRA replica partition does not cover every trainable exactly once")
+
+
+def _sum_data_parallel_gradients_(
+    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
+) -> None:
+    """SUM globally-normalized full-replica gradients in one deterministic bucket.
+
+    This deliberately does not use DDP: DDP's default division by world size
+    would halve gradients that were already normalized by the global element
+    count. Frozen backbone/expert tensors are absent from ``named_parameters``.
+    """
+
+    entries = tuple(sorted(named_parameters, key=lambda item: item[0]))
+    if dist.get_world_size() != DP2_DATA_PARALLEL_SIZE:
+        raise RuntimeError("DP2 gradient reduction requires exactly two ranks")
+    if not entries or len({name for name, _ in entries}) != len(entries):
+        raise ValueError("DP2 gradient reduction requires unique named trainables")
+    if len({id(parameter) for _, parameter in entries}) != len(entries):
+        raise ValueError("DP2 gradient reduction received duplicate trainable tensors")
+    gradients = []
+    for name, parameter in entries:
+        gradient = parameter.grad
+        if gradient is None:
+            raise RuntimeError(f"DP2 trainable has no local gradient: {name}")
+        if gradient.layout != torch.strided or gradient.is_sparse:
+            raise RuntimeError(f"DP2 supports only dense strided gradients: {name}")
+        gradients.append(gradient)
+    reference = gradients[0]
+    if any(gradient.device != reference.device or gradient.dtype != reference.dtype for gradient in gradients):
+        raise RuntimeError("DP2 gradient bucket requires one device and dtype")
+    flat = torch.cat([gradient.reshape(-1) for gradient in gradients])
+    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+    offset = 0
+    for gradient in gradients:
+        count = gradient.numel()
+        gradient.copy_(flat.narrow(0, offset, count).view_as(gradient))
+        offset += count
+
+
+def _assert_replicated_gradient_values(
+    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
+) -> str:
+    """Require one byte-identical post-reduction gradient bucket on every rank."""
+
+    entries = sorted(named_parameters, key=lambda item: item[0])
+    if not entries:
+        raise ValueError("named gradient parameters must not be empty")
+    digest = hashlib.sha256()
+    for name, parameter in entries:
+        if parameter.grad is None:
+            raise RuntimeError(f"post-reduction gradient is missing: {name}")
+        local = parameter.grad.detach().cpu().contiguous()
+        digest.update(name.encode())
+        digest.update(str(local.dtype).encode())
+        digest.update(str(tuple(local.shape)).encode())
+        digest.update(local.reshape(-1).view(torch.uint8).numpy().tobytes())
+    local_hash = digest.hexdigest()
+    hashes: list[str | None] = [None] * dist.get_world_size()
+    dist.all_gather_object(hashes, local_hash)
+    if any(value != local_hash for value in hashes):
+        raise RuntimeError(f"post-reduction gradients diverged across DP ranks: {hashes}")
+    return local_hash
+
+
+def _sum_data_parallel_scalar(value: float | int, *, device: torch.device, dtype: torch.dtype) -> float | int:
+    """Return a DP2 SUM while preserving integer counts exactly."""
+
+    if dist.get_world_size() != DP2_DATA_PARALLEL_SIZE:
+        raise RuntimeError("DP2 scalar reduction requires exactly two ranks")
+    reduced = torch.tensor(value, device=device, dtype=dtype)
+    dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+    return int(reduced.item()) if not dtype.is_floating_point else float(reduced.item())
+
+
+def _max_data_parallel_seconds(value: float, *, device: torch.device) -> float:
+    if dist.get_world_size() != DP2_DATA_PARALLEL_SIZE:
+        raise RuntimeError("DP2 timing reduction requires exactly two ranks")
+    reduced = torch.tensor(value, device=device, dtype=torch.float64)
+    dist.all_reduce(reduced, op=dist.ReduceOp.MAX)
+    return float(reduced.item())
+
+
+def _data_parallel_peak_memory_bytes(device: torch.device) -> list[int]:
+    """Gather exact local allocator peaks in stable rank order."""
+
+    if dist.get_world_size() != DP2_DATA_PARALLEL_SIZE:
+        raise RuntimeError("DP2 memory reporting requires exactly two ranks")
+    local_peak = int(torch.cuda.max_memory_allocated(device))
+    peaks: list[int | None] = [None] * DP2_DATA_PARALLEL_SIZE
+    dist.all_gather_object(peaks, local_peak)
+    if any(type(value) is not int or value < 0 for value in peaks):
+        raise RuntimeError(f"DP2 peak-memory gather returned invalid values: {peaks}")
+    return [value for value in peaks if value is not None]
+
+
+def _data_parallel_peak_memory_gib(device: torch.device) -> list[float]:
+    return [value / 2**30 for value in _data_parallel_peak_memory_bytes(device)]
 
 
 def _assert_distributed_trainer_state(
@@ -992,7 +1603,7 @@ def _assert_distributed_trainer_state(
     states: list[dict[str, Any] | None] = [None] * dist.get_world_size()
     dist.all_gather_object(states, serialized)
     if any(state != serialized for state in states):
-        raise RuntimeError(f"TP ranks restored different trainer states: {states}")
+        raise RuntimeError(f"distributed ranks restored different trainer states: {states}")
     manifest_state = checkpoint_manifest.get("trainer_state")
     if manifest_state != serialized:
         raise ValueError("checkpoint manifest and rank-state trainer progress disagree")
@@ -1020,9 +1631,18 @@ def _fixed_distinct_anchors(
     return tuple(anchors)
 
 
-def _processor_inputs(processor, samples, device: torch.device, prefix_geometry: dict[str, Any]):
-    if len(samples) != PHYSICAL_BATCH_SIZE:
-        raise ValueError(f"LIBERO processor requires physical batch {PHYSICAL_BATCH_SIZE}, observed {len(samples)}")
+def _processor_inputs(
+    processor,
+    samples,
+    device: torch.device,
+    prefix_geometry: dict[str, Any],
+    *,
+    expected_batch_size: int = PHYSICAL_BATCH_SIZE,
+):
+    if expected_batch_size not in SUPPORTED_PHYSICAL_BATCH_SIZES:
+        raise ValueError("LIBERO processor received an unsupported physical batch size")
+    if len(samples) != expected_batch_size:
+        raise ValueError(f"LIBERO processor requires physical batch {expected_batch_size}, observed {len(samples)}")
     camera_arrays: list[tuple[np.ndarray, np.ndarray]] = []
     for index, sample in enumerate(samples):
         third_person = np.asarray(sample.observation.third_person)
@@ -1054,7 +1674,7 @@ def _processor_inputs(processor, samples, device: torch.device, prefix_geometry:
         conversations,
         fixed_physical_prefix_width=fixed_width,
         padding_side=padding_side,
-        expected_batch_size=PHYSICAL_BATCH_SIZE,
+        expected_batch_size=expected_batch_size,
         images_per_prefix=len(LIBERO_PREFIX_CAMERAS),
     )
     expected_lengths = {
@@ -1094,6 +1714,166 @@ def _materialize_batch(
     )
 
 
+def _materialize_canonical_batches(
+    dataset: LiberoParquetDataset,
+    sampler: TaskUniformAnchorSampler,
+    plans: Sequence[MicrobatchPlan],
+    *,
+    state_normalizer,
+    action_normalizer,
+) -> tuple[LiberoBatch, ...]:
+    """Materialize plans only as canonical B8 chunks, independent of forward width."""
+
+    values = tuple(plans)
+    if not values:
+        raise ValueError("at least one canonical plan is required")
+    return tuple(
+        _materialize_batch(
+            dataset,
+            sampler,
+            count=CANONICAL_STREAM_BATCH_SIZE,
+            seed=plan.data_seed,
+            state_normalizer=state_normalizer,
+            action_normalizer=action_normalizer,
+        )
+        for plan in values
+    )
+
+
+def _group_canonical_plans(
+    plans: Sequence[MicrobatchPlan],
+    *,
+    physical_batch_size: int,
+) -> tuple[tuple[MicrobatchPlan, ...], ...]:
+    if physical_batch_size not in SUPPORTED_PHYSICAL_BATCH_SIZES:
+        raise ValueError("cannot group plans for an unsupported physical batch size")
+    canonical_per_forward = physical_batch_size // CANONICAL_STREAM_BATCH_SIZE
+    values = tuple(plans)
+    if not values or len(values) % canonical_per_forward:
+        raise ValueError("canonical plan count does not form complete physical forwards")
+    return tuple(
+        values[start : start + canonical_per_forward] for start in range(0, len(values), canonical_per_forward)
+    )
+
+
+def _canonical_update_plan_groups(
+    seed: int,
+    update: int,
+    *,
+    physical_batch_size: int,
+) -> tuple[tuple[MicrobatchPlan, ...], ...]:
+    """Keep the B8 seed stream invariant while changing physical-forward width."""
+
+    canonical = make_update_plan(
+        seed,
+        update,
+        gradient_accumulation_steps=CANONICAL_MICROSTEPS_PER_UPDATE,
+    )
+    return _group_canonical_plans(canonical, physical_batch_size=physical_batch_size)
+
+
+def _partition_canonical_plans_by_rank(
+    plans: Sequence[MicrobatchPlan],
+    *,
+    rank: int,
+    data_parallel_size: int,
+) -> tuple[MicrobatchPlan, ...]:
+    """Assign one contiguous, non-overlapping portion of the canonical stream."""
+
+    values = tuple(plans)
+    if data_parallel_size != DP2_DATA_PARALLEL_SIZE:
+        raise ValueError("canonical DP partition currently supports exactly two ranks")
+    if isinstance(rank, bool) or not isinstance(rank, int) or not 0 <= rank < data_parallel_size:
+        raise ValueError("data-parallel rank is out of range")
+    if not values or len(values) % data_parallel_size:
+        raise ValueError("canonical plan stream cannot be divided evenly across DP ranks")
+    plans_per_rank = len(values) // data_parallel_size
+    start = rank * plans_per_rank
+    return values[start : start + plans_per_rank]
+
+
+def _rank_canonical_update_plan_groups(
+    seed: int,
+    update: int,
+    *,
+    rank: int,
+    data_parallel_size: int,
+    physical_batch_size: int,
+) -> tuple[tuple[MicrobatchPlan, ...], ...]:
+    """Derive all eight plans globally, then select the rank's canonical half."""
+
+    canonical = make_update_plan(
+        seed,
+        update,
+        gradient_accumulation_steps=CANONICAL_MICROSTEPS_PER_UPDATE,
+    )
+    local = _partition_canonical_plans_by_rank(
+        canonical,
+        rank=rank,
+        data_parallel_size=data_parallel_size,
+    )
+    return _group_canonical_plans(local, physical_batch_size=physical_batch_size)
+
+
+def _coalesce_canonical_batches(
+    batches: Sequence[LiberoBatch],
+    *,
+    physical_batch_size: int,
+) -> LiberoBatch:
+    values = tuple(batches)
+    expected_chunks = physical_batch_size // CANONICAL_STREAM_BATCH_SIZE
+    if physical_batch_size not in SUPPORTED_PHYSICAL_BATCH_SIZES or len(values) != expected_chunks:
+        raise ValueError("physical forward must contain the exact number of canonical B8 batches")
+    if any(batch.batch_size != CANONICAL_STREAM_BATCH_SIZE for batch in values):
+        raise ValueError("only complete canonical B8 batches may be coalesced")
+    samples = tuple(sample for batch in values for sample in batch.samples)
+    states = torch.cat([batch.states for batch in values], dim=0)
+    clean_actions = torch.cat([batch.clean_actions for batch in values], dim=0)
+    action_valid_mask = torch.cat([batch.action_valid_mask for batch in values], dim=0)
+    if (
+        len(samples) != physical_batch_size
+        or states.shape[0] != physical_batch_size
+        or clean_actions.shape[0] != physical_batch_size
+        or action_valid_mask.shape[0] != physical_batch_size
+    ):
+        raise ValueError("coalesced LIBERO batch has an invalid physical width")
+    return LiberoBatch(
+        samples=samples,
+        states=states,
+        clean_actions=clean_actions,
+        action_valid_mask=action_valid_mask,
+    )
+
+
+def _canonical_training_pair(
+    clean_actions: torch.Tensor,
+    policy_contract: PolicyContract,
+    plans: Sequence[MicrobatchPlan],
+) -> PolicyTrainingPair:
+    """Generate each canonical B8 objective slice before concatenating it."""
+
+    values = tuple(plans)
+    expected_batch_size = len(values) * CANONICAL_STREAM_BATCH_SIZE
+    if not values or clean_actions.shape[0] != expected_batch_size:
+        raise ValueError("clean actions do not match the canonical objective-plan slices")
+    pairs = []
+    for canonical_index, plan in enumerate(values):
+        start = canonical_index * CANONICAL_STREAM_BATCH_SIZE
+        stop = start + CANONICAL_STREAM_BATCH_SIZE
+        pairs.append(
+            make_seeded_policy_training_pair(
+                clean_actions[start:stop],
+                policy_contract,
+                seed=plan.flow_seed,
+            )
+        )
+    return PolicyTrainingPair(
+        input_actions=torch.cat([pair.input_actions for pair in pairs], dim=0),
+        timesteps=torch.cat([pair.timesteps for pair in pairs], dim=0),
+        target=torch.cat([pair.target for pair in pairs], dim=0),
+    )
+
+
 def _validation_is_due(*, next_update: int, total_updates: int, interval: int) -> bool:
     """Keep validation on the declared cadence and configured final update only."""
 
@@ -1114,38 +1894,67 @@ def _run_validation(
     adapted,
     device: torch.device,
     samples: int,
-    microbatch_size: int,
+    physical_batch_size: int,
     validation_seed: int,
     policy_contract: PolicyContract,
     prefix_geometry: dict[str, Any],
+    data_parallel_size: int = 1,
 ) -> float:
     denoiser.eval()
     adapted.eval()
     model.model.encoder.eval()
     numerators: list[float] = []
     element_count = 0
-    if microbatch_size != PHYSICAL_BATCH_SIZE:
-        raise ValueError(f"validation requires physical batch {PHYSICAL_BATCH_SIZE}")
-    if samples % PHYSICAL_BATCH_SIZE:
-        raise ValueError(f"validation sample count must be divisible by {PHYSICAL_BATCH_SIZE}")
-    microbatches = samples // PHYSICAL_BATCH_SIZE
+    if physical_batch_size not in SUPPORTED_PHYSICAL_BATCH_SIZES:
+        raise ValueError("validation received an unsupported physical batch size")
+    if data_parallel_size not in {1, DP2_DATA_PARALLEL_SIZE}:
+        raise ValueError("validation received an unsupported data-parallel size")
+    if data_parallel_size > 1 and dist.get_world_size() != data_parallel_size:
+        raise RuntimeError("validation data-parallel size differs from the runtime world size")
+    global_forward_width = physical_batch_size * data_parallel_size
+    if samples % global_forward_width:
+        raise ValueError(f"validation sample count must be divisible by {global_forward_width}")
+    if samples % CANONICAL_STREAM_BATCH_SIZE:
+        raise ValueError("validation samples must contain complete canonical B8 chunks")
+    canonical_plans = tuple(
+        make_microbatch_plan(validation_seed, 0, microstep)
+        for microstep in range(samples // CANONICAL_STREAM_BATCH_SIZE)
+    )
+    local_plans = (
+        canonical_plans
+        if data_parallel_size == 1
+        else _partition_canonical_plans_by_rank(
+            canonical_plans,
+            rank=dist.get_rank(),
+            data_parallel_size=data_parallel_size,
+        )
+    )
+    plan_groups = _group_canonical_plans(local_plans, physical_batch_size=physical_batch_size)
     with torch.no_grad():
-        for microstep in range(microbatches):
-            plan = make_microbatch_plan(validation_seed, 0, microstep)
-            batch = _materialize_batch(
+        for plans in plan_groups:
+            canonical_batches = _materialize_canonical_batches(
                 dataset,
                 sampler,
-                count=PHYSICAL_BATCH_SIZE,
-                seed=plan.data_seed,
+                plans,
                 state_normalizer=state_normalizer,
                 action_normalizer=action_normalizer,
+            )
+            batch = _coalesce_canonical_batches(
+                canonical_batches,
+                physical_batch_size=physical_batch_size,
             )
             state = batch.states.to(device)
             clean = batch.clean_actions.to(device)
             valid = batch.action_valid_mask.to(device)
-            prefix_inputs = _processor_inputs(processor, batch.samples, device, prefix_geometry)
+            prefix_inputs = _processor_inputs(
+                processor,
+                batch.samples,
+                device,
+                prefix_geometry,
+                expected_batch_size=physical_batch_size,
+            )
             prefix = encode_diffusion_gemma_prefix(model, dict(prefix_inputs))
-            pair = make_seeded_policy_training_pair(clean, policy_contract, seed=plan.flow_seed)
+            pair = _canonical_training_pair(clean, policy_contract, plans)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 prediction = denoiser(
                     pair.input_actions,
@@ -1161,7 +1970,11 @@ def _run_validation(
     adapted.train()
     denoiser.train()
     model.model.encoder.eval()
-    loss = sum(numerators) / element_count
+    numerator = sum(numerators)
+    if data_parallel_size > 1:
+        numerator = float(_sum_data_parallel_scalar(numerator, device=device, dtype=torch.float64))
+        element_count = int(_sum_data_parallel_scalar(element_count, device=device, dtype=torch.int64))
+    loss = numerator / element_count
     replicated = torch.tensor(loss, device=device, dtype=torch.float64)
     assert_replicated_tensor("validation_loss", replicated)
     return loss
@@ -1367,7 +2180,7 @@ def _load_training_state(
         if len(recorded_hashes) != dist.get_world_size() or not all(
             isinstance(value, str) and len(value) == 64 for value in recorded_hashes
         ):
-            raise ValueError("checkpoint rank-state hash list does not match the TP topology")
+            raise ValueError("checkpoint rank-state hash list does not match the distributed topology")
         if artifact.get("sha256") != recorded_hashes[rank]:
             raise ValueError("checkpoint rank-state manifest hashes disagree")
         trainer_state = load_training_rank_state(
@@ -1417,7 +2230,34 @@ def main() -> None:
         type=int,
         help="Stop cleanly after this many updates in this invocation without changing the run contract.",
     )
-    parser.add_argument("--resume", type=Path)
+    restore_mode = parser.add_mutually_exclusive_group()
+    restore_mode.add_argument("--resume", type=Path)
+    restore_mode.add_argument(
+        "--fork-from",
+        type=Path,
+        help=(
+            "Start a new DP2 run from this frozen fork-manifest JSON; its adjacent "
+            "<name>.json.sha256 sidecar authenticates the document."
+        ),
+    )
+    restore_mode.add_argument(
+        "--topology-fork-from",
+        type=Path,
+        help=("Start a new TP1 or DP2 run from an authenticated 2500-boundary topology-fork manifest."),
+    )
+    parser.add_argument(
+        "--expected-fork-manifest-sha256",
+        action="append",
+        help="Preregistered raw SHA-256 of --fork-from; required for a new DP2 fork and forbidden on resume.",
+    )
+    parser.add_argument(
+        "--expected-topology-fork-manifest-sha256",
+        action="append",
+        help=(
+            "Preregistered raw SHA-256 of --topology-fork-from; required for a topology fork "
+            "and forbidden in other restore modes."
+        ),
+    )
     args = parser.parse_args()
 
     args.snapshot_root = args.snapshot_root.resolve()
@@ -1425,6 +2265,39 @@ def main() -> None:
     args.output_dir = args.output_dir.resolve()
     args.config = args.config.resolve()
     args.prefix_geometry_artifact = Path(os.path.abspath(args.prefix_geometry_artifact))
+    fork_manifest: dict[str, Any] | None = None
+    fork_manifest_sha256: str | None = None
+    fork_child_run_uuid: str | None = None
+    topology_fork_manifest: dict[str, Any] | None = None
+    topology_fork_manifest_sha256: str | None = None
+    topology_fork_child_run_uuid: str | None = None
+    expected_fork_manifest_sha256 = _validate_dp2_fork_digest_argument(
+        fork_from=args.fork_from,
+        resume=args.resume,
+        expected_sha256=args.expected_fork_manifest_sha256,
+    )
+    if args.fork_from is not None:
+        args.fork_from = Path(os.path.abspath(args.fork_from))
+        _validate_dp2_fork_cli(args)
+        fork_manifest, fork_manifest_sha256 = load_published_dp2_fork_manifest(args.fork_from)
+        if fork_manifest_sha256 != expected_fork_manifest_sha256:
+            raise ValueError("published fork manifest differs from --expected-fork-manifest-sha256")
+        fork_child_run_uuid = str(fork_manifest["child"]["run_uuid"])
+    expected_topology_fork_manifest_sha256 = _validate_topology_fork_digest_argument(
+        topology_fork_from=args.topology_fork_from,
+        resume=args.resume,
+        legacy_fork_from=args.fork_from,
+        expected_sha256=args.expected_topology_fork_manifest_sha256,
+    )
+    if args.topology_fork_from is not None:
+        args.topology_fork_from = Path(os.path.abspath(args.topology_fork_from))
+        topology_fork_manifest, topology_fork_manifest_sha256 = load_published_topology_fork_manifest(
+            args.topology_fork_from
+        )
+        if topology_fork_manifest_sha256 != expected_topology_fork_manifest_sha256:
+            raise ValueError("published topology fork differs from --expected-topology-fork-manifest-sha256")
+        _validate_topology_fork_cli(args, topology_fork_manifest)
+        topology_fork_child_run_uuid = str(topology_fork_manifest["child"]["run_uuid"])
     if args.resume is not None:
         args.resume = args.resume.resolve() if args.resume.is_absolute() else (args.output_dir / args.resume).resolve()
         try:
@@ -1433,21 +2306,33 @@ def main() -> None:
             raise ValueError("resume checkpoint must be inside output_dir") from exc
 
     project_root = Path(__file__).resolve().parents[1]
-    runtime_preflight = _configure_and_validate_training_runtime(project_root)
+    # Runtime selection must use the authenticated recipe topology: both TP2
+    # and DP2 expose two CUDA devices, but DP2 deliberately runs the qualified
+    # TP1 (train-single-gpu) software environment on each replica.
+    config = copy.deepcopy(load_resolved_toml(args.config))
+    runtime_preflight = _configure_and_validate_training_runtime(
+        project_root,
+        resolved_config=config,
+    )
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     dist.init_process_group("nccl", device_id=device)
-    if dist.get_world_size() != 2:
-        raise RuntimeError("LIBERO training requires TP world size 2")
+    expected_world_size = canonical_visible_cuda_world_size(os.environ)
+    if dist.get_world_size() != expected_world_size:
+        raise RuntimeError(
+            f"LIBERO training world size differs from the canonical visible-device topology: "
+            f"expected={expected_world_size}, observed={dist.get_world_size()}"
+        )
     rank = dist.get_rank()
     run_lock = None
     try:
         run_lock = _acquire_run_lock(args.output_dir)
-        config = load_resolved_toml(args.config)
-        config = copy.deepcopy(config)
         optimization = config["optimization"]
         training = config["training"]
+        # Reject an internally inconsistent committed recipe before applying
+        # any explicitly requested runtime overrides.
+        _validate_batch_contract(config)
         run_seed = int(config["reproducibility"]["seed"] if args.seed is None else args.seed)
         if not 0 <= run_seed <= (1 << 32) - 1:
             raise ValueError("run seed must be in [0, 4294967295] for PYTHONHASHSEED and NumPy")
@@ -1497,15 +2382,36 @@ def main() -> None:
         invalid = [name for name, value in positive_values.items() if value <= 0]
         if invalid or not 0 <= warmup_updates < total_updates:
             raise ValueError(f"invalid training schedule fields: {invalid}, warmup={warmup_updates}")
-        if validation_samples % PHYSICAL_BATCH_SIZE:
-            raise ValueError(f"validation samples must be divisible by physical batch {PHYSICAL_BATCH_SIZE}")
         if permanent_checkpoint_interval % checkpoint_interval:
             raise ValueError("permanent_checkpoint_interval must be a multiple of checkpoint_interval")
         optimization["total_updates"] = total_updates
         optimization["warmup_updates"] = warmup_updates
         optimization["microbatch_size"] = microbatch_size
         optimization["gradient_accumulation_steps"] = accumulation_steps
-        optimization["global_batch_size"] = microbatch_size * accumulation_steps
+        # In DP2 this is a global, not per-rank, batch. The explicit topology
+        # below accounts for the second rank when validating the local geometry.
+        optimization["global_batch_size"] = GLOBAL_BATCH_SIZE
+        physical_batch_size, accumulation_steps, serving_batch_size = _validate_batch_contract(config)
+        distributed = _data_parallel_contract(config, world_size=dist.get_world_size())
+        data_parallel_size = 1 if distributed is None else int(distributed["data_parallel_size"])
+        is_data_parallel = distributed is not None
+        _validate_dp2_restore_mode(
+            is_data_parallel=is_data_parallel,
+            has_fork_manifest=fork_manifest is not None,
+            has_resume_checkpoint=args.resume is not None,
+            has_topology_fork_manifest=topology_fork_manifest is not None,
+        )
+        if is_data_parallel and args.max_cached_files != int(training["max_cached_files"]):
+            raise ValueError(
+                f"DP2 --max-cached-files must equal the frozen training.max_cached_files={training['max_cached_files']}"
+            )
+        expert_batch_isolation = str(config["model"]["expert_batch_isolation"])
+        # Persist the serving geometry even for legacy TOMLs that predate its
+        # separation from the training physical-forward width.
+        optimization["serving_batch_size"] = serving_batch_size
+        validation_forward_width = physical_batch_size * data_parallel_size
+        if validation_samples % validation_forward_width:
+            raise ValueError(f"validation samples must be divisible by global forward width {validation_forward_width}")
         training["validation_interval"] = validation_interval
         training["validation_samples"] = validation_samples
         training["checkpoint_interval"] = checkpoint_interval
@@ -1546,6 +2452,8 @@ def main() -> None:
         model_tree_sha256 = str(model_snapshot_report["tree_metadata_sha256"])
         execution_environment = _execution_environment(runtime_preflight)
         config["execution_environment"] = execution_environment
+        execution_geometry = _execution_geometry(config)
+        config["execution_geometry"] = execution_geometry
         config["artifact_trees"] = {
             "dataset_content_inventory_sha256": dataset_content_inventory_sha256,
             "dataset_files_verified": dataset_files_verified,
@@ -1559,6 +2467,53 @@ def main() -> None:
         source_sha256 = _source_tree_sha256(project_root)
         config["source_tree_sha256"] = source_sha256
         config_sha256 = canonical_config_sha256(config)
+
+        fork_parent_checkpoint: Path | None = None
+        fork_parent_manifest: dict[str, Any] | None = None
+        topology_fork_parent_checkpoint: Path | None = None
+        topology_fork_parent_manifest: dict[str, Any] | None = None
+        if fork_manifest is not None:
+            assert fork_manifest_sha256 is not None
+            assert fork_child_run_uuid is not None
+            authenticate_dp2_child_environment(
+                fork_manifest,
+                fork_manifest_path=args.fork_from,
+                fork_manifest_sha256=fork_manifest_sha256,
+                project_root=project_root,
+                config_path=args.config,
+                child_output_dir=args.output_dir,
+                child_run_uuid=fork_child_run_uuid,
+                live_train_venv_identity=runtime_preflight["train_venv"],
+                live_training_gpu_uuids=execution_environment["gpu_uuids"],
+            )
+            fork_parent_checkpoint, fork_parent_manifest, _ = authenticate_dp2_fork_parent(
+                fork_manifest,
+                fork_manifest_path=args.fork_from,
+                fork_manifest_sha256=fork_manifest_sha256,
+            )
+        if topology_fork_manifest is not None:
+            assert topology_fork_manifest_sha256 is not None
+            assert topology_fork_child_run_uuid is not None
+            authenticate_topology_child_environment(
+                topology_fork_manifest,
+                manifest_path=args.topology_fork_from,
+                manifest_sha256=topology_fork_manifest_sha256,
+                project_root=project_root,
+                config_path=args.config,
+                child_output_dir=args.output_dir,
+                child_run_uuid=topology_fork_child_run_uuid,
+                live_train_venv_identity=runtime_preflight["train_venv"],
+                live_training_gpu_uuids=execution_environment["gpu_uuids"],
+            )
+            (
+                topology_fork_parent_checkpoint,
+                topology_fork_parent_manifest,
+                _,
+            ) = authenticate_topology_fork_parent(
+                topology_fork_manifest,
+                manifest_path=args.topology_fork_from,
+                manifest_sha256=topology_fork_manifest_sha256,
+            )
 
         recover_bootstrap = _prepare_output(
             args.output_dir,
@@ -1584,6 +2539,7 @@ def main() -> None:
             config_sha256=config_sha256,
             resume=args.resume,
             recover_bootstrap=recover_bootstrap,
+            new_run_uuid=fork_child_run_uuid or topology_fork_child_run_uuid,
         )
         dist.barrier()
 
@@ -1606,7 +2562,7 @@ def main() -> None:
             "dataset_revision": LIBERO_DATASET_REVISION,
             "dataset_total_bytes": str(dataset_total_bytes),
             "dataset_tree_sha256": dataset_tree_sha256,
-            "expert_batch_isolation": EXPERT_BATCH_ISOLATION,
+            "expert_batch_isolation": expert_batch_isolation,
             "execution_environment_sha256": canonical_config_sha256(execution_environment),
             "experts_implementation": GROUPED_MM_EXPERTS_IMPLEMENTATION,
             "fixed_physical_prefix_width": str(fixed_physical_prefix_width),
@@ -1614,21 +2570,94 @@ def main() -> None:
             "model_revision": DEFAULT_DIFFUSION_GEMMA_SPEC.revision,
             "model_tree_sha256": model_tree_sha256,
             "normalization_sha256": normalization_sha256,
-            "physical_batch_size": str(PHYSICAL_BATCH_SIZE),
+            "physical_batch_size": str(physical_batch_size),
             "policy_contract_sha256": canonical_config_sha256(policy_contract.to_dict()),
             "prefix_geometry_content_sha256": prefix_geometry_content_sha256,
             "run_uuid": run_uuid,
+            "serving_batch_size": str(serving_batch_size),
             "source_tree_sha256": source_sha256,
         }
+        if distributed is not None:
+            run_contract.update(
+                canonical_plan_partition=str(distributed["canonical_plan_partition"]),
+                data_parallel_size=str(distributed["data_parallel_size"]),
+                gradient_reduction=str(distributed["gradient_reduction"]),
+                max_cached_files=str(args.max_cached_files),
+                rank_physical_batch_size=str(distributed["rank_physical_batch_size"]),
+                strategy=str(distributed["strategy"]),
+                tensor_parallel_size=str(distributed["tensor_parallel_size"]),
+                world_size=str(distributed["world_size"]),
+            )
+        if config.get("execution_profile") is not None:
+            run_contract.update(
+                execution_profile=str(config["execution_profile"]),
+                tensor_parallel_size=str(config["model"]["tensor_parallel_size"]),
+            )
+        if "shared_weight_kernel_sha256" in execution_geometry:
+            run_contract["shared_weight_kernel_sha256"] = str(execution_geometry["shared_weight_kernel_sha256"])
 
+        fork_lineage: dict[str, Any] | None = None
+        topology_lineage: dict[str, Any] | None = None
+        if fork_manifest is not None:
+            assert fork_manifest_sha256 is not None
+            _merge_dp2_fork_run_contract(
+                run_contract,
+                dp2_fork_run_contract(
+                    fork_manifest,
+                    fork_manifest_sha256=fork_manifest_sha256,
+                ),
+            )
+        if topology_fork_manifest is not None:
+            assert topology_fork_manifest_sha256 is not None
+            _merge_topology_fork_run_contract(
+                run_contract,
+                topology_fork_run_contract(
+                    topology_fork_manifest,
+                    manifest_sha256=topology_fork_manifest_sha256,
+                ),
+            )
         resume_manifest = load_checkpoint_manifest(args.resume) if args.resume is not None else None
         if resume_manifest is not None:
+            if has_topology_fork_lineage(resume_manifest):
+                topology_fields, topology_lineage = validate_topology_checkpoint_lineage(resume_manifest)
+                if dp2_semantic_recipe_sha256(config) != topology_lineage["semantic_recipe_sha256"]:
+                    raise ValueError("resume semantic recipe differs from its authenticated topology fork")
+                _merge_topology_fork_run_contract(run_contract, topology_fields)
+            elif is_data_parallel:
+                fork_fields, fork_lineage = validate_dp2_checkpoint_lineage(resume_manifest)
+                if dp2_semantic_recipe_sha256(config) != fork_lineage["semantic_recipe_sha256"]:
+                    raise ValueError("DP2 resume semantic recipe differs from its authenticated fork lineage")
+                _merge_dp2_fork_run_contract(
+                    run_contract,
+                    {
+                        **fork_fields,
+                        "data_parallel_size": run_contract["data_parallel_size"],
+                        "execution_profile": run_contract["execution_profile"],
+                        "max_cached_files": run_contract["max_cached_files"],
+                        "run_uuid": run_contract["run_uuid"],
+                        "source_tree_sha256": run_contract["source_tree_sha256"],
+                    },
+                )
+            elif has_dp2_checkpoint_lineage(resume_manifest):
+                raise ValueError("non-DP resume checkpoint unexpectedly carries DP2 fork lineage")
             _validate_checkpoint_execution_geometry(args.resume, resume_manifest, config)
             resumed_policy_contract = validate_manifest_policy_contract(resume_manifest, config)
             if resumed_policy_contract != policy_contract:
                 raise ValueError("resume checkpoint policy contract mismatch")
             if resume_manifest.get("policy_contract_sha256") != run_contract["policy_contract_sha256"]:
                 raise ValueError("resume checkpoint policy contract SHA-256 mismatch")
+        elif fork_parent_manifest is not None:
+            parent_policy_contract = validate_manifest_policy_contract(fork_parent_manifest, config)
+            if parent_policy_contract != policy_contract:
+                raise ValueError("fork parent checkpoint policy contract mismatch")
+            if fork_parent_manifest.get("policy_contract_sha256") != run_contract["policy_contract_sha256"]:
+                raise ValueError("fork parent checkpoint policy contract SHA-256 mismatch")
+        elif topology_fork_parent_manifest is not None:
+            parent_policy_contract = validate_manifest_policy_contract(topology_fork_parent_manifest, config)
+            if parent_policy_contract != policy_contract:
+                raise ValueError("topology fork parent checkpoint policy contract mismatch")
+            if topology_fork_parent_manifest.get("policy_contract_sha256") != run_contract["policy_contract_sha256"]:
+                raise ValueError("topology fork parent checkpoint policy contract SHA-256 mismatch")
 
         random.seed(2026 + run_seed)
         np.random.seed((2026 + run_seed) % (1 << 32))
@@ -1638,18 +2667,33 @@ def main() -> None:
             revision=DEFAULT_DIFFUSION_GEMMA_SPEC.revision,
             local_files_only=True,
         )
-        model = load_diffusion_gemma_bf16_tp(local_files_only=True, tp_size=dist.get_world_size())
-        install_sample_isolated_grouped_mm_experts(
-            model,
-            physical_batch_size=PHYSICAL_BATCH_SIZE,
+        loader_kwargs: dict[str, Any] = {}
+        if is_data_parallel:
+            loader_kwargs["replica_mode"] = DATA_PARALLEL_STRATEGY
+        model = load_diffusion_gemma_bf16_tp(
+            local_files_only=True,
+            tp_size=int(config["model"]["tensor_parallel_size"]),
+            **loader_kwargs,
         )
-        verify_sample_isolated_grouped_mm_experts(
+        _install_expert_batch_isolation(
             model,
-            physical_batch_size=PHYSICAL_BATCH_SIZE,
+            backend=expert_batch_isolation,
+            physical_batch_size=physical_batch_size,
+        )
+        _verify_expert_batch_isolation(
+            model,
+            backend=expert_batch_isolation,
+            physical_batch_size=physical_batch_size,
         )
         backend = DiffusionGemmaActionDecoder.from_block_diffusion_model(model)
         torch.manual_seed(2027 + run_seed)
-        if args.resume is None:
+        trainable_checkpoint = (
+            args.resume if args.resume is not None else topology_fork_parent_checkpoint or fork_parent_checkpoint
+        )
+        trainable_manifest = (
+            resume_manifest if resume_manifest is not None else topology_fork_parent_manifest or fork_parent_manifest
+        )
+        if trainable_checkpoint is None:
             adapted = apply_decoder_attention_lora(
                 model,
                 rank=int(config["lora"]["rank"]),
@@ -1658,15 +2702,16 @@ def main() -> None:
             )
         else:
             adapted, _ = load_lora_checkpoint(
-                args.resume,
+                trainable_checkpoint,
                 model,
                 is_trainable=True,
                 validate_decoder_contract=True,
                 expected_rank=int(config["lora"]["rank"]),
             )
-        verify_sample_isolated_grouped_mm_experts(
+        _verify_expert_batch_isolation(
             model,
-            physical_batch_size=PHYSICAL_BATCH_SIZE,
+            backend=expert_batch_isolation,
+            physical_batch_size=physical_batch_size,
         )
         projector = ActionInputProjector(interface_config).to(device)
         head = VelocityHead(
@@ -1674,11 +2719,11 @@ def main() -> None:
             interface_config.action_dim,
             init_std=interface_config.output_init_std,
         ).to(device)
-        if args.resume is not None:
-            assert resume_manifest is not None
-            interface_artifact = resume_manifest["artifacts"]["interface"]
+        if trainable_checkpoint is not None:
+            assert trainable_manifest is not None
+            interface_artifact = trainable_manifest["artifacts"]["interface"]
             load_interface_state_dict(
-                args.resume / interface_artifact["path"],
+                trainable_checkpoint / interface_artifact["path"],
                 {"action_projector": projector, "velocity_head": head},
             )
         denoiser = DuoVLADenoiser(projector, backend, head).train()
@@ -1695,6 +2740,9 @@ def main() -> None:
         lora_parameters = [parameter for _, parameter in lora_named_parameters]
         interface_parameters = [parameter for _, parameter in interface_named_parameters]
         _assert_fp32_trainables(lora_parameters, interface_parameters)
+        if is_data_parallel:
+            _assert_data_parallel_trainables_are_replicated(lora_partition, lora_named_parameters)
+            assert_replicated_parameter_values([*lora_named_parameters, *interface_named_parameters])
         optimization_config = OptimizationConfig(
             lora_learning_rate=float(optimization["lora_learning_rate"]),
             interface_learning_rate=float(optimization["interface_learning_rate"]),
@@ -1717,7 +2765,48 @@ def main() -> None:
             optimizer,
             optimizer_named_parameters,
         )
-        if args.resume is None:
+        if topology_fork_manifest is not None:
+            assert topology_fork_manifest_sha256 is not None
+            topology_restore = restore_topology_fork_training_state(
+                topology_fork_manifest,
+                manifest_path=args.topology_fork_from,
+                manifest_sha256=topology_fork_manifest_sha256,
+                rank=rank,
+                world_size=dist.get_world_size(),
+                optimizer=optimizer,
+                named_parameters=optimizer_named_parameters,
+                scheduler=scheduler,
+                child_run_contract=run_contract,
+                device=device,
+            )
+            trainer_state = topology_restore.trainer_state
+            topology_lineage = topology_restore.lineage
+            if topology_fork_child_run_uuid != run_uuid:
+                raise RuntimeError("restored topology fork child identity differs from the active run")
+        elif fork_manifest is not None:
+            assert fork_manifest_sha256 is not None
+            fork_restore = restore_tp1_fork_training_state(
+                fork_manifest,
+                fork_manifest_path=args.fork_from,
+                fork_manifest_sha256=fork_manifest_sha256,
+                rank=rank,
+                world_size=dist.get_world_size(),
+                optimizer=optimizer,
+                named_parameters=optimizer_named_parameters,
+                scheduler=scheduler,
+                child_run_contract=run_contract,
+                device=device,
+            )
+            trainer_state = fork_restore.trainer_state
+            fork_lineage = fork_restore.lineage_dict()
+            if (
+                fork_restore.child_run_uuid != run_uuid
+                or fork_restore.child_run_seed != run_seed
+                or fork_restore.parent_run_seed != run_seed
+                or fork_restore.child_source_tree_sha256 != source_sha256
+            ):
+                raise RuntimeError("restored DP2 fork identity differs from the active child run")
+        elif args.resume is None:
             trainer_state = TrainerState()
         else:
             assert resume_manifest is not None
@@ -1730,12 +2819,13 @@ def main() -> None:
                 run_contract=run_contract,
                 device=device,
             )
+        if trainable_checkpoint is not None:
             _assert_fp32_optimizer_state(optimizer)
             validate_training_progress(
                 trainer_state,
                 optimizer=optimizer,
                 scheduler=scheduler,
-                examples_per_update=microbatch_size * accumulation_steps,
+                examples_per_update=GLOBAL_BATCH_SIZE,
                 expected_learning_rates=[
                     optimization_config.lora_learning_rate
                     * learning_rate_scale(trainer_state.next_update, optimization_config),
@@ -1743,7 +2833,10 @@ def main() -> None:
                     * learning_rate_scale(trainer_state.next_update, optimization_config),
                 ],
             )
-            _assert_distributed_trainer_state(trainer_state, resume_manifest)
+            assert trainable_manifest is not None
+            _assert_distributed_trainer_state(trainer_state, trainable_manifest)
+            if is_data_parallel:
+                _assert_replicated_optimizer_state(optimizer, optimizer_named_parameters)
         if trainer_state.next_update > total_updates:
             raise ValueError("resume checkpoint is beyond the configured training budget")
         parent_checkpoint = (
@@ -1765,34 +2858,72 @@ def main() -> None:
         started = time.perf_counter()
         for update in range(trainer_state.next_update, execution_end):
             update_started = time.perf_counter()
-            plans = make_update_plan(run_seed, update, gradient_accumulation_steps=accumulation_steps)
-            batches = [
-                _materialize_batch(
-                    dataset,
-                    train_sampler,
-                    count=microbatch_size,
-                    seed=plan.data_seed,
-                    state_normalizer=state_normalizer,
-                    action_normalizer=action_normalizer,
+            plan_groups = (
+                _rank_canonical_update_plan_groups(
+                    run_seed,
+                    update,
+                    rank=rank,
+                    data_parallel_size=data_parallel_size,
+                    physical_batch_size=physical_batch_size,
                 )
-                for plan in plans
-            ]
-            total_elements = sum(
+                if is_data_parallel
+                else _canonical_update_plan_groups(
+                    run_seed,
+                    update,
+                    physical_batch_size=physical_batch_size,
+                )
+            )
+            canonical_plans = tuple(plan for group in plan_groups for plan in group)
+            canonical_batches = _materialize_canonical_batches(
+                dataset,
+                train_sampler,
+                canonical_plans,
+                state_normalizer=state_normalizer,
+                action_normalizer=action_normalizer,
+            )
+            chunks_per_forward = physical_batch_size // CANONICAL_STREAM_BATCH_SIZE
+            batches = tuple(
+                _coalesce_canonical_batches(
+                    canonical_batches[start : start + chunks_per_forward],
+                    physical_batch_size=physical_batch_size,
+                )
+                for start in range(0, len(canonical_batches), chunks_per_forward)
+            )
+            if len(plan_groups) != len(batches) or len(batches) != accumulation_steps:
+                raise RuntimeError("physical update grouping differs from the resolved accumulation contract")
+            local_total_elements = sum(
                 masked_element_count(
                     batch.action_valid_mask,
                     action_dim=interface_config.action_dim,
                 )
                 for batch in batches
             )
+            total_elements = (
+                int(
+                    _sum_data_parallel_scalar(
+                        local_total_elements,
+                        device=device,
+                        dtype=torch.int64,
+                    )
+                )
+                if is_data_parallel
+                else local_total_elements
+            )
             optimizer.zero_grad(set_to_none=True)
             numerator = 0.0
-            for microstep, (plan, batch) in enumerate(zip(plans, batches, strict=True)):
+            for microstep, (plans, batch) in enumerate(zip(plan_groups, batches, strict=True)):
                 state = batch.states.to(device)
                 clean = batch.clean_actions.to(device)
                 valid = batch.action_valid_mask.to(device)
-                prefix_inputs = _processor_inputs(processor, batch.samples, device, prefix_geometry)
+                prefix_inputs = _processor_inputs(
+                    processor,
+                    batch.samples,
+                    device,
+                    prefix_geometry,
+                    expected_batch_size=physical_batch_size,
+                )
                 prefix = encode_diffusion_gemma_prefix(model, dict(prefix_inputs))
-                pair = make_seeded_policy_training_pair(clean, policy_contract, seed=plan.flow_seed)
+                pair = _canonical_training_pair(clean, policy_contract, plans)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     prediction = denoiser(
                         pair.input_actions,
@@ -1805,12 +2936,18 @@ def main() -> None:
                 component = masked_sse(prediction, pair.target, valid)
                 component.loss_for_total(total_elements).backward()
                 numerator += float(component.squared_error_sum.detach())
-                if update == 0 and microstep == 0:
+                if update == invocation_start_update and microstep == 0:
                     _assert_initial_gradients_present(
                         lora_partition,
                         interface_named_parameters,
+                        data_parallel=is_data_parallel,
                     )
             _assert_distributed_gradient_health([*lora_parameters, *interface_parameters])
+            if is_data_parallel:
+                _sum_data_parallel_gradients_(optimizer_named_parameters)
+                _assert_distributed_gradient_health([*lora_parameters, *interface_parameters])
+                if update == invocation_start_update:
+                    _assert_replicated_gradient_values(optimizer_named_parameters)
             gradient_norm = clip_tensor_parallel_grad_norm_(
                 [*(parameter for _, parameter in lora_partition.replicated), *interface_parameters],
                 [parameter for _, parameter in lora_partition.sharded],
@@ -1822,15 +2959,24 @@ def main() -> None:
             if update == invocation_start_update:
                 _assert_fp32_optimizer_state(optimizer)
             scheduler.step()
-            trainer_state = trainer_state.advance(examples=microbatch_size * accumulation_steps)
-            if update == 0:
+            trainer_state = trainer_state.advance(examples=GLOBAL_BATCH_SIZE)
+            if is_data_parallel and update == invocation_start_update:
+                assert_replicated_parameter_values(optimizer_named_parameters)
+            elif update == 0:
                 assert_replicated_parameter_values(interface_named_parameters)
-            train_loss = numerator / total_elements
+            global_numerator = (
+                float(_sum_data_parallel_scalar(numerator, device=device, dtype=torch.float64))
+                if is_data_parallel
+                else numerator
+            )
+            train_loss = global_numerator / total_elements
             assert_replicated_tensor(
                 f"train_loss.{trainer_state.next_update}",
                 torch.tensor(train_loss, device=device, dtype=torch.float64),
             )
             update_seconds = time.perf_counter() - update_started
+            if is_data_parallel:
+                update_seconds = _max_data_parallel_seconds(update_seconds, device=device)
             metric: dict[str, Any] = {
                 "examples_seen": trainer_state.examples_seen,
                 "gradient_norm": float(gradient_norm),
@@ -1841,6 +2987,12 @@ def main() -> None:
                 "update": trainer_state.next_update,
                 "update_seconds": update_seconds,
             }
+            if is_data_parallel:
+                metric.update(
+                    data_parallel_size=data_parallel_size,
+                    global_batch_size=GLOBAL_BATCH_SIZE,
+                    rank_physical_batch_size=physical_batch_size,
+                )
             should_validate = _validation_is_due(
                 next_update=trainer_state.next_update,
                 total_updates=total_updates,
@@ -1858,10 +3010,11 @@ def main() -> None:
                     adapted=adapted,
                     device=device,
                     samples=validation_samples,
-                    microbatch_size=microbatch_size,
+                    physical_batch_size=physical_batch_size,
                     validation_seed=validation_seed,
                     policy_contract=policy_contract,
                     prefix_geometry=prefix_geometry,
+                    data_parallel_size=data_parallel_size,
                 )
             should_checkpoint = (
                 trainer_state.next_update % checkpoint_interval == 0
@@ -1869,6 +3022,9 @@ def main() -> None:
                 or trainer_state.next_update == execution_end
             )
             if should_checkpoint:
+                allocator_peak_memory_bytes_by_rank = (
+                    _data_parallel_peak_memory_bytes(device) if is_data_parallel else None
+                )
                 replicated_checkpoint_parameters = [
                     *lora_partition.replicated,
                     *interface_named_parameters,
@@ -1903,10 +3059,11 @@ def main() -> None:
                         "dataset_revision": LIBERO_DATASET_REVISION,
                         "dataset_total_bytes": dataset_total_bytes,
                         "dataset_tree_sha256": dataset_tree_sha256,
-                        "expert_batch_isolation": EXPERT_BATCH_ISOLATION,
+                        "expert_batch_isolation": expert_batch_isolation,
                         "execution_environment": execution_environment,
                         "execution_environment_sha256": run_contract["execution_environment_sha256"],
                         "experts_implementation": GROUPED_MM_EXPERTS_IMPLEMENTATION,
+                        "execution_geometry": execution_geometry,
                         "fixed_physical_prefix_width": fixed_physical_prefix_width,
                         "kind": "resumable-libero-training",
                         "last_metrics": metric,
@@ -1923,7 +3080,7 @@ def main() -> None:
                             permanent_checkpoint_interval=permanent_checkpoint_interval,
                             parent_checkpoint=parent_checkpoint,
                         ),
-                        "physical_batch_size": PHYSICAL_BATCH_SIZE,
+                        "physical_batch_size": physical_batch_size,
                         "platform": platform.platform(),
                         "policy_contract": policy_contract.to_dict(),
                         "policy_contract_sha256": run_contract["policy_contract_sha256"],
@@ -1932,10 +3089,55 @@ def main() -> None:
                         "replicated_parameter_sha256": replicated_parameter_sha256,
                         "run_seed": run_seed,
                         "run_uuid": run_uuid,
+                        "serving_batch_size": serving_batch_size,
                         "source_tree_sha256": source_sha256,
                         "task": args.task,
                         "train_episode_count": len(train_indices),
                         "validation_episode_count": len(validation_indices),
+                        **(
+                            {
+                                "fork_lineage": fork_lineage,
+                                **{name: run_contract[name] for name in sorted(_DP2_FORK_ONLY_RUN_CONTRACT_FIELDS)},
+                            }
+                            if fork_lineage is not None
+                            else {}
+                        ),
+                        **(
+                            {
+                                "topology_fork_lineage": topology_lineage,
+                                **{name: run_contract[name] for name in sorted(TOPOLOGY_FORK_CHECKPOINT_FIELDS)},
+                            }
+                            if topology_lineage is not None
+                            else {}
+                        ),
+                        **(
+                            {
+                                "cuda_allocator_peak_memory_bytes_by_rank": allocator_peak_memory_bytes_by_rank,
+                                "cuda_allocator_peak_memory_bytes_max": max(allocator_peak_memory_bytes_by_rank),
+                                "canonical_plan_partition": distributed["canonical_plan_partition"],
+                                "data_parallel_size": distributed["data_parallel_size"],
+                                "gradient_reduction": distributed["gradient_reduction"],
+                                "max_cached_files": args.max_cached_files,
+                                "rank_physical_batch_size": distributed["rank_physical_batch_size"],
+                                "strategy": distributed["strategy"],
+                                "world_size": distributed["world_size"],
+                            }
+                            if distributed is not None
+                            else {}
+                        ),
+                        **(
+                            {"shared_weight_kernel_sha256": execution_geometry["shared_weight_kernel_sha256"]}
+                            if "shared_weight_kernel_sha256" in execution_geometry
+                            else {}
+                        ),
+                        **(
+                            {
+                                "execution_profile": run_contract["execution_profile"],
+                                "tensor_parallel_size": int(config["model"]["tensor_parallel_size"]),
+                            }
+                            if "execution_profile" in run_contract
+                            else {}
+                        ),
                     },
                     device=device,
                 )
@@ -1960,17 +3162,30 @@ def main() -> None:
                 ),
             )
         dist.barrier()
+        peak_memory_gib_by_rank = _data_parallel_peak_memory_gib(device) if is_data_parallel else None
         if rank == 0:
+            completion: dict[str, Any] = {
+                "complete": trainer_state.next_update == total_updates,
+                "elapsed_seconds": time.perf_counter() - started,
+                "examples_seen": trainer_state.examples_seen,
+                "final_update": trainer_state.next_update,
+                "output_dir": str(args.output_dir),
+                "peak_memory_gib": (
+                    max(peak_memory_gib_by_rank)
+                    if peak_memory_gib_by_rank is not None
+                    else torch.cuda.max_memory_allocated(device) / 2**30
+                ),
+            }
+            if peak_memory_gib_by_rank is not None:
+                completion.update(
+                    data_parallel_size=data_parallel_size,
+                    global_batch_size=GLOBAL_BATCH_SIZE,
+                    peak_memory_gib_by_rank=peak_memory_gib_by_rank,
+                    rank_physical_batch_size=physical_batch_size,
+                )
             print(
                 json.dumps(
-                    {
-                        "complete": trainer_state.next_update == total_updates,
-                        "elapsed_seconds": time.perf_counter() - started,
-                        "examples_seen": trainer_state.examples_seen,
-                        "final_update": trainer_state.next_update,
-                        "output_dir": str(args.output_dir),
-                        "peak_memory_gib": torch.cuda.max_memory_allocated(device) / 2**30,
-                    },
+                    completion,
                     indent=2,
                     sort_keys=True,
                 )

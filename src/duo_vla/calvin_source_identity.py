@@ -10,12 +10,17 @@ from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 
 _IDENTITY_FIELDS = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns", "st_nlink")
+_BINDING_FIELDS = ("st_dev", "st_ino", "st_mode")
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_NONBLOCK | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _FILE_OPEN_FLAGS = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
 def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
     return all(getattr(left, field) == getattr(right, field) for field in _IDENTITY_FIELDS)
+
+
+def _same_binding(left: os.stat_result, right: os.stat_result) -> bool:
+    return all(getattr(left, field) == getattr(right, field) for field in _BINDING_FIELDS)
 
 
 def _canonical_relative_parts(relative_text: str) -> tuple[str, ...]:
@@ -85,10 +90,16 @@ def _verify_absolute_directory_chain(
 ) -> None:
     root_descriptor = os.fstat(descriptors[0])
     root_path = os.stat("/", follow_symlinks=False)
-    if not _same_identity(root_descriptor, root_path):
+    if not _same_binding(root_descriptor, root_path):
         raise RuntimeError("CALVIN source-tree filesystem root changed while reading")
-    for parent_fd, name, child_fd, expected, context in reversed(bindings):
-        _verify_directory_binding(parent_fd, name, child_fd, expected, context=context)
+    for index, (parent_fd, name, child_fd, expected, context) in reversed(tuple(enumerate(bindings))):
+        if index == len(bindings) - 1:
+            _verify_directory_binding(parent_fd, name, child_fd, expected, context=context)
+            continue
+        after_descriptor = os.fstat(child_fd)
+        after_path = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not _same_binding(expected, after_descriptor) or not _same_binding(expected, after_path):
+            raise RuntimeError(f"CALVIN source-tree ancestor changed while reading: {context}")
 
 
 def _walk_source_directory(descriptor: int, prefix: tuple[str, ...], output: list[str]) -> None:

@@ -52,9 +52,9 @@ EXPECTED_SOURCE_URL = "https://github.com/huggingface/LIBERO.git"
 EXPECTED_ASSETS_REVISION = "0b3ea86be5fe169d0fd036ae63d1070ec09e90f6"
 EXPECTED_ASSETS_REPO = "lerobot/libero-assets"
 EXPECTED_ASSETS_IDENTITY = {
-    "file_count": 1_761,
-    "root_sha256": "419a4eb55ad97c2ba834ace741330747015ddd01bc48b94d9b8f93aebaa6b1dc",
-    "total_bytes": 422_500_901,
+    "file_count": 586,
+    "root_sha256": "8d0757e06f484cef06e08349a1d8bc2790fea5831e36d82e00174508856c659f",
+    "total_bytes": 422_320_936,
 }
 EXPECTED_EVAL_LOCK_SHA256 = "81210a8d7bd58233ca24bd94fd2700e243329f267fd7c25e65c1f41497d57a3c"
 EXPECTED_INSTALLED_DISTRIBUTIONS_SHA256 = "03d681d41088af5db6e97148ba9318ae03e19dd932355ae1a961b91a522950d9"
@@ -149,8 +149,8 @@ _EXPECTED_DISTRIBUTION_INVENTORIES = {
     "hydra-core": "764d54731d23a4e2e7fecf44fbc1022a7da8e7c85879912a253e5d9017696b97",
     "llvmlite": "abd239d163551c38ec6da92073bced68d0a6549790e784e74a12c9e814a7bd14",
     "mujoco": "712fb2f4e6f0b691951761233735f3c35497a1d9075e1ea903dd0d37a35d991b",
-    "numpy": "2ad9c2f80f76f25e839e6cea25e7100a0295c79bc3371b7494c38871f55cd470",
-    "numba": "3adda757867501f89e5b7c0092c9ca6381c6fd961b4e5f417cfc4e0d089d6cb0",
+    "numpy": "8744c53c2a84c80d48a2c7eebeefb4ced8598c4a3d6e37c90f88e0c1672030ca",
+    "numba": "d98d44f7569289973f838974274985294ee18e025a0873c8950c598de2784075",
     "omegaconf": "b36941cf9e1a06d9cf555232e9940a4663f60c11bd784151f824b7c0eaef7198",
     "opencv-python": "28532619d2092f4ab7bb15a2f43521422b9e03d7e1994753a6581f5e386e457e",
     "robomimic": "aa5325c87fa33e14e361c68e61a66d0828488284666ce9f3445ed1bb0bf3f140",
@@ -539,7 +539,23 @@ def verify_distribution_records(venv_root: Path) -> dict[str, dict[str, Any]]:
             encoded = base64.urlsafe_b64encode(digest.digest()).rstrip(b"=").decode("ascii")
             require(encoded == entry.hash.value, f"installed distribution file hash mismatch: {path}")
             checked += 1
-            inventory.append({"hash": f"{entry.hash.mode}={entry.hash.value}", "path": str(entry)})
+            inventory_hash = f"{entry.hash.mode}={entry.hash.value}"
+            if str(entry).startswith("../../../bin/"):
+                payload = path.read_bytes()
+                shebang, separator, remainder = payload.partition(b"\n")
+                allowed_shebangs = {
+                    f"#!{venv_root}/bin/python".encode(),
+                    f"#!{venv_root}/bin/python3".encode(),
+                }
+                require(
+                    separator == b"\n" and shebang in allowed_shebangs,
+                    f"evaluator entry point has an unexpected interpreter: {path}",
+                )
+                normalized = b"#!<VENV>/bin/python\n" + remainder
+                normalized_digest = hashlib.sha256(normalized).digest()
+                normalized_value = base64.urlsafe_b64encode(normalized_digest).rstrip(b"=").decode("ascii")
+                inventory_hash = f"sha256={normalized_value}"
+            inventory.append({"hash": inventory_hash, "path": str(entry)})
         require(checked > 0, f"distribution has no hashed RECORD files: {distribution_name}")
         reports[distribution_name] = {
             "inventory_sha256": canonical_sha256(inventory),

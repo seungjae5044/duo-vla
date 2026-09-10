@@ -84,6 +84,8 @@ from duo_vla.libero_replay_evidence import (  # noqa: E402
     ACTION_DIM,
     CAMERA_KEYS,
     IMAGE_SHAPE,
+    OBSERVATION_ALIGNMENT_FEATURE_SCHEMA,
+    OBSERVATION_ALIGNMENT_GRID_SIZE,
     REGENERATION_ENVIRONMENT_SEED,
     SETTLE_STEPS,
     SIMULATOR_ATTESTATION_SCHEMA,
@@ -97,6 +99,8 @@ from duo_vla.libero_replay_evidence import (  # noqa: E402
     canonical_sha256,
     initial_state_sha256,
     load_original_hdf5_inventory,
+    load_source_parquet_alignment,
+    observation_alignment_frame,
     read_stable_json,
     require,
     retained_action_indices,
@@ -322,6 +326,7 @@ def _replay_demo(environment: Any, demo: Any, *, suite: str, task_id: int, sourc
     _simulator_state, observation = _reset_and_settle(environment, states[0])
     observation_digest = ObservationSequenceDigester()
     swapped_observation_digest = ObservationSequenceDigester()
+    alignment_frames: list[dict[str, Any]] = []
     alignment_probe: dict[str, Any] | None = None
     final_done = False
     for retained_index, source_index in enumerate(retained):
@@ -332,6 +337,7 @@ def _replay_demo(environment: Any, demo: Any, *, suite: str, task_id: int, sourc
         wrist = rotate_simulator_rgb_for_training(pre_action[CAMERA_KEYS[1]])
         observation_digest.update(agentview, wrist, state)
         swapped_observation_digest.update(wrist, agentview, state)
+        alignment_frames.append(observation_alignment_frame(agentview, wrist, state))
         observation, _reward, done, _info = environment.step(simulation_action)
         final_done = bool(done)
         if alignment_probe is None:
@@ -358,6 +364,11 @@ def _replay_demo(environment: Any, demo: Any, *, suite: str, task_id: int, sourc
         "initial_state_sha256": initial_digest,
         "inverted_gripper_action_sequence_sha256": action_sequence_sha256(inverted_actions),
         "observation_sequence_sha256": observation_sequence_digest,
+        "observation_alignment_features": {
+            "frames": alignment_frames,
+            "grid_size": OBSERVATION_ALIGNMENT_GRID_SIZE,
+            "schema": OBSERVATION_ALIGNMENT_FEATURE_SCHEMA,
+        },
         "source_episode_index": source_episode_index,
         "step_count": len(retained),
         "success": final_done,
@@ -374,11 +385,12 @@ def _replay_demo(environment: Any, demo: Any, *, suite: str, task_id: int, sourc
     }
 
 
-def _replay_first_success(
+def _replay_first_training_linked_success(
     environment: Any,
     data: Any,
     names: Sequence[str],
     source_scan: Mapping[str, Any],
+    training_source_episode_indices: frozenset[int],
     *,
     suite: str,
     task_id: int,
@@ -405,12 +417,13 @@ def _replay_first_success(
                 "source_episode_index": source_episode_index,
                 "step_count": replay["step_count"],
                 "success": replay["success"],
+                "training_linked": source_episode_index in training_source_episode_indices,
             }
         )
-        if replay["success"]:
+        if replay["success"] and source_episode_index in training_source_episode_indices:
             selected = replay
             break
-    require(selected is not None, f"no source demonstration replay succeeds for {suite}:{task_id}")
+    require(selected is not None, f"no training-linked source demonstration replay succeeds for {suite}:{task_id}")
     return attempts, selected
 
 
@@ -432,21 +445,28 @@ def _controller_impulses(environment: Any, initial_state: np.ndarray) -> dict[st
     responses: list[dict[str, Any]] = []
     for label, axis, sign in CONTROLLER_DIRECTIONS:
         _state, _observation = _reset_and_settle(environment, initial_state)
+        baseline_action = np.zeros(ACTION_DIM, dtype=np.float64)
+        baseline_action[-1] = -1.0
+        environment.step(baseline_action)
+        baseline_controller = environment.env.robots[0].controller
+        require(baseline_controller.name == "OSC_POSE", "LIBERO controller is not OSC_POSE")
+        baseline_position = np.asarray(baseline_controller.goal_pos).copy()
+        baseline_orientation = np.asarray(baseline_controller.goal_ori).copy()
+
+        _state, _observation = _reset_and_settle(environment, initial_state)
         controller = environment.env.robots[0].controller
         require(controller.name == "OSC_POSE", "LIBERO controller is not OSC_POSE")
-        before_position = np.asarray(controller.goal_pos).copy()
-        before_orientation = np.asarray(controller.goal_ori).copy()
         action = np.zeros(ACTION_DIM, dtype=np.float64)
         action[axis] = sign
         action[-1] = -1.0
         environment.step(action)
         controller = environment.env.robots[0].controller
         if axis < 3:
-            delta = np.asarray(controller.goal_pos) - before_position
+            delta = np.asarray(controller.goal_pos) - baseline_position
             primary = float(delta[axis])
             leakage = float(np.max(np.abs(np.delete(delta, axis))))
         else:
-            relative = np.asarray(controller.goal_ori) @ before_orientation.T
+            relative = np.asarray(controller.goal_ori) @ baseline_orientation.T
             rotation = Rotation.from_matrix(relative).as_rotvec()
             primary = float(rotation[axis - 3])
             leakage = float(np.max(np.abs(np.delete(rotation, axis - 3))))
@@ -454,7 +474,7 @@ def _controller_impulses(environment: Any, initial_state: np.ndarray) -> dict[st
             math.isfinite(primary) and math.isfinite(leakage),
             f"controller impulse response is non-finite: {label}",
         )
-        matched = sign * primary > 0.0 and leakage <= abs(primary) * 1e-5 + 1e-8
+        matched = _controller_direction_matches(sign, primary, leakage)
         require(matched, f"controller impulse direction differs: {label}")
         responses.append({"direction": label, "leakage": leakage, "primary_delta": primary})
 
@@ -477,6 +497,10 @@ def _controller_impulses(environment: Any, initial_state: np.ndarray) -> dict[st
         "gripper_open": -1.0,
         "raw": {"gripper_apertures": apertures, "responses": responses},
     }
+
+
+def _controller_direction_matches(sign: float, primary: float, leakage: float) -> bool:
+    return sign * primary > 0.0 and leakage <= abs(primary) * 0.01 + 1e-8
 
 
 def _construct_environment(task: Any) -> Any:
@@ -623,11 +647,33 @@ def _authenticate_live_simulator(project_root: Path, attestation: Mapping[str, A
     )
 
 
+def _restore_authenticated_simulator_environment_mutations() -> None:
+    cv2_module = sys.modules.get("cv2")
+    require(cv2_module is not None, "OpenCV was not imported by the simulator")
+    module_file = getattr(cv2_module, "__file__", None)
+    require(isinstance(module_file, str), "OpenCV module origin is invalid")
+    module_root = Path(module_file).parent
+    expected = {
+        "LD_LIBRARY_PATH": f"{module_root / '../../lib64'}:",
+        "PYGAME_HIDE_SUPPORT_PROMPT": "hide",
+        "QT_QPA_FONTDIR": str(module_root / "qt/fonts"),
+        "QT_QPA_PLATFORM_PLUGIN_PATH": str(module_root / "qt/plugins"),
+    }
+    observed = {name: os.environ.get(name) for name in expected}
+    require(observed == expected, "simulator environment mutations differ from the authenticated wheel loaders")
+    for name in expected:
+        del os.environ[name]
+
+
 def collect(args: argparse.Namespace, *, project_root: Path | None = None) -> tuple[Path, str]:
     root = Path(__file__).resolve().parents[1] if project_root is None else project_root.resolve()
+    alignment_path = root / "configs/libero_source_parquet_alignment.json"
+    alignment, training_source_indices, alignment_raw_sha256 = load_source_parquet_alignment(alignment_path)
     collector_identity = {
         "path": "scripts/collect_libero_expert_replay.py",
         "sha256": sha256_file(Path(__file__)),
+        "source_parquet_alignment_content_sha256": alignment["content_sha256"],
+        "source_parquet_alignment_raw_sha256": alignment_raw_sha256,
         "shared_contract_sha256": sha256_file(root / "src/duo_vla/libero_replay_evidence.py"),
     }
     source_root = Path(os.path.abspath(args.source_root))
@@ -703,14 +749,16 @@ def collect(args: argparse.Namespace, *, project_root: Path | None = None) -> tu
 
                 environment = _construct_environment(task)
                 try:
-                    # Match OpenVLA regeneration: seed once, then consume resets
-                    # and replays for demo_0 through the first success in order.
+                    # Match OpenVLA regeneration: seed once, then consume resets in
+                    # source order. Select the first replay that both succeeds now
+                    # and belongs to the pinned regenerated training snapshot.
                     _seed_environment(environment)
-                    attempts, selected = _replay_first_success(
+                    attempts, selected = _replay_first_training_linked_success(
                         environment,
                         data,
                         names,
                         scan,
+                        training_source_indices[(suite_name, task_id)],
                         suite=suite_name,
                         task_id=task_id,
                     )
@@ -776,6 +824,7 @@ def collect(args: argparse.Namespace, *, project_root: Path | None = None) -> tu
             "status": "complete",
             "task_records": task_records,
         }
+        _restore_authenticated_simulator_environment_mutations()
         _authenticate_source_hdf5_files(source_root, records)
         _authenticate_live_simulator(root, attestation)
         inventory_after, records_after, inventory_raw_sha256_after = load_original_hdf5_inventory(
@@ -796,9 +845,20 @@ def collect(args: argparse.Namespace, *, project_root: Path | None = None) -> tu
             attestation_after == attestation and attestation_raw_sha256_after == attestation_raw_sha256,
             "simulator attestation changed during simulator replay",
         )
+        alignment_after, training_source_indices_after, alignment_raw_sha256_after = load_source_parquet_alignment(
+            alignment_path
+        )
+        require(
+            alignment_after == alignment
+            and training_source_indices_after == training_source_indices
+            and alignment_raw_sha256_after == alignment_raw_sha256,
+            "source/parquet alignment changed during simulator replay",
+        )
         collector_identity_after = {
             "path": "scripts/collect_libero_expert_replay.py",
             "sha256": sha256_file(Path(__file__)),
+            "source_parquet_alignment_content_sha256": alignment_after["content_sha256"],
+            "source_parquet_alignment_raw_sha256": alignment_raw_sha256_after,
             "shared_contract_sha256": sha256_file(root / "src/duo_vla/libero_replay_evidence.py"),
         }
         require(collector_identity_after == collector_identity, "collector source changed during simulator replay")

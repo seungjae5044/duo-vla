@@ -9,6 +9,7 @@ import pytest
 
 from duo_vla.runtime_integrity import (
     canonical_sha256,
+    canonical_visible_cuda_world_size,
     content_address_train_venv,
     require_matching_train_venv,
     static_environment_identity,
@@ -142,6 +143,32 @@ def test_torchrun_rank_environment_is_explicit_and_tp_ranks_must_match() -> None
         validate_torchrun_rank_environment(missing, required=True)
 
 
+def test_single_gpu_torchrun_rank_environment_and_visible_device_are_exact() -> None:
+    environment = _torchrun_environment()
+    environment.update(
+        {
+            "LOCAL_RANK": "0",
+            "LOCAL_WORLD_SIZE": "1",
+            "RANK": "0",
+            "ROLE_RANK": "0",
+            "ROLE_WORLD_SIZE": "1",
+            "WORLD_SIZE": "1",
+        }
+    )
+    assert validate_torchrun_rank_environment(environment, required=True, expected_world_size=1) == {
+        "group_world_size": 1,
+        "local_rank_equals_rank": True,
+        "local_world_size": 1,
+        "role_world_size": 1,
+        "world_size": 1,
+    }
+    assert canonical_visible_cuda_world_size({"CUDA_VISIBLE_DEVICES": "0"}) == 1
+    assert canonical_visible_cuda_world_size({"CUDA_VISIBLE_DEVICES": "1"}) == 1
+    assert canonical_visible_cuda_world_size({"CUDA_VISIBLE_DEVICES": "0,1"}) == 2
+    with pytest.raises(RuntimeError, match="canonical launcher"):
+        canonical_visible_cuda_world_size({"CUDA_VISIBLE_DEVICES": "1,0"})
+
+
 def test_static_environment_identity_is_order_independent_and_tracks_overrides() -> None:
     first = static_environment_identity({"OMP_NUM_THREADS": "1", "LANG": "C.UTF-8"})
     reordered = static_environment_identity({"LANG": "C.UTF-8", "OMP_NUM_THREADS": "1"})
@@ -212,3 +239,78 @@ def test_real_launchers_remove_caller_runtime_and_injection_overrides(tmp_path: 
     for name in ("BASH_ENV", "MALLOC_CONF", "NCCL_ALGO"):
         assert name not in observed
         assert "/tmp/injected" not in observed.get("PYTHONPATH", "")
+
+
+@pytest.mark.parametrize(
+    "launcher",
+    (
+        "scripts/run_libero_train_single_gpu.sh",
+        "scripts/run_calvin_train_single_gpu.sh",
+        "scripts/run_libero_policy_server_single_gpu.sh",
+        "scripts/calvin/run_policy_server_single_gpu.sh",
+    ),
+)
+def test_single_gpu_launchers_seal_gpu_zero_and_tp1(tmp_path: Path, launcher: str) -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    cache_root = tmp_path / "cache"
+    bin_dir = cache_root / "venvs/train-single-gpu/bin"
+    bin_dir.mkdir(parents=True)
+    environment_probe = "#!/bin/bash\n/usr/bin/env\n"
+    for name in ("python", "torchrun"):
+        executable = bin_dir / name
+        executable.write_text(environment_probe, encoding="utf-8")
+        executable.chmod(0o755)
+    inherited = dict(os.environ)
+    inherited.update(
+        {
+            "DUO_VLA_CACHE_ROOT": str(cache_root),
+            "HF_HOME": str(tmp_path / "hf"),
+            "NCCL_ALGO": "injected",
+            "PYTHONPATH": "/tmp/injected",
+        }
+    )
+
+    completed = subprocess.run(
+        [str(project_root / launcher), "--help"],
+        check=True,
+        capture_output=True,
+        env=inherited,
+        text=True,
+    )
+    observed = dict(line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line)
+
+    assert observed["CUDA_VISIBLE_DEVICES"] == "0"
+    assert observed["DUO_VLA_TRAIN_VENV"] == str(cache_root / "venvs/train-single-gpu")
+    assert "NCCL_ALGO" not in observed
+    assert "/tmp/injected" not in observed.get("PYTHONPATH", "")
+
+
+def test_libero_train_single_gpu_launcher_can_seal_physical_gpu_one(tmp_path: Path) -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    cache_root = tmp_path / "cache"
+    bin_dir = cache_root / "venvs/train-single-gpu/bin"
+    bin_dir.mkdir(parents=True)
+    for executable_name in ("python", "torchrun"):
+        probe = bin_dir / executable_name
+        probe.write_text("#!/bin/bash\n/usr/bin/env\n", encoding="utf-8")
+        probe.chmod(0o755)
+    inherited = dict(os.environ)
+    inherited.update(
+        {
+            "DUO_VLA_CACHE_ROOT": str(cache_root),
+            "DUO_VLA_PHYSICAL_GPU": "1",
+            "HF_HOME": str(tmp_path / "hf"),
+        }
+    )
+
+    completed = subprocess.run(
+        [str(project_root / "scripts/run_libero_train_single_gpu.sh"), "--help"],
+        check=True,
+        capture_output=True,
+        env=inherited,
+        text=True,
+    )
+    observed = dict(line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line)
+
+    assert observed["CUDA_VISIBLE_DEVICES"] == "1"
+    assert "DUO_VLA_PHYSICAL_GPU" not in observed

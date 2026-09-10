@@ -37,6 +37,26 @@ LIBERO_EXECUTION_GEOMETRY = {
     "fixed_physical_prefix_width": 545,
     "prefix_geometry_content_sha256": LIBERO_PREFIX_GEOMETRY_SHA256,
 }
+_EXECUTION_TOPOLOGY_FIELDS = {"tensor_parallel_size", "execution_profile"}
+_OPTIONAL_TRAINING_EXECUTION_FIELDS = {"serving_batch_size", "shared_weight_kernel_sha256"}
+_DATA_PARALLEL_EXECUTION_FIELDS = {
+    "canonical_plan_partition",
+    "data_parallel_size",
+    "gradient_reduction",
+    "rank_physical_batch_size",
+    "strategy",
+    "world_size",
+}
+SUPPORTED_TRAINING_PHYSICAL_BATCH_SIZES = frozenset({8, 16, 32, 64})
+SUPPORTED_EXPERT_BATCH_ISOLATIONS = frozenset({"sample_isolated_grouped_mm_v1", "sample_isolated_grouped_mm_v2"})
+SERVING_PHYSICAL_BATCH_SIZE = 8
+_SERVING_EXECUTION_FIELDS = {
+    "experts_implementation",
+    "expert_batch_isolation",
+    "physical_batch_size",
+    "execution_profile",
+    "tensor_parallel_size",
+}
 MAX_FRAME_BYTES = 2 * 1024 * 1024
 _HEADER = struct.Struct(">Q")
 _WIRE_POLICY_KEYS = {"objective", "sampler", "nfe", "inference_seed_behavior"}
@@ -150,12 +170,203 @@ def validate_wire_policy_contract(value: Mapping[str, Any], *, allow_fake: bool 
 
 
 def validate_execution_geometry(value: Any) -> dict[str, Any]:
-    """Validate the exact fixed-B8 execution geometry carried by real health."""
+    """Validate authenticated checkpoint training geometry carried by real health."""
 
     require(isinstance(value, Mapping), "real policy health has no execution geometry")
-    _exact_keys(value, set(LIBERO_EXECUTION_GEOMETRY), "execution geometry")
+    fields = set(value)
+    expected_fields = set(LIBERO_EXECUTION_GEOMETRY)
+    require(
+        expected_fields <= fields
+        and fields
+        <= expected_fields
+        | _OPTIONAL_TRAINING_EXECUTION_FIELDS
+        | _EXECUTION_TOPOLOGY_FIELDS
+        | _DATA_PARALLEL_EXECUTION_FIELDS,
+        "execution geometry fields differ",
+    )
     observed = dict(value)
-    require(observed == LIBERO_EXECUTION_GEOMETRY, f"policy execution geometry differs: {observed}")
+    require(observed["experts_implementation"] == "grouped_mm", "policy experts implementation differs")
+    require(
+        observed["expert_batch_isolation"] in SUPPORTED_EXPERT_BATCH_ISOLATIONS,
+        "policy expert batch isolation is unsupported",
+    )
+    require(
+        type(observed["physical_batch_size"]) is int
+        and observed["physical_batch_size"] in SUPPORTED_TRAINING_PHYSICAL_BATCH_SIZES,
+        "policy training physical batch is unsupported",
+    )
+    extended_training_geometry = (
+        observed["physical_batch_size"] != 8 or observed["expert_batch_isolation"] != "sample_isolated_grouped_mm_v1"
+    )
+    require(
+        not extended_training_geometry or "serving_batch_size" in observed,
+        "noncanonical training geometry must explicitly authorize serving batch eight",
+    )
+    require(observed["fixed_physical_prefix_width"] == 545, "policy fixed prefix width differs")
+    require(
+        observed["prefix_geometry_content_sha256"] == LIBERO_PREFIX_GEOMETRY_SHA256,
+        "policy prefix geometry identity differs",
+    )
+    if "serving_batch_size" in observed:
+        require(
+            type(observed["serving_batch_size"]) is int
+            and observed["serving_batch_size"] == SERVING_PHYSICAL_BATCH_SIZE,
+            "checkpoint serving batch must be eight",
+        )
+    kernel_sha256 = observed.get("shared_weight_kernel_sha256")
+    if observed["expert_batch_isolation"] == "sample_isolated_grouped_mm_v2":
+        require(
+            isinstance(kernel_sha256, str)
+            and len(kernel_sha256) == 64
+            and all(character in "0123456789abcdef" for character in kernel_sha256),
+            "sample-isolated grouped-MM v2 has no valid shared-weight kernel identity",
+        )
+    else:
+        require(kernel_sha256 is None, "sequential grouped-MM geometry cannot claim a shared-weight kernel")
+    has_topology = bool(fields & _EXECUTION_TOPOLOGY_FIELDS)
+    require(
+        not has_topology or fields >= _EXECUTION_TOPOLOGY_FIELDS,
+        "execution topology fields must be present together",
+    )
+    if has_topology:
+        require(observed["tensor_parallel_size"] in {1, 2}, "tensor parallel size must be one or two")
+        has_data_parallel = bool(fields & _DATA_PARALLEL_EXECUTION_FIELDS)
+        require(
+            not has_data_parallel or fields >= _DATA_PARALLEL_EXECUTION_FIELDS,
+            "data-parallel execution fields must be present together",
+        )
+        if has_data_parallel:
+            expected_data_parallel = {
+                "canonical_plan_partition": "contiguous-b8-chunks-by-rank",
+                "data_parallel_size": 2,
+                "gradient_reduction": "sum_globally_normalized_sse_gradients",
+                "rank_physical_batch_size": 32,
+                "strategy": "data_parallel",
+                "world_size": 2,
+            }
+            require(
+                {name: observed[name] for name in _DATA_PARALLEL_EXECUTION_FIELDS} == expected_data_parallel,
+                "data-parallel execution geometry differs",
+            )
+        expected_profile = expected_training_execution_profile(
+            tensor_parallel_size=observed["tensor_parallel_size"],
+            expert_batch_isolation=observed["expert_batch_isolation"],
+            physical_batch_size=observed["physical_batch_size"],
+            serving_batch_size=observed.get("serving_batch_size", SERVING_PHYSICAL_BATCH_SIZE),
+            strategy=observed.get("strategy"),
+            world_size=observed.get("world_size"),
+            data_parallel_size=observed.get("data_parallel_size", 1),
+            rank_physical_batch_size=observed.get("rank_physical_batch_size"),
+        )
+        require(observed["execution_profile"] == expected_profile, "execution profile differs from tensor topology")
+    elif extended_training_geometry:
+        raise BridgeProtocolError("noncanonical training geometry requires explicit single-GPU topology")
+    if observed["expert_batch_isolation"] == "sample_isolated_grouped_mm_v2":
+        require(observed.get("tensor_parallel_size") == 1, "sample-isolated grouped-MM v2 requires TP=1")
+    return observed
+
+
+def expected_training_execution_profile(
+    *,
+    tensor_parallel_size: int,
+    expert_batch_isolation: str,
+    physical_batch_size: int,
+    serving_batch_size: int,
+    strategy: str | None = None,
+    world_size: int | None = None,
+    data_parallel_size: int = 1,
+    rank_physical_batch_size: int | None = None,
+) -> str:
+    """Return the only valid explicit profile for one training geometry."""
+
+    require(tensor_parallel_size in {1, 2}, "tensor parallel size must be one or two")
+    require(expert_batch_isolation in SUPPORTED_EXPERT_BATCH_ISOLATIONS, "unsupported training backend")
+    require(
+        physical_batch_size in SUPPORTED_TRAINING_PHYSICAL_BATCH_SIZES,
+        "unsupported training physical batch",
+    )
+    require(serving_batch_size == SERVING_PHYSICAL_BATCH_SIZE, "serving batch must be eight")
+    if strategy is not None or data_parallel_size != 1 or world_size is not None:
+        require(
+            strategy == "data_parallel"
+            and world_size == 2
+            and data_parallel_size == 2
+            and tensor_parallel_size == 1
+            and expert_batch_isolation == "sample_isolated_grouped_mm_v2"
+            and physical_batch_size == 32
+            and rank_physical_batch_size == 32,
+            "unsupported data-parallel training profile",
+        )
+        return "duovla-dp2-tp1-fused-v2-train-b32-serve-b8-v1"
+    require(rank_physical_batch_size is None, "non-DP training cannot declare rank physical batch")
+    if tensor_parallel_size == 2:
+        require(
+            expert_batch_isolation == "sample_isolated_grouped_mm_v1" and physical_batch_size == 8,
+            "TP=2 is qualified only for sequential-v1 training batch eight",
+        )
+        return "duovla-tp2-v1"
+    if expert_batch_isolation == "sample_isolated_grouped_mm_v1" and physical_batch_size == 8:
+        return "duovla-single-gpu-tp1-v1"
+    backend = "fused-v2" if expert_batch_isolation == "sample_isolated_grouped_mm_v2" else "sequential-v1"
+    return f"duovla-single-gpu-tp1-{backend}-train-b{physical_batch_size}-serve-b{serving_batch_size}-v1"
+
+
+def serving_execution_geometry(training_execution_geometry: Any) -> dict[str, Any]:
+    """Derive the exact B8 serving geometry without rewriting training provenance."""
+
+    training = validate_execution_geometry(training_execution_geometry)
+    tensor_parallel_size = int(training.get("tensor_parallel_size", 2))
+    expected_training_profile = expected_training_execution_profile(
+        tensor_parallel_size=tensor_parallel_size,
+        expert_batch_isolation=str(training["expert_batch_isolation"]),
+        physical_batch_size=int(training["physical_batch_size"]),
+        serving_batch_size=int(training.get("serving_batch_size", SERVING_PHYSICAL_BATCH_SIZE)),
+        strategy=training.get("strategy"),
+        world_size=training.get("world_size"),
+        data_parallel_size=int(training.get("data_parallel_size", 1)),
+        rank_physical_batch_size=training.get("rank_physical_batch_size"),
+    )
+    require(
+        training.get("execution_profile", expected_training_profile) == expected_training_profile,
+        "training execution profile differs from serving topology",
+    )
+    require(
+        training.get("serving_batch_size", SERVING_PHYSICAL_BATCH_SIZE) == SERVING_PHYSICAL_BATCH_SIZE,
+        "checkpoint does not authorize B8 serving",
+    )
+    backend = "fused-v2" if training["expert_batch_isolation"] == "sample_isolated_grouped_mm_v2" else "sequential-v1"
+    serving_profile = (
+        f"duovla-single-gpu-tp1-{backend}-serve-b8-v1"
+        if tensor_parallel_size == 1
+        else "duovla-tp2-sequential-v1-serve-b8-v1"
+    )
+    geometry = {
+        "experts_implementation": training["experts_implementation"],
+        "expert_batch_isolation": training["expert_batch_isolation"],
+        "physical_batch_size": SERVING_PHYSICAL_BATCH_SIZE,
+        "execution_profile": serving_profile,
+        "tensor_parallel_size": tensor_parallel_size,
+    }
+    if "shared_weight_kernel_sha256" in training:
+        geometry["shared_weight_kernel_sha256"] = training["shared_weight_kernel_sha256"]
+    return geometry
+
+
+def validate_serving_execution_geometry(
+    value: Any,
+    *,
+    training_execution_geometry: Any,
+) -> dict[str, Any]:
+    """Require a serving geometry derived exactly from authenticated training geometry."""
+
+    require(isinstance(value, Mapping), "real policy health has no serving execution geometry")
+    require(
+        set(value) in (_SERVING_EXECUTION_FIELDS, _SERVING_EXECUTION_FIELDS | {"shared_weight_kernel_sha256"}),
+        "serving execution geometry fields differ",
+    )
+    observed = dict(value)
+    expected = serving_execution_geometry(training_execution_geometry)
+    require(observed == expected, f"policy serving execution geometry differs: {observed}")
     return observed
 
 
@@ -590,10 +801,12 @@ class PolicyClient:
                 "request_id",
                 "sampler",
                 "schema",
+                "serving_execution_geometry",
                 "serving_runtime_sha256",
                 "state_dim",
                 "status",
                 "train_seed",
+                "training_execution_geometry",
             },
             "health response",
         )
@@ -661,6 +874,14 @@ class PolicyClient:
                 checkpoint.get("execution_geometry") == execution_geometry,
                 "checkpoint and health execution geometry disagree",
             )
+            require(
+                response.get("training_execution_geometry") == execution_geometry,
+                "health training execution geometry differs from its compatibility alias",
+            )
+            validate_serving_execution_geometry(
+                response.get("serving_execution_geometry"),
+                training_execution_geometry=execution_geometry,
+            )
         else:
             for name in (
                 "checkpoint",
@@ -668,7 +889,9 @@ class PolicyClient:
                 "latency_runtime_sha256",
                 "model_revision",
                 "normalization_content_sha256",
+                "serving_execution_geometry",
                 "serving_runtime_sha256",
+                "training_execution_geometry",
             ):
                 require(response.get(name) is None, f"fake policy health cannot claim {name}")
         self._policy_contract = validate_wire_policy_contract(

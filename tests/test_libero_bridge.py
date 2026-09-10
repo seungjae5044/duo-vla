@@ -33,9 +33,11 @@ from libero_bridge import (
     encode_rgb,
     libero_replan_seed,
     make_predict_request,
+    serving_execution_geometry,
     validate_action_response,
     validate_execution_geometry,
     validate_request,
+    validate_serving_execution_geometry,
     wait_for_socket,
 )
 from serve_libero_policy import run_fake_server, select_serving_policy_contract
@@ -190,6 +192,8 @@ def test_fake_policy_persistent_socket_is_private_and_deterministic(tmp_path: Pa
             assert health["train_seed"] == 17
             assert health["schema"] == "duo-vla-libero-policy-ipc-v5"
             assert health["execution_geometry"] is None
+            assert health["training_execution_geometry"] is None
+            assert health["serving_execution_geometry"] is None
             assert health["latency_runtime_sha256"] is None
             assert health["serving_runtime_sha256"] is None
             assert health["objective"] == "test_fake"
@@ -319,10 +323,42 @@ def test_v5_rejects_v3_request_schema() -> None:
 def test_v5_execution_geometry_is_exact() -> None:
     assert validate_execution_geometry(LIBERO_EXECUTION_GEOMETRY) == LIBERO_EXECUTION_GEOMETRY
     changed = dict(LIBERO_EXECUTION_GEOMETRY, physical_batch_size=1)
-    with pytest.raises(BridgeProtocolError, match="execution geometry differs"):
+    with pytest.raises(BridgeProtocolError, match="training physical batch"):
         validate_execution_geometry(changed)
     with pytest.raises(BridgeProtocolError, match="fields differ"):
         validate_execution_geometry({**LIBERO_EXECUTION_GEOMETRY, "extra": True})
+
+
+def test_v5_reports_distinct_b64_v2_training_and_b8_serving_geometry() -> None:
+    kernel_sha256 = "a" * 64
+    training = {
+        **LIBERO_EXECUTION_GEOMETRY,
+        "expert_batch_isolation": "sample_isolated_grouped_mm_v2",
+        "physical_batch_size": 64,
+        "serving_batch_size": 8,
+        "execution_profile": "duovla-single-gpu-tp1-fused-v2-train-b64-serve-b8-v1",
+        "tensor_parallel_size": 1,
+        "shared_weight_kernel_sha256": kernel_sha256,
+    }
+    assert validate_execution_geometry(training) == training
+    serving = serving_execution_geometry(training)
+    assert serving == {
+        "experts_implementation": "grouped_mm",
+        "expert_batch_isolation": "sample_isolated_grouped_mm_v2",
+        "physical_batch_size": 8,
+        "execution_profile": "duovla-single-gpu-tp1-fused-v2-serve-b8-v1",
+        "tensor_parallel_size": 1,
+        "shared_weight_kernel_sha256": kernel_sha256,
+    }
+    assert validate_serving_execution_geometry(serving, training_execution_geometry=training) == serving
+
+    with pytest.raises(BridgeProtocolError, match="serving batch"):
+        validate_execution_geometry({**training, "serving_batch_size": 64})
+    with pytest.raises(BridgeProtocolError, match="serving execution geometry differs"):
+        validate_serving_execution_geometry(
+            {**serving, "physical_batch_size": 64},
+            training_execution_geometry=training,
+        )
 
 
 def test_v5_prediction_response_rejects_contract_and_echo_drift() -> None:

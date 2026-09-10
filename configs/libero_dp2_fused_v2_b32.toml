@@ -1,0 +1,33 @@
+extends = "libero_single_gpu_fused_v2_b32.toml"
+execution_profile = "duovla-dp2-tp1-fused-v2-train-b32-serve-b8-v1"
+
+[model]
+tensor_parallel_size = 1
+
+[optimization]
+physical_batch_size = 32
+microbatch_size = 32
+gradient_accumulation_steps = 1
+global_batch_size = 64
+serving_batch_size = 8
+
+[training]
+max_cached_files = 377
+
+[distributed]
+strategy = "data_parallel"
+world_size = 2
+data_parallel_size = 2
+tensor_parallel_size = 1
+rank_physical_batch_size = 32
+canonical_plan_partition = "contiguous-b8-chunks-by-rank"
+gradient_reduction = "sum_globally_normalized_sse_gradients"
+
+[serving]
+strategy = "single_gpu"
+world_size = 1
+tensor_parallel_size = 1
+physical_batch_size = 8
+checkpoint_artifact_layout = "consolidated-tp1-trainables"
+hardware_identity_scope = "serving-runtime-attestation"
+training_gpu_identity_reuse_required = false

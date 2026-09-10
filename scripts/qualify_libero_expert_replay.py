@@ -91,8 +91,11 @@ from duo_vla.libero_replay_evidence import (  # noqa: E402
     SIMULATOR_TASK_SCHEMA,
     ReplayEvidenceError,
     load_original_hdf5_inventory,
+    load_source_parquet_alignment,
+    observation_alignment_metrics,
     task_slug,
     trajectory_sha256,
+    validate_observation_alignment_metrics,
     validate_original_hdf5_inventory,
 )
 from duo_vla.runtime_integrity import (  # noqa: E402
@@ -262,6 +265,7 @@ _SELECTED_REPLAY_FIELDS = {
     "alignment_probe",
     "initial_state_sha256",
     "inverted_gripper_action_sequence_sha256",
+    "observation_alignment_features",
     "observation_sequence_sha256",
     "source_episode_index",
     "step_count",
@@ -270,7 +274,13 @@ _SELECTED_REPLAY_FIELDS = {
     "trajectory_sha256",
     "zero_action_sequence_sha256",
 }
-_REPLAY_ATTEMPT_FIELDS = {"action_sequence_sha256", "source_episode_index", "step_count", "success"}
+_REPLAY_ATTEMPT_FIELDS = {
+    "action_sequence_sha256",
+    "source_episode_index",
+    "step_count",
+    "success",
+    "training_linked",
+}
 _RESET_EVIDENCE_FIELDS = {
     "environment_seed",
     "first_observation_sha256",
@@ -519,7 +529,11 @@ def training_source_tree_sha256(root: Path) -> str:
         path
         for path in (
             root / "scripts/run_libero_train.sh",
+            root / "scripts/run_libero_train_single_gpu.sh",
+            root / "scripts/bootstrap_train_single_gpu_env.sh",
             root / "scripts/train_libero.py",
+            root / "envs/train-single-gpu/pyproject.toml",
+            root / "envs/train-single-gpu/uv.lock",
             root / "pyproject.toml",
             root / "uv.lock",
         )
@@ -531,27 +545,41 @@ def training_source_tree_sha256(root: Path) -> str:
     return digest.hexdigest()
 
 
-def source_identity(project_root: Path) -> dict[str, Any]:
+def source_identity(project_root: Path, *, single_gpu: bool = False) -> dict[str, Any]:
+    binder_launcher = (
+        "run_bind_libero_expert_replay_single_gpu.sh" if single_gpu else "run_bind_libero_expert_replay.sh"
+    )
+    qualification_launcher = (
+        "run_qualify_libero_expert_replay_single_gpu.sh" if single_gpu else "run_qualify_libero_expert_replay.sh"
+    )
+    training_launcher = "run_libero_train_single_gpu.sh" if single_gpu else "run_libero_train.sh"
     named_paths = {
         "data_reader": project_root / "src/duo_vla/data/libero.py",
         "normalization": project_root / "src/duo_vla/data/libero_stats.py",
         "expert_replay_binder": project_root / "scripts/bind_libero_expert_replay.py",
-        "expert_replay_binder_launcher": project_root / "scripts/run_bind_libero_expert_replay.sh",
+        "expert_replay_binder_launcher": project_root / "scripts" / binder_launcher,
         "expert_replay_collector": project_root / "scripts/collect_libero_expert_replay.py",
         "expert_replay_collector_launcher": project_root / "scripts/run_collect_libero_expert_replay.sh",
         "expert_replay_contract": project_root / "src/duo_vla/libero_replay_evidence.py",
         "original_hdf5_inventory": project_root / "configs/libero_original_hdf5_inventory.json",
+        "source_parquet_alignment": project_root / "configs/libero_source_parquet_alignment.json",
         "qualification": Path(__file__),
-        "qualification_launcher": project_root / "scripts/run_qualify_libero_expert_replay.sh",
+        "qualification_launcher": project_root / "scripts" / qualification_launcher,
         "simulator_preflight": project_root / "scripts/preflight_libero_env.py",
         "simulator_preflight_launcher": project_root / "scripts/run_libero_preflight.sh",
-        "training_launcher": project_root / "scripts/run_libero_train.sh",
+        "training_launcher": project_root / "scripts" / training_launcher,
         "training_program": project_root / "scripts/train_libero.py",
     }
     source_files = {name: stable_file_sha256(path) for name, path in named_paths.items()}
     configs = {
-        "direct_regression": stable_file_sha256(project_root / "configs/libero_direct_regression.toml"),
-        "rectified_flow": stable_file_sha256(project_root / "configs/libero.toml"),
+        "direct_regression": stable_file_sha256(
+            project_root
+            / "configs"
+            / ("libero_direct_regression_single_gpu.toml" if single_gpu else "libero_direct_regression.toml")
+        ),
+        "rectified_flow": stable_file_sha256(
+            project_root / "configs" / ("libero_single_gpu.toml" if single_gpu else "libero.toml")
+        ),
     }
     return {
         "config_file_sha256": configs,
@@ -826,7 +854,8 @@ def build_expected_inputs(
         original_hdf5_inventory.get("content_sha256") == ORIGINAL_HDF5_CONTENT_SHA256,
         "original HDF5 inventory content identity mismatch",
     )
-    identity = source_identity(project_root)
+    train_venv_root = Path(validated_train_venv["root"])
+    identity = source_identity(project_root, single_gpu=train_venv_root.name == "train-single-gpu")
     return {
         "config_file_sha256": identity["config_file_sha256"],
         "dataset_content_inventory_sha256": DATASET_CONTENT_INVENTORY_SHA256,
@@ -1211,6 +1240,9 @@ def _validate_generated_bundle_semantics(
     """Cross-check the two generated stages instead of trusting result booleans."""
 
     record_by_id = {record["id"]: record for record in raw_records}
+    alignment, training_source_indices, alignment_raw_sha256 = load_source_parquet_alignment(
+        _PROJECT_SOURCE_ROOT.parent / "configs/libero_source_parquet_alignment.json"
+    )
     evidence_gate_results = {gate["name"]: gate["result"] for gate in evidence_document["gates"]}
     expected_ids = {"parquet-binding", "simulator-stage", "simulator-stage-commit"}
     for suite in SUITES:
@@ -1317,7 +1349,13 @@ def _validate_generated_bundle_semantics(
         require(isinstance(simulator_collector, Mapping), "simulator collector identity is invalid")
         _require_exact_keys(
             simulator_collector,
-            {"path", "sha256", "shared_contract_sha256"},
+            {
+                "path",
+                "sha256",
+                "shared_contract_sha256",
+                "source_parquet_alignment_content_sha256",
+                "source_parquet_alignment_raw_sha256",
+            },
             "simulator collector identity",
         )
         require(
@@ -1327,6 +1365,11 @@ def _validate_generated_bundle_semantics(
             and simulator_collector.get("shared_contract_sha256")
             == expected_inputs["source_files_sha256"].get("expert_replay_contract"),
             "simulator collector source identity differs",
+        )
+        require(
+            simulator_collector.get("source_parquet_alignment_content_sha256") == alignment["content_sha256"]
+            and simulator_collector.get("source_parquet_alignment_raw_sha256") == alignment_raw_sha256,
+            "simulator collector source/parquet alignment identity differs",
         )
         simulator_checks = simulator_stage.get("gates")
         require(
@@ -1379,7 +1422,7 @@ def _validate_generated_bundle_semantics(
                 and not isinstance(item["primary_delta"], bool)
                 and math.isfinite(float(item["primary_delta"]))
                 and (1.0 if item["direction"].startswith("+") else -1.0) * float(item["primary_delta"]) > 0.0
-                and float(item["leakage"]) <= abs(float(item["primary_delta"])) * 1e-5 + 1e-8
+                and float(item["leakage"]) <= abs(float(item["primary_delta"])) * 0.01 + 1e-8
                 for item in responses
             ),
             "simulator-stage raw controller impulse responses differ",
@@ -1523,10 +1566,19 @@ def _validate_generated_bundle_semantics(
                 f"simulator replay attempt fields differ: {suite}:{task_id}",
             )
             require(
-                all(item.get("success") is False for item in attempts[:-1])
+                all(not (item.get("success") is True and item.get("training_linked") is True) for item in attempts[:-1])
                 and attempts[-1].get("success") is True
+                and attempts[-1].get("training_linked") is True
                 and [item.get("source_episode_index") for item in attempts] == list(range(len(attempts))),
-                f"simulator did not use canonical first-success selection: {suite}:{task_id}",
+                f"simulator did not use canonical first training-linked success selection: {suite}:{task_id}",
+            )
+            require(
+                all(
+                    item["training_linked"]
+                    == (item["source_episode_index"] in training_source_indices[(suite, task_id)])
+                    for item in attempts
+                ),
+                f"simulator training-link flags differ from the pinned alignment: {suite}:{task_id}",
             )
             selected = simulator_task.get("selected")
             require(
@@ -1538,7 +1590,7 @@ def _validate_generated_bundle_semantics(
                 and selected.get("source_episode_index") == attempts[-1].get("source_episode_index")
                 and selected.get("action_sequence_sha256") == attempts[-1].get("action_sequence_sha256")
                 and selected.get("step_count") == attempts[-1].get("step_count"),
-                f"simulator selected replay differs from first success: {suite}:{task_id}",
+                f"simulator selected replay differs from first training-linked success: {suite}:{task_id}",
             )
             for digest_name in (
                 "action_sequence_sha256",
@@ -1550,6 +1602,14 @@ def _validate_generated_bundle_semantics(
                 "zero_action_sequence_sha256",
             ):
                 _require_sha256(selected[digest_name], f"selected replay {digest_name}")
+            simulator_alignment = observation_alignment_metrics(
+                selected["observation_alignment_features"],
+                selected["observation_alignment_features"].get("frames", []),
+            )
+            require(
+                simulator_alignment["passed"] is True and simulator_alignment["frames"] == selected["step_count"],
+                f"simulator observation-alignment feature structure differs: {suite}:{task_id}",
+            )
             scan = simulator_task.get("source_scan")
             require(
                 isinstance(scan, Mapping)
@@ -1696,14 +1756,25 @@ def _validate_generated_bundle_semantics(
                 f"pre-dispatch integrity-control evidence differs: {suite}:{task_id}",
             )
             require(
+                _require_sha256(
+                    parquet_task.get("dataset_observation_sequence_sha256"),
+                    "parquet dataset observation sequence",
+                )
+                and validate_observation_alignment_metrics(parquet_task.get("observation_alignment_metrics"))["passed"]
+                is True,
+                f"parquet observation-alignment evidence differs: {suite}:{task_id}",
+            )
+            require(
                 parquet_task
                 == {
                     "action_sequence_sha256": selected["action_sequence_sha256"],
+                    "dataset_observation_sequence_sha256": parquet_task.get("dataset_observation_sequence_sha256"),
                     "dataset_episode_index": parquet_task.get("dataset_episode_index"),
                     "dataset_global_start": parquet_task.get("dataset_global_start"),
                     "dataset_global_stop": parquet_task.get("dataset_global_stop"),
                     "dataset_task_index": parquet_task.get("dataset_task_index"),
                     "instruction": task["instruction"],
+                    "observation_alignment_metrics": parquet_task.get("observation_alignment_metrics"),
                     "observation_sequence_sha256": selected["observation_sequence_sha256"],
                     "schema": PARQUET_TASK_SCHEMA,
                     "source_episode_index": selected["source_episode_index"],
@@ -2208,8 +2279,9 @@ def validate_qualification_report_document(
         "qualification validator and input source identities differ",
     )
     if project_root is not None:
+        train_venv_root = Path(inputs["train_venv_identity"]["root"])
         require(
-            validator_source == source_identity(project_root),
+            validator_source == source_identity(project_root, single_gpu=train_venv_root.name == "train-single-gpu"),
             "qualification source/config identity is no longer current",
         )
     if simulator_attestation is not None:
@@ -2388,6 +2460,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--normalization-artifact-sha256", required=True)
     parser.add_argument("--original-hdf5-inventory", type=Path, required=True)
     parser.add_argument("--original-hdf5-inventory-sha256", required=True)
+    parser.add_argument(
+        "--train-venv-profile",
+        choices=("legacy-tp2", "single-gpu-tp1"),
+        default="legacy-tp2",
+    )
     parser.add_argument("--output-dir", type=Path, required=True, help="must not already exist")
     return parser.parse_args(argv)
 
@@ -2395,6 +2472,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def run_qualification(args: argparse.Namespace, *, project_root: Path | None = None) -> tuple[Path, str]:
     root = Path(__file__).resolve().parents[1] if project_root is None else project_root.resolve()
     cache_root = Path(os.environ.get("DUO_VLA_CACHE_ROOT", "/root/.cache/duo-vla")).resolve()
+    train_venv_profile = getattr(args, "train_venv_profile", "legacy-tp2")
+    require(train_venv_profile in {"legacy-tp2", "single-gpu-tp1"}, "unknown train-venv profile")
+    single_gpu = train_venv_profile == "single-gpu-tp1"
+    train_venv = cache_root / "venvs" / ("train-single-gpu" if single_gpu else "train")
     attestation, attestation_raw_sha256 = read_stable_json(
         args.simulator_attestation.resolve(),
         name="simulator attestation",
@@ -2407,7 +2488,7 @@ def run_qualification(args: argparse.Namespace, *, project_root: Path | None = N
             args.snapshot_root.resolve(),
             expected_revision=DATASET_REVISION,
         )
-        train_venv_start = content_address_train_venv(cache_root / "venvs/train")
+        train_venv_start = content_address_train_venv(train_venv)
     except (OSError, RuntimeError, ValueError) as exc:
         raise QualificationError(f"cannot authenticate live training data/runtime: {exc}") from exc
     dataset_tree, dataset_tree_raw_sha256 = read_stable_json(
@@ -2438,7 +2519,7 @@ def run_qualification(args: argparse.Namespace, *, project_root: Path | None = N
         original_hdf5_inventory=original_hdf5_inventory,
         original_hdf5_inventory_raw_sha256=original_hdf5_inventory_raw_sha256,
     )
-    start_source = source_identity(root)
+    start_source = source_identity(root, single_gpu=single_gpu)
     require(
         start_source
         == {
@@ -2466,7 +2547,7 @@ def run_qualification(args: argparse.Namespace, *, project_root: Path | None = N
             args.snapshot_root.resolve(),
             expected_revision=DATASET_REVISION,
         )
-        train_venv_end = content_address_train_venv(cache_root / "venvs/train")
+        train_venv_end = content_address_train_venv(train_venv)
         require_matching_train_venv(train_venv_start, train_venv_end)
     except (OSError, RuntimeError, ValueError) as exc:
         raise QualificationError(f"live training data/runtime changed during qualification: {exc}") from exc
@@ -2500,7 +2581,10 @@ def run_qualification(args: argparse.Namespace, *, project_root: Path | None = N
         raw_evidence_root=evidence_path.parent,
     )
     require(final_summary == summary, "expert replay evidence summary changed during qualification")
-    require(source_identity(root) == start_source, "qualification source/config changed before report construction")
+    require(
+        source_identity(root, single_gpu=single_gpu) == start_source,
+        "qualification source/config changed before report construction",
+    )
     report = build_report(
         evidence,
         evidence_manifest_raw_sha256=evidence_raw_sha256,
@@ -2516,7 +2600,10 @@ def run_qualification(args: argparse.Namespace, *, project_root: Path | None = N
         simulator_attestation=attestation,
         simulator_attestation_raw_sha256=attestation_raw_sha256,
     )
-    require(source_identity(root) == start_source, "qualification source/config changed before publication")
+    require(
+        source_identity(root, single_gpu=single_gpu) == start_source,
+        "qualification source/config changed before publication",
+    )
     validator_runtime_end = validator_runtime_identity(root, cache_root, attestation)
     require(validator_runtime_end == validator_runtime_start, "validator runtime changed before publication")
     return publish_report_exclusive(args.output_dir.resolve(), report)

@@ -327,6 +327,37 @@ def _manifest(*, token: str = "sealed", attestation_sha256: str = "a" * 64) -> d
     }
 
 
+def _spatial_manifest(*, token: str = "sealed", attestation_sha256: str = "a" * 64) -> dict[str, Any]:
+    full = _manifest(token=token, attestation_sha256=attestation_sha256)
+    episodes = EVALUATOR.official_spatial_episode_matrix()
+    episode_sha256 = EVALUATOR.canonical_sha256(episodes)
+    selected = copy.deepcopy(
+        next(cell for cell in full["cells"] if cell["cell_id"] == "seed-0-flow-nfe-10-k-4")
+    )
+    selected["episode_matrix_sha256"] = episode_sha256
+    return {
+        "benchmark_protocol": EVALUATOR.PROTOCOL,
+        "cells": [selected],
+        "episode_count": EVALUATOR.SPATIAL_OFFICIAL_EPISODES,
+        "episode_matrix_sha256": episode_sha256,
+        "episodes": episodes,
+        "evaluation_seed": 123,
+        "expert_replay_qualification": full["expert_replay_qualification"],
+        "execution_horizons": [selected["execution_horizon"]],
+        "final_checkpoint_update": EVALUATOR.FINAL_CHECKPOINT_UPDATE,
+        "final_freeze_token_sha256": full["final_freeze_token_sha256"],
+        "official_output_roots": full["official_output_roots"],
+        "official_resets_per_task": EVALUATOR.OFFICIAL_RESETS_PER_TASK,
+        "policy_warmup_calls": EVALUATOR.OFFICIAL_POLICY_WARMUP_CALLS,
+        "reporting_scope": copy.deepcopy(EVALUATOR.SPATIAL_REPORTING_SCOPE),
+        "schema": EVALUATOR.SPATIAL_PREREGISTRATION_SCHEMA,
+        "simulator_attestation_sha256": attestation_sha256,
+        "suites": ["libero_spatial"],
+        "task_ids": list(range(10)),
+        "training_seeds": [selected["train_seed"]],
+    }
+
+
 def _creator_attestation() -> dict[str, Any]:
     tasks = [
         {
@@ -483,6 +514,104 @@ def test_contamination_contract_forces_exact_1999_episode_primary_matrix() -> No
     assert episodes[-1] == {"reset_id": 49, "suite": "libero_10", "task_id": 9}
 
 
+def test_official_spatial_matrix_has_all_500_published_resets_and_no_goal_exclusion() -> None:
+    episodes = EVALUATOR.official_spatial_episode_matrix()
+
+    assert len(episodes) == 500
+    assert {episode["suite"] for episode in episodes} == {"libero_spatial"}
+    assert {
+        (episode["task_id"], episode["reset_id"])
+        for episode in episodes
+    } == {(task_id, reset_id) for task_id in range(10) for reset_id in range(50)}
+    assert episodes[0] == {"reset_id": 0, "suite": "libero_spatial", "task_id": 0}
+    assert episodes[-1] == {"reset_id": 49, "suite": "libero_spatial", "task_id": 9}
+
+
+def test_spatial_preregistration_is_one_final_checkpoint_cell_and_not_an_aggregate() -> None:
+    manifest = _spatial_manifest()
+
+    cells = EVALUATOR.validate_spatial_preregistration_manifest(
+        manifest,
+        simulator_attestation_sha256="a" * 64,
+    )
+
+    assert len(cells) == 1
+    assert cells[0]["checkpoint"]["update"] == 30_000
+    assert manifest["reporting_scope"]["full_g6_claim_allowed"] is False
+    assert manifest["reporting_scope"]["three_seed_aggregate_claim_allowed"] is False
+    assert manifest["reporting_scope"]["goal_exclusion_applied"] is False
+    assert "contamination" not in manifest
+    with pytest.raises(RuntimeError, match="fields differ"):
+        EVALUATOR.validate_preregistration_manifest(
+            manifest,
+            contamination=EVALUATOR.load_contamination_contract(ROOT),
+            simulator_attestation_sha256="a" * 64,
+        )
+    with pytest.raises(RuntimeError, match="fields differ"):
+        EVALUATOR.validate_spatial_preregistration_manifest(
+            _manifest(),
+            simulator_attestation_sha256="a" * 64,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    (
+        (lambda value: value["cells"].append(copy.deepcopy(value["cells"][0])), "exactly one policy cell"),
+        (lambda value: value.update(suites=["libero_goal"]), "only libero_spatial"),
+        (lambda value: value["episodes"].pop(), "episode matrix changed"),
+        (lambda value: value.update(episode_count=499), "episode count must equal 500"),
+        (
+            lambda value: value["reporting_scope"].update(full_g6_claim_allowed=True),
+            "prohibit full G6 and three-seed",
+        ),
+        (lambda value: value["cells"][0]["checkpoint"].update(update=5_000), "checkpoint update"),
+        (lambda value: value.update(training_seeds=[0, 1, 2]), "exactly the selected cell training seed"),
+        (lambda value: value.update(execution_horizons=[1, 4]), "exactly the selected cell execution horizon"),
+    ),
+)
+def test_spatial_preregistration_rejects_scope_or_matrix_drift(mutate: Any, message: str) -> None:
+    manifest = _spatial_manifest()
+    mutate(manifest)
+    with pytest.raises(RuntimeError, match=message):
+        EVALUATOR.validate_spatial_preregistration_manifest(
+            manifest,
+            simulator_attestation_sha256="a" * 64,
+        )
+
+
+def test_spatial_preregistration_load_binds_raw_sha_cell_and_freeze_token(tmp_path: Path) -> None:
+    manifest = _spatial_manifest(token="spatial-seal")
+    path = tmp_path / "spatial-preregistered.json"
+    path.write_text(json.dumps(manifest, allow_nan=False, indent=2, sort_keys=True) + "\n")
+    raw_sha256 = EVALUATOR.sha256_file(path)
+
+    loaded, cell, observed_sha256 = EVALUATOR.load_spatial_preregistration(
+        path,
+        cell_id=manifest["cells"][0]["cell_id"],
+        execution_horizon=4,
+        evaluation_seed=123,
+        final_freeze_token="spatial-seal",
+        preregistration_sha256=raw_sha256,
+        simulator_attestation_sha256="a" * 64,
+    )
+
+    assert loaded == manifest
+    assert cell == manifest["cells"][0]
+    assert observed_sha256 == raw_sha256
+
+    with pytest.raises(RuntimeError, match="freeze token"):
+        EVALUATOR.load_spatial_preregistration(
+            path,
+            cell_id=cell["cell_id"],
+            execution_horizon=4,
+            evaluation_seed=123,
+            final_freeze_token="post-hoc",
+            preregistration_sha256=raw_sha256,
+            simulator_attestation_sha256="a" * 64,
+        )
+
+
 def test_preregistration_binds_raw_sha_token_attestation_and_exact_24_cells(tmp_path: Path) -> None:
     token = "external final freeze token"
     manifest = _manifest(token=token)
@@ -605,6 +734,99 @@ def test_preregistration_creator_derives_episode_and_serving_policy_hashes(
     assert output.with_suffix(".json.sha256").is_file()
 
 
+def test_spatial_preregistration_creator_seals_one_cell_without_aggregate_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = _spatial_manifest()
+    attestation = _creator_attestation()
+    synthetic_task_inventory_sha256 = QUALIFY.canonical_sha256(attestation["task_inventory"])
+    attestation["task_inventory_sha256"] = synthetic_task_inventory_sha256
+    monkeypatch.setattr(QUALIFY, "TASK_INVENTORY_SHA256", synthetic_task_inventory_sha256)
+    monkeypatch.setattr(EVALUATOR, "TASK_INVENTORY_SHA256", synthetic_task_inventory_sha256)
+    attestation_path = tmp_path / "attestation.json"
+    attestation_path.write_text(json.dumps(attestation, sort_keys=True), encoding="utf-8")
+    attestation_sha256 = EVALUATOR.canonical_sha256(attestation)
+    qualified_source = QUALIFY.source_identity(ROOT)["project_source_tree_sha256"]
+    qualified_identity = copy.deepcopy(_manifest(attestation_sha256=attestation_sha256)["expert_replay_qualification"])
+    qualified_identity["project_source_tree_sha256"] = qualified_source
+    qualified_identity["simulator_attestation_raw_sha256"] = EVALUATOR.sha256_file(attestation_path)
+    qualified_identity["simulator_runtime_sha256"] = QUALIFY.simulator_runtime_sha256(attestation)
+    qualified_identity["task_inventory_sha256"] = synthetic_task_inventory_sha256
+    qualified_identity["validator_runtime_identity"] = _validator_runtime_from_attestation(attestation)
+    qualification_path = tmp_path / "qualification.json"
+    qualification_path.write_text("{}\n", encoding="ascii")
+    qualification_sha256 = EVALUATOR.sha256_file(qualification_path)
+    monkeypatch.setattr(
+        CREATOR,
+        "load_qualification_report",
+        lambda *_args, **_kwargs: ({"validated": True}, qualification_sha256),
+    )
+    monkeypatch.setattr(
+        CREATOR,
+        "qualification_identity",
+        lambda *_args, **_kwargs: copy.deepcopy(qualified_identity),
+    )
+    monkeypatch.setattr(
+        CREATOR,
+        "load_contamination_contract",
+        lambda *_args, **_kwargs: pytest.fail("Spatial creator must not load the Goal contamination contract"),
+    )
+    cell = {
+        name: field
+        for name, field in manifest["cells"][0].items()
+        if name not in {"episode_matrix_sha256", "output_claim", "serving_policy_sha256"}
+    }
+    cell["checkpoint"] = {**cell["checkpoint"], "source_tree_sha256": qualified_source}
+    cells_path = tmp_path / "spatial-cell.json"
+    cells_path.write_text(json.dumps({"cells": [cell]}, sort_keys=True))
+    output = tmp_path / "spatial-preregistered.json"
+    run_root = tmp_path / "spatial-official-runs"
+    claim_root = tmp_path / "spatial-official-claims"
+    run_root.mkdir()
+    claim_root.mkdir()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "create_libero_preregistration.py",
+            "--mode",
+            "official-spatial-score",
+            "--cells",
+            str(cells_path),
+            "--simulator-attestation",
+            str(attestation_path),
+            "--expert-replay-qualification",
+            str(qualification_path),
+            "--expert-replay-qualification-sha256",
+            qualification_sha256,
+            "--evaluation-seed",
+            "123",
+            "--final-freeze-token",
+            "sealed",
+            "--official-output-root",
+            str(run_root),
+            "--official-claim-root",
+            str(claim_root),
+            "--output",
+            str(output),
+        ],
+    )
+    monkeypatch.setattr(CREATOR, "validate_evaluator_process_environment", lambda _root: {})
+    CREATOR.main()
+    created = json.loads(output.read_text())
+
+    assert created["schema"] == EVALUATOR.SPATIAL_PREREGISTRATION_SCHEMA
+    assert created["episodes"] == EVALUATOR.official_spatial_episode_matrix()
+    assert created["episode_count"] == 500
+    assert len(created["cells"]) == 1
+    assert created["reporting_scope"] == EVALUATOR.SPATIAL_REPORTING_SCOPE
+    assert "aggregator_sha256" not in created
+    assert "contamination" not in created
+    assert output.with_suffix(".json.sha256").is_file()
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     (
@@ -627,6 +849,33 @@ def test_preregistration_rejects_incomplete_or_mutated_factor_matrix(mutate: Any
     manifest = _manifest()
     mutate(manifest)
     with pytest.raises(RuntimeError, match=message):
+        EVALUATOR.validate_preregistration_manifest(
+            manifest,
+            contamination=manifest["contamination"],
+            simulator_attestation_sha256="a" * 64,
+        )
+
+
+def test_single_gpu_preregistration_uses_a_distinct_schema_and_exact_topology() -> None:
+    manifest = _manifest()
+    for cell in manifest["cells"]:
+        cell["execution_geometry"].update(
+            execution_profile="duovla-single-gpu-tp1-v1",
+            tensor_parallel_size=1,
+        )
+    manifest["schema"] = EVALUATOR.SINGLE_GPU_PREREGISTRATION_SCHEMA
+
+    checked = EVALUATOR.validate_preregistration_manifest(
+        manifest,
+        contamination=manifest["contamination"],
+        simulator_attestation_sha256="a" * 64,
+    )
+
+    assert len(checked) == 24
+    assert {cell["execution_geometry"]["tensor_parallel_size"] for cell in checked} == {1}
+
+    manifest["schema"] = EVALUATOR.PREREGISTRATION_SCHEMA
+    with pytest.raises(RuntimeError, match="schema differs from execution topology"):
         EVALUATOR.validate_preregistration_manifest(
             manifest,
             contamination=manifest["contamination"],
@@ -964,6 +1213,40 @@ def test_official_mode_requires_full_primary_selection_and_seal() -> None:
         EVALUATOR.validate_mode_arguments(args)
 
 
+def test_official_spatial_mode_requires_only_spatial_all_tasks_and_resets() -> None:
+    args = EVALUATOR.parse_args(
+        [
+            "--mode",
+            "official-spatial-score",
+            "--suite",
+            "libero_spatial",
+            "--task-ids",
+            "all",
+            "--init-state-ids",
+            "all",
+            "--evaluation-seed",
+            "123",
+            "--execution-horizon",
+            "4",
+            "--output-dir",
+            "/tmp/output",
+            "--preregistration-manifest",
+            "/tmp/spatial-preregistered.json",
+            "--preregistration-sha256",
+            "a" * 64,
+            "--cell-id",
+            "seed-0-flow-nfe-10-k-4",
+            "--final-freeze-token",
+            "sealed",
+        ]
+    )
+    EVALUATOR.validate_mode_arguments(args)
+
+    args.suite = "all"
+    with pytest.raises(RuntimeError, match="suite libero_spatial"):
+        EVALUATOR.validate_mode_arguments(args)
+
+
 def test_official_summary_states_clean_denominator_and_exclusion() -> None:
     contamination = EVALUATOR.load_contamination_contract(ROOT)
     task_metrics = [
@@ -995,6 +1278,35 @@ def test_official_summary_states_clean_denominator_and_exclusion() -> None:
     assert result["reporting"]["policy_warmup_calls"] == EVALUATOR.OFFICIAL_POLICY_WARMUP_CALLS
     assert result["reporting"]["policy_warmup_included_in_latency"] is False
     assert result["reporting"]["latency_scope"] == "episode_policy_calls_only"
+
+
+def test_official_spatial_summary_is_labeled_single_cell_and_cannot_claim_g6() -> None:
+    task_metrics = [
+        {"episodes": 50, "suite": "libero_spatial", "task_id": task_id}
+        for task_id in range(10)
+    ]
+    summary = {
+        "complete_40_task_macro": False,
+        "episodes": 500,
+        "overall_40_task_macro_success": None,
+        "policy_calls": 1,
+        "suites": [{"episodes": 500, "suite": "libero_spatial", "tasks": 10}],
+        "task_metrics": task_metrics,
+    }
+
+    result = EVALUATOR.bind_official_spatial_summary(
+        summary,
+        episode_matrix_sha256="e" * 64,
+    )
+
+    assert result["schema"] == EVALUATOR.SPATIAL_OFFICIAL_SUMMARY_SCHEMA
+    assert result["reporting"]["denominator"] == 500
+    assert result["reporting"]["excluded_episode_count"] == 0
+    assert result["reporting"]["excluded_episodes"] == []
+    assert result["reporting"]["goal_exclusion_applied"] is False
+    assert result["reporting"]["full_g6_claim_allowed"] is False
+    assert result["reporting"]["three_seed_aggregate_claim_allowed"] is False
+    assert "not_full_g6_not_three_seed_aggregate" in result["reporting"]["claim_label"]
 
 
 def test_eval_launchers_scrub_injection_and_do_not_append_pythonpath() -> None:
@@ -1228,6 +1540,92 @@ def test_official_claim_and_running_journal_precede_simulator_and_policy_setup(
     failed = json.loads((output_dir / "run.json").read_text())
     assert failed["status"] == "failed"
     assert failed["error"]["message"] == "simulator setup failed after claim"
+
+
+def test_official_spatial_claim_and_labeled_journal_precede_simulator_setup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runs_root = tmp_path / "spatial-runs"
+    claims_root = tmp_path / "spatial-claims"
+    runs_root.mkdir()
+    claims_root.mkdir()
+    roots = EVALUATOR.capture_official_output_roots(runs_root.resolve(), claims_root.resolve())
+    manifest = _spatial_manifest(attestation_sha256="a" * 64)
+    manifest["official_output_roots"] = roots
+    cell = manifest["cells"][0]
+    cell["output_claim"] = EVALUATOR.derive_output_claim(
+        cell["cell_id"],
+        roots,
+        manifest["final_freeze_token_sha256"],
+    )
+    preregistration = tmp_path / "spatial-preregistration.json"
+    preregistration.write_text(json.dumps(manifest, allow_nan=False, indent=2, sort_keys=True) + "\n")
+    preregistration_sha256 = EVALUATOR.sha256_file(preregistration)
+    claim_path = Path(cell["output_claim"]["claim_path"])
+    output_dir = Path(cell["output_claim"]["output_dir"])
+
+    monkeypatch.setattr(EVALUATOR, "validate_evaluator_process_environment", lambda _root: {})
+    monkeypatch.setattr(EVALUATOR.platform, "python_version", lambda: "3.12.13")
+    monkeypatch.setattr(EVALUATOR, "require_evaluator_sources_unchanged", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        EVALUATOR,
+        "load_contamination_contract",
+        lambda *_args, **_kwargs: pytest.fail("Spatial evaluator must not load the Goal contamination contract"),
+    )
+
+    def fail_after_claim(_root: Path, *, construct_environment: bool) -> dict[str, Any]:
+        assert construct_environment is True
+        assert claim_path.is_file()
+        running = json.loads((output_dir / "run.json").read_text())
+        assert running["status"] == "running"
+        assert running["schema"] == EVALUATOR.SPATIAL_OFFICIAL_RUN_SCHEMA
+        assert running["mode"] == "official-spatial-score"
+        assert running["episode_count"] == 500
+        assert running["suites"] == ["libero_spatial"]
+        assert running["reporting_scope"] == EVALUATOR.SPATIAL_REPORTING_SCOPE
+        assert "contamination" not in running
+        raise RuntimeError("Spatial simulator setup failed after claim")
+
+    monkeypatch.setattr(EVALUATOR, "run_exact_simulator_preflight", fail_after_claim)
+
+    class _ForbiddenPolicyClient:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("policy connection occurred before simulator failure")
+
+    monkeypatch.setattr(EVALUATOR, "PolicyClient", _ForbiddenPolicyClient)
+    with pytest.raises(RuntimeError, match="Spatial simulator setup failed after claim"):
+        EVALUATOR.main(
+            [
+                "--mode",
+                "official-spatial-score",
+                "--socket",
+                str(tmp_path / "policy.sock"),
+                "--suite",
+                "libero_spatial",
+                "--task-ids",
+                "all",
+                "--init-state-ids",
+                "all",
+                "--evaluation-seed",
+                "123",
+                "--execution-horizon",
+                "4",
+                "--preregistration-manifest",
+                str(preregistration),
+                "--preregistration-sha256",
+                preregistration_sha256,
+                "--cell-id",
+                cell["cell_id"],
+                "--final-freeze-token",
+                "sealed",
+                "--output-dir",
+                str(output_dir),
+            ]
+        )
+    failed = json.loads((output_dir / "run.json").read_text())
+    assert failed["status"] == "failed"
+    assert failed["error"]["message"] == "Spatial simulator setup failed after claim"
 
 
 def test_output_claim_rejects_alternate_paths_and_live_root_replacement(tmp_path: Path) -> None:

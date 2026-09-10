@@ -404,6 +404,31 @@ def test_real_health_binds_normalization_metadata_to_nested_calvin_identity() ->
     response = make_health_response(request, train_seed=17, **kwargs)
     assert validate_health_response(response, "real-health-v4")["calvin_identity"] == _calvin_identity()
 
+    single_gpu_kwargs = copy.deepcopy(kwargs)
+    single_gpu_kwargs["execution_geometry"].update(
+        execution_profile="duovla-single-gpu-tp1-v1",
+        tensor_parallel_size=1,
+    )
+    single_gpu_response = make_health_response(request, train_seed=17, **single_gpu_kwargs)
+    assert (
+        validate_health_response(single_gpu_response, "real-health-v4")["execution_geometry"]
+        == (single_gpu_kwargs["execution_geometry"])
+    )
+
+    for geometry in (
+        dict(single_gpu_kwargs["execution_geometry"], execution_profile="duovla-tp2-v1"),
+        dict(single_gpu_kwargs["execution_geometry"], tensor_parallel_size=3),
+    ):
+        invalid_topology = copy.deepcopy(kwargs)
+        invalid_topology["execution_geometry"] = geometry
+        with pytest.raises(DevBridgeProtocolError):
+            make_health_response(request, train_seed=17, **invalid_topology)
+
+    partial_topology = copy.deepcopy(single_gpu_kwargs)
+    partial_topology["execution_geometry"].pop("tensor_parallel_size")
+    with pytest.raises(DevBridgeProtocolError, match="execution geometry fields differ"):
+        make_health_response(request, train_seed=17, **partial_topology)
+
     bad_make = dict(kwargs, normalization_metadata_sha256="a" * 64)
     with pytest.raises(DevBridgeProtocolError, match="normalization metadata differs"):
         make_health_response(request, train_seed=17, **bad_make)

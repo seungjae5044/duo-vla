@@ -93,8 +93,65 @@ Before constructing MuJoCo, make one synthetic request through the real bridge:
 ## Sealed canonical evaluation only
 
 Development rollout mode now rejects published resets and requires an authenticated `--reset-source clean-dev` bank.
-Official states are reachable only through `--mode official-score`, which requires an externally frozen manifest,
-its independently recorded raw content SHA-256, a matching final-freeze token, and one canonical cell ID.
+Official states are reachable only through the sealed `official-score` or `official-spatial-score` modes. Both require
+an externally frozen manifest, its independently recorded raw content SHA-256, a matching final-freeze token, and one
+canonical cell ID. The two modes use different schemas and cannot consume each other's manifests.
+
+### Single-cell official Spatial score
+
+`official-spatial-score` is a deliberately narrow report, separate from the unchanged 24-cell `official-score`
+protocol. It accepts exactly one update-30,000 checkpoint/policy cell, one training seed, and one execution horizon.
+It evaluates all ten `libero_spatial` tasks at all 50 published official resets, for exactly 500 rows in canonical
+task/reset order. It does not load or apply the Goal contamination exclusion because no Goal task is in scope.
+
+The manifest, run journal, and summary use the dedicated schemas
+`duo-vla-libero-official-spatial-preregistration-v1`, `duo-vla-libero-official-spatial-run-v1`, and
+`duo-vla-libero-official-spatial-summary-v1`. Their reporting scope is fixed to the label
+`libero_spatial_official_500_single_checkpoint_single_policy_cell_not_full_g6_not_three_seed_aggregate` and contains
+explicit false-valued permissions for full-G6 and three-seed-aggregate claims. This result is therefore only a
+single-checkpoint, single-policy-cell Spatial score. It is not a full G6 result, not a three-seed aggregate, and is not
+accepted by the 24-cell official aggregator. A 5,000-update development checkpoint is rejected.
+
+Prepare the normal strict cell document, but include exactly one fully selected final cell. Create separate empty run
+and claim roots, then seal the Spatial manifest:
+
+```bash
+mkdir /sealed/libero-spatial-runs /sealed/libero-spatial-claims
+./scripts/run_create_libero_preregistration.sh \
+  --mode official-spatial-score \
+  --cells /read-only/freeze/libero-spatial-cell.json \
+  --simulator-attestation /read-only/freeze/libero-simulator-attestation.json \
+  --expert-replay-qualification /read-only/freeze/libero-expert-replay-qualification/qualification.json \
+  --expert-replay-qualification-sha256 '<externally-recorded-report-64hex>' \
+  --evaluation-seed 123 \
+  --final-freeze-token '<externally-held-token>' \
+  --official-output-root /sealed/libero-spatial-runs \
+  --official-claim-root /sealed/libero-spatial-claims \
+  --output /read-only/freeze/libero-spatial-preregistration.json
+```
+
+Run the one pre-registered cell with the same seed, horizon, cell ID, and canonical derived output path:
+
+```bash
+./scripts/run_libero_eval.sh \
+  --mode official-spatial-score \
+  --socket /root/.cache/duo-vla/run/libero-policy.sock \
+  --suite libero_spatial \
+  --task-ids all \
+  --init-state-ids all \
+  --evaluation-seed 123 \
+  --execution-horizon 4 \
+  --policy-warmup-calls 2 \
+  --preregistration-manifest /read-only/freeze/libero-spatial-preregistration.json \
+  --preregistration-sha256 '<externally-recorded-64hex-digest>' \
+  --cell-id seed-0-flow-nfe-10-k-4 \
+  --final-freeze-token '<externally-held-token>' \
+  --output-dir /sealed/libero-spatial-runs/seed-0-flow-nfe-10-k-4
+```
+
+The exclusive claim-before-simulator behavior, environment/attestation checks, policy-health binding, warm-up policy,
+and crash-safe journal are the same strict mechanisms used by `official-score`; only the sealed scope and its result
+labels differ.
 
 First create the full simulator attestation without executing policy inference:
 

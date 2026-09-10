@@ -2,8 +2,8 @@
 """Qualify exact fixed-B=8 sample-isolated MoE execution on real DiffusionGemma.
 
 This is a deliberately expensive, fail-closed hardware gate.  It exercises the
-frozen vision-language prefix encoder and continuous action decoder under native
-TP=2, then requires one target sample to be bitwise invariant to batch
+frozen vision-language prefix encoder and continuous action decoder under the
+declared TP topology, then requires one target sample to be bitwise invariant to batch
 companions and row placement.  A target-only backward pass also verifies that
 the target input gradient is invariant and every companion input gradient is
 exactly zero.
@@ -551,8 +551,11 @@ def prefix_target_layer_sha256s(
 
 def validate_runtime(model: nn.Module, *, prefix_width: int) -> dict[str, Any]:
     require(transformers_version == EXPECTED_TRANSFORMERS_VERSION, "Transformers must be pinned to 5.15.0")
-    require(dist.is_initialized() and dist.get_world_size() == 2, "qualification requires exactly TP=2 ranks")
-    require(int(getattr(model, "_tp_size", 0)) == 2, "loaded model does not report native TP size two")
+    require(dist.is_initialized() and dist.get_world_size() in {1, 2}, "qualification requires TP=1 or TP=2")
+    require(
+        int(getattr(model, "_tp_size", 0)) == dist.get_world_size(),
+        "loaded model tensor-parallel size differs from the launched world size",
+    )
     require(torch.cuda.is_bf16_supported(), "selected CUDA device does not support BF16")
     require(not any(parameter.requires_grad for parameter in model.parameters()), "base model is not fully frozen")
     floating_dtypes = {str(parameter.dtype) for parameter in model.parameters() if parameter.is_floating_point()}
@@ -809,7 +812,7 @@ def main() -> None:
     dist.init_process_group("nccl", device_id=device)
     started = time.perf_counter()
     try:
-        require(dist.get_world_size() == 2, "qualification requires torchrun --nproc-per-node=2")
+        require(dist.get_world_size() in {1, 2}, "qualification requires torchrun with one or two ranks")
         torch.manual_seed(0)
         torch.cuda.manual_seed_all(0)
         torch.use_deterministic_algorithms(True)
@@ -914,6 +917,7 @@ def main() -> None:
                         canonical_json_bytes(list(installation.target_names))
                     ).hexdigest(),
                 },
+                "execution_profile": ("duovla-single-gpu-tp1-v1" if dist.get_world_size() == 1 else "duovla-tp2-v1"),
                 "image_contract": {
                     "dtype": "uint8",
                     "height": IMAGE_HEIGHT,

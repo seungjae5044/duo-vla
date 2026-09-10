@@ -183,6 +183,27 @@ def test_creator_derives_exact_canonical_matrix_and_policy_identities(manifest: 
         )
 
 
+def test_creator_assigns_distinct_single_gpu_preregistration_schema(manifest: dict[str, Any]) -> None:
+    cells = _input_cells()
+    for cell in cells:
+        cell["execution_geometry"].update(
+            execution_profile="duovla-single-gpu-tp1-v1",
+            tensor_parallel_size=1,
+        )
+
+    single_gpu = CREATOR.build_manifest(
+        {"cells": cells},
+        aggregator_sha256=manifest["aggregator_sha256"],
+        attestation_sha256=manifest["runtime_attestation_sha256"],
+        final_freeze_token="frozen before scoring",
+        official_output_roots=manifest["official_output_roots"],
+        sequences=manifest["sequences"],
+    )
+
+    assert single_gpu["schema"] == EVALUATOR.SINGLE_GPU_PREREGISTRATION_SCHEMA
+    assert {cell["execution_geometry"]["tensor_parallel_size"] for cell in single_gpu["cells"]} == {1}
+
+
 def test_creator_rejects_caller_supplied_output_claim(manifest: dict[str, Any]) -> None:
     cells = _input_cells()
     cells[0]["output_claim"] = {"output_dir": "/alternate"}

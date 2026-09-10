@@ -23,6 +23,24 @@ class CalvinBatch:
         return len(self.samples)
 
 
+def coalesce_calvin_batches(batches: tuple[CalvinBatch, ...], *, physical_batch_size: int) -> CalvinBatch:
+    """Join already-validated B8 chunks without rejecting cross-chunk repeats.
+
+    Distinctness applies within each canonical RNG plan, not across plans. A
+    repeated anchor in another plan has its own noise and remains a real sample.
+    """
+    if physical_batch_size not in (8, 16, 32, 64) or len(batches) * 8 != physical_batch_size:
+        raise ValueError("physical CALVIN batches must contain complete canonical B8 chunks")
+    if any(batch.batch_size != 8 for batch in batches):
+        raise ValueError("only canonical B8 batches may be coalesced")
+    return CalvinBatch(
+        samples=tuple(sample for batch in batches for sample in batch.samples),
+        states=torch.cat([batch.states for batch in batches]),
+        clean_actions=torch.cat([batch.clean_actions for batch in batches]),
+        action_valid_mask=torch.cat([batch.action_valid_mask for batch in batches]),
+    )
+
+
 def collate_calvin_samples(
     samples: tuple[CalvinTrainingSample, ...],
     *,

@@ -1445,7 +1445,7 @@ def test_comparator_source_hash_rejects_ancestor_replacement_during_read(
 def test_launcher_declares_exact_byte_and_runtime_bootstrap() -> None:
     source = (ROOT / "scripts/calvin/run_compare_training_reproducibility.sh").read_text(encoding="utf-8")
     assert source.startswith("#!/usr/bin/env -S -i DUO_VLA_CLOSED_LAUNCHER_ENTRY=1 /bin/bash --noprofile --norc\n")
-    assert 'cache_root="/root/.cache/duo-vla"' in source
+    assert 'cache_root="/hdd2/hyunbin/vla/cache"' in source
     assert "${DUO_VLA_CACHE_ROOT" not in source and "${CALVIN_TRAIN_VENV" not in source
     assert "$(/usr/bin/dirname" in source
     assert "launcher_start_sha256" in source

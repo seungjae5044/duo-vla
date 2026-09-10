@@ -107,6 +107,9 @@ from duo_vla.libero_replay_evidence import (  # noqa: E402
     canonical_gate_results,
     canonical_sha256,
     load_original_hdf5_inventory,
+    load_source_parquet_alignment,
+    observation_alignment_frame,
+    observation_alignment_metrics,
     raw_evidence_record,
     read_stable_json,
     require,
@@ -115,6 +118,7 @@ from duo_vla.libero_replay_evidence import (  # noqa: E402
     task_identities,
     task_slug,
     validate_normalization,
+    validate_observation_alignment_metrics,
 )
 from duo_vla.runtime_integrity import (  # noqa: E402
     content_address_train_venv,
@@ -154,7 +158,13 @@ REQUIRED_ENVIRONMENT = {
 
 
 def validate_process_environment(project_root: Path, cache_root: Path) -> dict[str, Any]:
-    train_venv = (cache_root / "venvs/train").resolve()
+    configured_train_venv = os.environ.get("DUO_VLA_TRAIN_VENV", str(cache_root / "venvs/train"))
+    train_venv = Path(configured_train_venv).resolve()
+    allowed_train_venvs = {
+        (cache_root / "venvs/train").resolve(),
+        (cache_root / "venvs/train-single-gpu").resolve(),
+    }
+    require(train_venv in allowed_train_venvs, "parquet binder train venv is not an allowed execution profile")
     source_root = _validate_project_source_root(project_root)
     _validate_project_module_origins(source_root, _REQUIRED_PROJECT_MODULES)
     expected = {
@@ -281,11 +291,16 @@ def _load_stage(
         "simulator stage commit differs",
     )
     collector = stage.get("collector")
+    alignment, training_source_indices, alignment_raw_sha256 = load_source_parquet_alignment(
+        project_root / "configs/libero_source_parquet_alignment.json"
+    )
     require(
         collector
         == {
             "path": "scripts/collect_libero_expert_replay.py",
             "sha256": stable_regular_file_identity(project_root / "scripts/collect_libero_expert_replay.py")["sha256"],
+            "source_parquet_alignment_content_sha256": alignment["content_sha256"],
+            "source_parquet_alignment_raw_sha256": alignment_raw_sha256,
             "shared_contract_sha256": stable_regular_file_identity(
                 project_root / "src/duo_vla/libero_replay_evidence.py"
             )["sha256"],
@@ -359,6 +374,14 @@ def _load_stage(
             expected_sha256=record["sha256"],
         )
         _validate_simulator_task(task_document, suite=suite, task_id=task_id)
+        require(
+            all(
+                attempt["training_linked"]
+                == (attempt["source_episode_index"] in training_source_indices[(suite, task_id)])
+                for attempt in task_document["attempts"]
+            ),
+            f"simulator training-link flags differ from the pinned alignment: {suite}:{task_id}",
+        )
         scan_summary = _require_exact_fields(
             source_scan[index],
             {"gripper_counts", "path", "raw_transition_count", "retained_transition_count", "suite", "task_id"},
@@ -416,17 +439,20 @@ def _validate_simulator_task(value: Mapping[str, Any], *, suite: str, task_id: i
     for index, attempt in enumerate(attempts):
         _require_exact_fields(
             attempt,
-            {"action_sequence_sha256", "source_episode_index", "step_count", "success"},
+            {"action_sequence_sha256", "source_episode_index", "step_count", "success", "training_linked"},
             f"simulator replay attempt {index}",
         )
     require(
-        all(item.get("success") is False for item in attempts[:-1]),
-        "a successful replay was skipped before selection",
+        all(not (item.get("success") is True and item.get("training_linked") is True) for item in attempts[:-1]),
+        "a successful training-linked replay was skipped before selection",
     )
-    require(attempts[-1].get("success") is True, "selected replay did not succeed")
+    require(
+        attempts[-1].get("success") is True and attempts[-1].get("training_linked") is True,
+        "selected replay did not succeed with a training link",
+    )
     require(
         [item.get("source_episode_index") for item in attempts] == list(range(len(attempts))),
-        "simulator replay attempts are not canonical first-success order",
+        "simulator replay attempts are not in canonical source order",
     )
     selected = _require_exact_fields(
         value["selected"],
@@ -435,6 +461,7 @@ def _validate_simulator_task(value: Mapping[str, Any], *, suite: str, task_id: i
             "alignment_probe",
             "initial_state_sha256",
             "inverted_gripper_action_sequence_sha256",
+            "observation_alignment_features",
             "observation_sequence_sha256",
             "source_episode_index",
             "step_count",
@@ -444,6 +471,14 @@ def _validate_simulator_task(value: Mapping[str, Any], *, suite: str, task_id: i
             "zero_action_sequence_sha256",
         },
         "simulator selected replay",
+    )
+    self_alignment = observation_alignment_metrics(
+        selected["observation_alignment_features"],
+        selected["observation_alignment_features"].get("frames", []),
+    )
+    require(
+        self_alignment["passed"] is True and self_alignment["frames"] == selected["step_count"],
+        "simulator observation-alignment feature structure differs",
     )
     _require_exact_fields(
         selected["alignment_probe"],
@@ -460,7 +495,7 @@ def _validate_simulator_task(value: Mapping[str, Any], *, suite: str, task_id: i
         and selected.get("source_episode_index") == attempts[-1]["source_episode_index"]
         and selected.get("action_sequence_sha256") == attempts[-1]["action_sequence_sha256"]
         and selected.get("step_count") == attempts[-1]["step_count"],
-        "simulator selected replay differs from the first successful attempt",
+        "simulator selected replay differs from the first successful training-linked attempt",
     )
     reset = _require_exact_fields(
         value["reset_determinism"],
@@ -591,25 +626,34 @@ def _bind_task(dataset: LiberoParquetDataset, task_document: Mapping[str, Any], 
     action_digest = action_sequence_sha256(actions)
     require(action_digest == selected["action_sequence_sha256"], "matched parquet action sequence differs")
     observations = ObservationSequenceDigester()
+    dataset_alignment_frames: list[dict[str, Any]] = []
     for row in rows.to_pylist():
-        observations.update(
-            _decode_rgb(row["observation.images.image"]),
-            _decode_rgb(row["observation.images.image2"]),
-            np.asarray(row["observation.state"], dtype=np.float32),
+        agentview = _decode_rgb(row["observation.images.image"])
+        wrist = _decode_rgb(row["observation.images.image2"])
+        state = np.asarray(row["observation.state"], dtype=np.float32)
+        observations.update(agentview, wrist, state)
+        dataset_alignment_frames.append(observation_alignment_frame(agentview, wrist, state))
+    dataset_observation_digest = observations.hexdigest()
+    alignment_metrics = validate_observation_alignment_metrics(
+        observation_alignment_metrics(
+            selected["observation_alignment_features"],
+            dataset_alignment_frames,
         )
-    observation_digest = observations.hexdigest()
+    )
     require(
-        observation_digest == selected["observation_sequence_sha256"],
-        f"matched parquet pre-action RGB/state sequence differs: {task['suite']}:{task['task_id']}",
+        alignment_metrics["passed"] is True,
+        f"matched parquet pre-action RGB/state alignment differs: {task['suite']}:{task['task_id']}",
     )
     return {
         "action_sequence_sha256": action_digest,
+        "dataset_observation_sequence_sha256": dataset_observation_digest,
         "dataset_episode_index": episode_index,
         "dataset_global_start": episode.global_start,
         "dataset_global_stop": episode.global_stop,
         "dataset_task_index": dataset_task_index,
         "instruction": episode.task,
-        "observation_sequence_sha256": observation_digest,
+        "observation_alignment_metrics": alignment_metrics,
+        "observation_sequence_sha256": selected["observation_sequence_sha256"],
         "schema": PARQUET_TASK_SCHEMA,
         "source_episode_index": selected["source_episode_index"],
         "step_count": episode.length,
@@ -763,7 +807,8 @@ def bind(args: argparse.Namespace, *, project_root: Path | None = None) -> tuple
     root = Path(__file__).resolve().parents[1] if project_root is None else project_root.resolve()
     cache_root = Path(os.environ.get("DUO_VLA_CACHE_ROOT", "/root/.cache/duo-vla")).resolve()
     process_identity = validate_process_environment(root, cache_root)
-    train_venv_identity = content_address_train_venv(cache_root / "venvs/train")
+    train_venv = Path(process_identity["python_prefix"])
+    train_venv_identity = content_address_train_venv(train_venv)
 
     stage_path = Path(os.path.abspath(args.simulator_stage))
     require(stage_path.resolve() == stage_path, "simulator stage path must not contain linked path components")
@@ -1105,7 +1150,7 @@ def bind(args: argparse.Namespace, *, project_root: Path | None = None) -> tuple
             expected_revision=LIBERO_DATASET_REVISION,
         )
         require(snapshot_report_after == snapshot_report, "LIBERO training snapshot changed during binding")
-        train_venv_identity_after = content_address_train_venv(cache_root / "venvs/train")
+        train_venv_identity_after = content_address_train_venv(train_venv)
         try:
             require_matching_train_venv(train_venv_identity, train_venv_identity_after)
         except RuntimeError as exc:

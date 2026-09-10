@@ -64,6 +64,42 @@ def test_libero_configs_pin_exact_fixed_batch_expert_execution() -> None:
         )
 
 
+def test_libero_single_gpu_configs_change_only_the_execution_topology() -> None:
+    for base_name, single_name in (
+        ("libero.toml", "libero_single_gpu.toml"),
+        ("libero_direct_regression.toml", "libero_direct_regression_single_gpu.toml"),
+    ):
+        base = load_resolved_toml(PROJECT_ROOT / "configs" / base_name)
+        single = load_resolved_toml(PROJECT_ROOT / "configs" / single_name)
+        assert single["execution_profile"] == "duovla-single-gpu-tp1-v1"
+        assert single["model"]["tensor_parallel_size"] == 1
+        single.pop("execution_profile")
+        single["model"]["tensor_parallel_size"] = 2
+        assert single == base
+
+
+def test_libero_single_gpu_g3_keeps_physical_b8_and_seals_gpu_zero() -> None:
+    launcher = (PROJECT_ROOT / "scripts/run_overfit_real_libero_batch_single_gpu.sh").read_text(encoding="utf-8")
+    for fragment in (
+        '"CUDA_VISIBLE_DEVICES=0"',
+        '"DUO_VLA_TRAIN_VENV=${environment_path}"',
+        '"PYTHONHASHSEED=0"',
+        '"${cache_root}/venvs/train-single-gpu"',
+        "--nproc-per-node=1",
+    ):
+        assert fragment in launcher
+
+    gate = (PROJECT_ROOT / "scripts/overfit_real_libero_batch.py").read_text(encoding="utf-8")
+    for fragment in (
+        "args.batch_size % PHYSICAL_BATCH_SIZE",
+        "range(0, args.batch_size, PHYSICAL_BATCH_SIZE)",
+        "TRAIN._processor_inputs(",
+        "install_sample_isolated_grouped_mm_experts(",
+        "component.loss_for_total(total_elements).backward()",
+    ):
+        assert fragment in gate
+
+
 def _dataset_snapshot_report() -> dict[str, object]:
     return {
         "content_inventory_sha256": TRAIN.LIBERO_DATASET_CONTENT_INVENTORY_SHA256,
@@ -229,7 +265,7 @@ def test_canonical_libero_training_launcher_pins_numeric_runtime_and_scrubs_nccl
 
 @pytest.mark.parametrize(
     ("field", "wrong_value"),
-    (("fixed_physical_prefix_width", 546), ("physical_batch_size", 7)),
+    (("fixed_physical_prefix_width", 546), ("physical_batch_size", 7), ("serving_batch_size", 16)),
 )
 def test_resume_manifest_run_contract_accepts_typed_execution_integers_only(
     field: str,
@@ -238,12 +274,14 @@ def test_resume_manifest_run_contract_accepts_typed_execution_integers_only(
     run_contract = {
         "fixed_physical_prefix_width": "545",
         "physical_batch_size": "8",
+        "serving_batch_size": "8",
         "source_tree_sha256": "a" * 64,
     }
     manifest: dict[str, Any] = {
         **run_contract,
         "fixed_physical_prefix_width": 545,
         "physical_batch_size": 8,
+        "serving_batch_size": 8,
     }
     expected_run_contract = copy.deepcopy(run_contract)
 
@@ -258,19 +296,101 @@ def test_resume_manifest_run_contract_accepts_typed_execution_integers_only(
         TRAIN._validate_resume_manifest_run_contract(wrong_type, run_contract)
 
 
-@pytest.mark.parametrize("legacy_batch", (1, 32))
-def test_trainer_rejects_legacy_physical_training_batches_before_model_work(
+@pytest.mark.parametrize("physical_batch_size", sorted(TRAIN.SUPPORTED_PHYSICAL_BATCH_SIZES))
+def test_trainer_accepts_qualified_physical_batches_at_fixed_global_batch(
     monkeypatch: pytest.MonkeyPatch,
-    legacy_batch: int,
+    physical_batch_size: int,
+) -> None:
+    config = load_resolved_toml(PROJECT_ROOT / "configs/libero_single_gpu.toml")
+    optimization = config["optimization"]
+    optimization["physical_batch_size"] = physical_batch_size
+    optimization["microbatch_size"] = physical_batch_size
+    optimization["gradient_accumulation_steps"] = TRAIN.GLOBAL_BATCH_SIZE // physical_batch_size
+    config["execution_profile"] = TRAIN._expected_execution_profile(
+        world_size=1,
+        expert_batch_isolation=TRAIN.EXPERT_BATCH_ISOLATION,
+        physical_batch_size=physical_batch_size,
+        serving_batch_size=TRAIN.DEFAULT_SERVING_BATCH_SIZE,
+    )
+    monkeypatch.setattr(TRAIN.dist, "get_world_size", lambda: 1)
+
+    TRAIN._validate_and_build_interface_config(config)
+    geometry = TRAIN._execution_geometry(config)
+    assert geometry["physical_batch_size"] == physical_batch_size
+    assert geometry["serving_batch_size"] == TRAIN.DEFAULT_SERVING_BATCH_SIZE
+
+
+@pytest.mark.parametrize("physical_batch_size", (8, 16, 32, 64))
+def test_fused_v2_configs_pin_exact_backend_batch_and_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    physical_batch_size: int,
+) -> None:
+    path = PROJECT_ROOT / "configs" / f"libero_single_gpu_fused_v2_b{physical_batch_size}.toml"
+    config = load_resolved_toml(path)
+    monkeypatch.setattr(TRAIN.dist, "get_world_size", lambda: 1)
+
+    TRAIN._validate_and_build_interface_config(config)
+    assert config["model"]["expert_batch_isolation"] == TRAIN.SAMPLE_ISOLATED_GROUPED_MM_V2
+    assert config["optimization"]["physical_batch_size"] == physical_batch_size
+    assert config["optimization"]["gradient_accumulation_steps"] == 64 // physical_batch_size
+    assert config["optimization"]["serving_batch_size"] == 8
+    assert config["execution_profile"] == (f"duovla-single-gpu-tp1-fused-v2-train-b{physical_batch_size}-serve-b8-v1")
+    geometry = TRAIN._execution_geometry(config)
+    assert geometry["shared_weight_kernel_sha256"] == TRAIN.file_sha256(
+        PROJECT_ROOT / "src/duo_vla/backbones/shared_weight_grouped_mm_triton.py"
+    )
+
+
+def test_tp2_rejects_unqualified_coalesced_or_fused_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(TRAIN.dist, "get_world_size", lambda: 2)
+    for path in (
+        PROJECT_ROOT / "configs/libero_single_gpu_ab_v1_b64.toml",
+        PROJECT_ROOT / "configs/libero_single_gpu_fused_v2_b8.toml",
+    ):
+        config = load_resolved_toml(path)
+        config["model"]["tensor_parallel_size"] = 2
+        with pytest.raises(ValueError, match="TP=2 is qualified only"):
+            TRAIN._validate_and_build_interface_config(config)
+
+
+def test_resume_rejects_nested_execution_geometry_drift(tmp_path: Path) -> None:
+    config = load_resolved_toml(PROJECT_ROOT / "configs/libero.toml")
+    expected = TRAIN._execution_geometry(config)
+    manifest = {
+        **expected,
+        "execution_geometry": {**expected, "serving_batch_size": 16},
+    }
+
+    with pytest.raises(ValueError, match="execution_geometry"):
+        TRAIN._validate_checkpoint_execution_geometry(tmp_path, manifest, config)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("physical_batch_size", 12, "must be one of"),
+        ("physical_batch_size", True, "must be an integer"),
+        ("microbatch_size", 16, "must equal"),
+        ("gradient_accumulation_steps", 4, "must equal"),
+        ("global_batch_size", 32, "must equal 64"),
+        ("serving_batch_size", 12, "must be one of"),
+        ("serving_batch_size", 16, "must remain 8"),
+    ),
+)
+def test_trainer_rejects_invalid_or_inconsistent_batch_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+    message: str,
 ) -> None:
     config = load_resolved_toml(PROJECT_ROOT / "configs/libero.toml")
-    legacy = copy.deepcopy(config)
-    legacy["optimization"]["microbatch_size"] = legacy_batch
-    legacy["optimization"]["gradient_accumulation_steps"] = 64 // legacy_batch
+    config["optimization"][field] = value
     monkeypatch.setattr(TRAIN.dist, "get_world_size", lambda: 2)
 
-    with pytest.raises(ValueError, match="unsupported by this trainer"):
-        TRAIN._validate_and_build_interface_config(legacy)
+    with pytest.raises(ValueError, match=message):
+        TRAIN._validate_and_build_interface_config(config)
 
 
 @pytest.mark.parametrize(
@@ -381,23 +501,174 @@ def _sample() -> SimpleNamespace:
     return SimpleNamespace(observation=observation, instruction="pick the block")
 
 
-def test_processor_path_requires_exact_b8_and_fixed_authenticated_width() -> None:
+@pytest.mark.parametrize("physical_batch_size", sorted(TRAIN.SUPPORTED_PHYSICAL_BATCH_SIZES))
+def test_processor_path_requires_selected_physical_batch_and_fixed_authenticated_width(
+    physical_batch_size: int,
+) -> None:
     processor = _Processor()
     contract = _prefix_contract()
-    samples = tuple(_sample() for _ in range(TRAIN.PHYSICAL_BATCH_SIZE))
+    samples = tuple(_sample() for _ in range(physical_batch_size))
 
-    result = TRAIN._processor_inputs(processor, samples, torch.device("cpu"), contract)
+    result = TRAIN._processor_inputs(
+        processor,
+        samples,
+        torch.device("cpu"),
+        contract,
+        expected_batch_size=physical_batch_size,
+    )
 
-    assert result["input_ids"].shape == (8, 16)
-    assert len(processor.last_conversations) == 8
+    assert result["input_ids"].shape == (physical_batch_size, 16)
+    assert len(processor.last_conversations) == physical_batch_size
     assert processor.last_kwargs is not None
     assert processor.last_kwargs["processor_kwargs"] == {
         "padding": "max_length",
         "max_length": 16,
         "truncation": False,
     }
-    with pytest.raises(ValueError, match="requires physical batch 8"):
-        TRAIN._processor_inputs(processor, samples[:-1], torch.device("cpu"), contract)
+    with pytest.raises(ValueError, match=f"requires physical batch {physical_batch_size}"):
+        TRAIN._processor_inputs(
+            processor,
+            samples[:-1],
+            torch.device("cpu"),
+            contract,
+            expected_batch_size=physical_batch_size,
+        )
+
+
+@pytest.mark.parametrize("physical_batch_size", sorted(TRAIN.SUPPORTED_PHYSICAL_BATCH_SIZES))
+def test_physical_plan_groups_preserve_the_exact_eight_step_b8_stream(
+    physical_batch_size: int,
+) -> None:
+    expected = TRAIN.make_update_plan(
+        17,
+        23,
+        gradient_accumulation_steps=TRAIN.CANONICAL_MICROSTEPS_PER_UPDATE,
+    )
+
+    groups = TRAIN._canonical_update_plan_groups(
+        17,
+        23,
+        physical_batch_size=physical_batch_size,
+    )
+
+    assert tuple(plan for group in groups for plan in group) == expected
+    assert len(groups) == TRAIN.GLOBAL_BATCH_SIZE // physical_batch_size
+    assert {len(group) for group in groups} == {physical_batch_size // TRAIN.CANONICAL_STREAM_BATCH_SIZE}
+    assert [plan.microstep for group in groups for plan in group] == list(range(TRAIN.CANONICAL_MICROSTEPS_PER_UPDATE))
+
+
+def test_materialization_uses_all_eight_canonical_b8_data_seeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plans = TRAIN.make_update_plan(
+        37,
+        41,
+        gradient_accumulation_steps=TRAIN.CANONICAL_MICROSTEPS_PER_UPDATE,
+    )
+    calls: list[tuple[object, object, int, int, object, object]] = []
+    results = tuple(object() for _ in plans)
+
+    def materialize(
+        dataset: object,
+        sampler: object,
+        *,
+        count: int,
+        seed: int,
+        state_normalizer: object,
+        action_normalizer: object,
+    ) -> object:
+        calls.append((dataset, sampler, count, seed, state_normalizer, action_normalizer))
+        return results[len(calls) - 1]
+
+    monkeypatch.setattr(TRAIN, "_materialize_batch", materialize)
+    dataset = object()
+    sampler = object()
+    state_normalizer = object()
+    action_normalizer = object()
+
+    observed = TRAIN._materialize_canonical_batches(
+        dataset,
+        sampler,
+        plans,
+        state_normalizer=state_normalizer,
+        action_normalizer=action_normalizer,
+    )
+
+    assert observed == results
+    assert calls == [
+        (
+            dataset,
+            sampler,
+            TRAIN.CANONICAL_STREAM_BATCH_SIZE,
+            plan.data_seed,
+            state_normalizer,
+            action_normalizer,
+        )
+        for plan in plans
+    ]
+
+
+def _canonical_batch(chunk_index: int) -> TRAIN.LiberoBatch:
+    start = chunk_index * TRAIN.CANONICAL_STREAM_BATCH_SIZE
+    samples = tuple(SimpleNamespace(canonical_index=start + index) for index in range(8))
+    states = torch.arange(start * 8, (start + 8) * 8, dtype=torch.float32).reshape(8, 8)
+    clean_actions = torch.arange(start * 56, (start + 8) * 56, dtype=torch.float32).reshape(8, 8, 7)
+    valid = torch.ones((8, 8), dtype=torch.bool)
+    return TRAIN.LiberoBatch(
+        samples=samples,
+        states=states,
+        clean_actions=clean_actions,
+        action_valid_mask=valid,
+    )
+
+
+@pytest.mark.parametrize("physical_batch_size", sorted(TRAIN.SUPPORTED_PHYSICAL_BATCH_SIZES))
+def test_coalescing_preserves_canonical_sample_and_tensor_order(physical_batch_size: int) -> None:
+    chunk_count = physical_batch_size // TRAIN.CANONICAL_STREAM_BATCH_SIZE
+    canonical = tuple(_canonical_batch(index) for index in range(chunk_count))
+
+    observed = TRAIN._coalesce_canonical_batches(
+        canonical,
+        physical_batch_size=physical_batch_size,
+    )
+
+    assert [sample.canonical_index for sample in observed.samples] == list(range(physical_batch_size))
+    assert torch.equal(observed.states, torch.cat([batch.states for batch in canonical]))
+    assert torch.equal(observed.clean_actions, torch.cat([batch.clean_actions for batch in canonical]))
+    assert torch.equal(observed.action_valid_mask, torch.cat([batch.action_valid_mask for batch in canonical]))
+
+
+@pytest.mark.parametrize("config_name", ("libero.toml", "libero_direct_regression.toml"))
+@pytest.mark.parametrize("physical_batch_size", sorted(TRAIN.SUPPORTED_PHYSICAL_BATCH_SIZES))
+def test_coalesced_objective_pair_preserves_each_canonical_b8_seed_stream(
+    config_name: str,
+    physical_batch_size: int,
+) -> None:
+    contract = TRAIN.policy_contract_from_config(load_resolved_toml(PROJECT_ROOT / "configs" / config_name))
+    plans = TRAIN._canonical_update_plan_groups(
+        29,
+        31,
+        physical_batch_size=physical_batch_size,
+    )[0]
+    clean = torch.linspace(-1.0, 1.0, physical_batch_size * 8 * 7, dtype=torch.float32).reshape(
+        physical_batch_size,
+        8,
+        7,
+    )
+    expected_parts = tuple(
+        TRAIN.make_seeded_policy_training_pair(
+            clean[index * 8 : (index + 1) * 8],
+            contract,
+            seed=plan.flow_seed,
+        )
+        for index, plan in enumerate(plans)
+    )
+
+    observed = TRAIN._canonical_training_pair(clean, contract, plans)
+
+    assert torch.equal(observed.input_actions, torch.cat([part.input_actions for part in expected_parts]))
+    assert torch.equal(observed.timesteps, torch.cat([part.timesteps for part in expected_parts]))
+    assert torch.equal(observed.target, torch.cat([part.target for part in expected_parts]))
 
 
 def test_libero_checkpoint_manifest_binds_parent_and_retention_uses_authenticated_config() -> None:

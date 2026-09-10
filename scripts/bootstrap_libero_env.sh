@@ -11,6 +11,8 @@ readonly config_path="${runtime_root}/config"
 readonly dataset_path="${cache_root}/data/libero/simulator-datasets"
 readonly hf_home="${HF_HOME:-/root/.cache/huggingface}"
 readonly uv_cache="${cache_root}/uv-cache"
+readonly uv_python_root="${UV_PYTHON_INSTALL_DIR:-${cache_root}/uv-python}"
+readonly python_version="3.12.13"
 readonly source_url="https://github.com/huggingface/LIBERO.git"
 readonly source_revision="8561c60eea2fb93096146f240194649df73d8b1e"
 readonly assets_repo="lerobot/libero-assets"
@@ -34,7 +36,8 @@ mkdir -p \
   "${dataset_path}" \
   "${cache_root}/venvs" \
   "${hf_home}" \
-  "${uv_cache}"
+  "${uv_cache}" \
+  "${uv_python_root}"
 
 if [[ -e "${source_path}" && ! -d "${source_path}/.git" ]]; then
   echo "refusing to replace non-git path: ${source_path}" >&2
@@ -58,11 +61,15 @@ if [[ "$(git -C "${source_path}" rev-parse HEAD)" != "${source_revision}" ]]; th
   exit 1
 fi
 
+UV_CACHE_DIR="${uv_cache}" UV_PYTHON_INSTALL_DIR="${uv_python_root}" \
+  uv python install "${python_version}"
+
 UV_CACHE_DIR="${uv_cache}" \
+UV_PYTHON_INSTALL_DIR="${uv_python_root}" \
 UV_HTTP_TIMEOUT="${http_timeout}" \
 UV_PROJECT_ENVIRONMENT="${environment_path}" \
 CMAKE_POLICY_VERSION_MINIMUM=3.5 \
-  uv sync --project "${project_dir}/envs/libero-eval" --frozen
+  uv sync --project "${project_dir}/envs/libero-eval" --python "${python_version}" --frozen
 
 HF_HOME="${hf_home}" "${environment_path}/bin/python" - "${assets_path}" "${assets_repo}" "${assets_revision}" <<'PY'
 from __future__ import annotations
@@ -75,6 +82,13 @@ from huggingface_hub import HfApi, snapshot_download
 destination = Path(sys.argv[1])
 repo_id = sys.argv[2]
 revision = sys.argv[3]
+local_metadata = destination / ".cache"
+external_metadata = destination.parents[1] / "download-metadata" / f"assets-{revision}"
+if local_metadata.exists() and external_metadata.exists():
+    raise RuntimeError("LIBERO asset download metadata exists in both the content and external roots")
+if external_metadata.exists():
+    local_metadata.parent.mkdir(parents=True, exist_ok=True)
+    external_metadata.rename(local_metadata)
 observed = HfApi().dataset_info(repo_id, revision=revision).sha
 if observed != revision:
     raise RuntimeError(f"asset revision mismatch: expected {revision}, observed {observed}")
@@ -84,6 +98,10 @@ snapshot_download(
     revision=revision,
     local_dir=destination,
 )
+if not local_metadata.is_dir():
+    raise RuntimeError("LIBERO asset download did not create its expected local metadata cache")
+external_metadata.parent.mkdir(parents=True, exist_ok=True)
+local_metadata.rename(external_metadata)
 required = (
     "articulated_objects",
     "scenes",

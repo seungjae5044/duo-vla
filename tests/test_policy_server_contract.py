@@ -33,6 +33,8 @@ from serve_libero_policy import (
     PHYSICAL_BATCH_SIZE,
     REQUIRED_SERVING_ENVIRONMENT,
     _authenticated_training_environment,
+    _execution_geometry_from_config,
+    _expert_backend_functions,
     _health_payload,
     _training_source_tree_sha256,
     _validate_serving_process_environment,
@@ -60,8 +62,8 @@ from duo_vla.runtime_integrity import (
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _train_venv_identity() -> dict[str, object]:
-    venv_root = "/root/.cache/duo-vla/venvs/train"
+def _train_venv_identity(environment_name: str = "train") -> dict[str, object]:
+    venv_root = f"/root/.cache/duo-vla/venvs/{environment_name}"
     base_python_runtime: dict[str, object] = {
         "base_prefix": "/usr/local",
         "configured_home": "/usr/local/bin",
@@ -151,11 +153,29 @@ def _checkpoint_fixture(
     tmp_path: Path,
     *,
     config_name: str = "libero.toml",
+    expert_batch_isolation: str = EXPERT_BATCH_ISOLATION,
+    physical_gpu: int = 0,
+    physical_batch_size: int = PHYSICAL_BATCH_SIZE,
 ) -> tuple[Path, dict[str, object], dict[str, object], dict[str, object]]:
     checkpoint = tmp_path / "checkpoint"
     artifacts = checkpoint / "artifacts"
     artifacts.mkdir(parents=True)
     config = load_resolved_toml(PROJECT_ROOT / "configs" / config_name)
+    config["model"]["expert_batch_isolation"] = expert_batch_isolation
+    config["optimization"].update(
+        physical_batch_size=physical_batch_size,
+        microbatch_size=physical_batch_size,
+        gradient_accumulation_steps=64 // physical_batch_size,
+        global_batch_size=64,
+        serving_batch_size=PHYSICAL_BATCH_SIZE,
+    )
+    if int(config["model"]["tensor_parallel_size"]) == 1 and (
+        expert_batch_isolation != EXPERT_BATCH_ISOLATION or physical_batch_size != PHYSICAL_BATCH_SIZE
+    ):
+        backend_label = "fused-v2" if expert_batch_isolation == "sample_isolated_grouped_mm_v2" else "sequential-v1"
+        config["execution_profile"] = (
+            f"duovla-single-gpu-tp1-{backend_label}-train-b{physical_batch_size}-serve-b8-v1"
+        )
     model_report: dict[str, object] = {
         "content_inventory_sha256": "c" * 64,
         "files_verified": 7,
@@ -176,6 +196,26 @@ def _checkpoint_fixture(
         padding_side="left",
     )
     config["benchmark"]["prefix_geometry_content_sha256"] = prefix_geometry["content_sha256"]
+    tensor_parallel_size = int(config["model"]["tensor_parallel_size"])
+    environment_name = "train-single-gpu" if tensor_parallel_size == 1 else "train"
+    execution_geometry: dict[str, object] = {
+        "experts_implementation": EXPERTS_IMPLEMENTATION,
+        "expert_batch_isolation": expert_batch_isolation,
+        "physical_batch_size": physical_batch_size,
+        "serving_batch_size": PHYSICAL_BATCH_SIZE,
+        "fixed_physical_prefix_width": config["benchmark"]["fixed_physical_prefix_width"],
+        "prefix_geometry_content_sha256": prefix_geometry["content_sha256"],
+    }
+    if config.get("execution_profile") is not None:
+        execution_geometry.update(
+            execution_profile=config["execution_profile"],
+            tensor_parallel_size=tensor_parallel_size,
+        )
+    if expert_batch_isolation == "sample_isolated_grouped_mm_v2":
+        execution_geometry["shared_weight_kernel_sha256"] = SERVER.sha256_file(
+            PROJECT_ROOT / "src/duo_vla/backbones/shared_weight_grouped_mm_triton.py"
+        )
+    config["execution_geometry"] = execution_geometry
     config["artifact_trees"] = {
         "dataset_content_inventory_sha256": DATASET_CONTENT_INVENTORY_SHA256,
         "dataset_files_verified": DATASET_FILES_VERIFIED,
@@ -188,9 +228,10 @@ def _checkpoint_fixture(
     }
     train_environment = {
         **REQUIRED_SERVING_ENVIRONMENT,
+        "CUDA_VISIBLE_DEVICES": str(physical_gpu) if tensor_parallel_size == 1 else "0,1",
         "DUO_VLA_CACHE_ROOT": "/root/.cache/duo-vla",
         "DUO_VLA_PROJECT_ROOT": str(PROJECT_ROOT),
-        "DUO_VLA_TRAIN_VENV": "/root/.cache/duo-vla/venvs/train",
+        "DUO_VLA_TRAIN_VENV": f"/root/.cache/duo-vla/venvs/{environment_name}",
         "HF_HOME": "/root/.cache/huggingface",
         "PYTHONHASHSEED": "1",
     }
@@ -203,11 +244,11 @@ def _checkpoint_fixture(
             "torchrun": {
                 "group_world_size": 1,
                 "local_rank_equals_rank": True,
-                "local_world_size": 2,
-                "role_world_size": 2,
-                "world_size": 2,
+                "local_world_size": tensor_parallel_size,
+                "role_world_size": tensor_parallel_size,
+                "world_size": tensor_parallel_size,
             },
-            "train_venv": _train_venv_identity(),
+            "train_venv": _train_venv_identity(environment_name),
         },
         "cublas_workspace_config": ":4096:8",
         "cudnn_benchmark": False,
@@ -216,6 +257,12 @@ def _checkpoint_fixture(
         "deterministic_algorithms": True,
         "deterministic_warn_only": False,
         "float32_matmul_precision": "highest",
+        "gpu_total_memory_bytes": [96 * 2**30] * tensor_parallel_size,
+        "gpu_uuids": (
+            [f"GPU-{physical_gpu}"]
+            if tensor_parallel_size == 1
+            else [f"GPU-{index}" for index in range(tensor_parallel_size)]
+        ),
         "matmul_tf32": False,
         "preferred_blas_library": "_BlasBackend.Cublas",
         "preferred_linalg_library": "_LinalgBackend.Default",
@@ -243,10 +290,12 @@ def _checkpoint_fixture(
         "dataset_tree_sha256": DATASET_TREE_SHA256,
         "execution_environment": training_environment,
         "execution_environment_sha256": canonical_config_sha256(training_environment),
+        "execution_geometry": execution_geometry,
         "kind": "resumable-libero-training",
         "experts_implementation": EXPERTS_IMPLEMENTATION,
-        "expert_batch_isolation": EXPERT_BATCH_ISOLATION,
-        "physical_batch_size": PHYSICAL_BATCH_SIZE,
+        "expert_batch_isolation": expert_batch_isolation,
+        "physical_batch_size": physical_batch_size,
+        "serving_batch_size": PHYSICAL_BATCH_SIZE,
         "fixed_physical_prefix_width": config["benchmark"]["fixed_physical_prefix_width"],
         "prefix_geometry_content_sha256": prefix_geometry["content_sha256"],
         "model_id": MODEL_ID,
@@ -260,6 +309,19 @@ def _checkpoint_fixture(
         "policy_contract_sha256": canonical_config_sha256(contract),
         "run_seed": 1,
         "source_tree_sha256": "d" * 64,
+        **(
+            {"shared_weight_kernel_sha256": execution_geometry["shared_weight_kernel_sha256"]}
+            if "shared_weight_kernel_sha256" in execution_geometry
+            else {}
+        ),
+        **(
+            {
+                "execution_profile": config["execution_profile"],
+                "tensor_parallel_size": tensor_parallel_size,
+            }
+            if "execution_profile" in config
+            else {}
+        ),
     }
     return checkpoint, manifest, config, model_report
 
@@ -305,6 +367,46 @@ def test_server_resolves_objective_only_from_verified_config_and_manifest(
     assert report["model_tree_sha256"] == model_report["tree_metadata_sha256"]
     assert report["model_content_inventory_sha256"] == model_report["content_inventory_sha256"]
     assert report["train_venv"] == _train_venv_identity()
+
+
+def test_server_resolves_b64_v2_training_checkpoint_for_explicit_b8_serving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import duo_vla.checkpointing
+    import duo_vla.data.libero_stats
+
+    checkpoint, manifest, config, model_report = _checkpoint_fixture(
+        tmp_path,
+        config_name="libero_single_gpu.toml",
+        expert_batch_isolation="sample_isolated_grouped_mm_v2",
+        physical_gpu=1,
+        physical_batch_size=64,
+    )
+    monkeypatch.setenv("DUO_VLA_TRAIN_VENV", "/root/.cache/duo-vla/venvs/train-single-gpu")
+    monkeypatch.setattr(
+        SERVER,
+        "content_address_train_venv",
+        lambda _root: _train_venv_identity("train-single-gpu"),
+    )
+    monkeypatch.setattr(duo_vla.checkpointing, "load_checkpoint_manifest", lambda *args, **kwargs: manifest)
+    monkeypatch.setattr(
+        duo_vla.data.libero_stats,
+        "load_libero_normalizers",
+        lambda *args, **kwargs: (object(), object(), {"content_sha256": NORMALIZATION_SHA256}),
+    )
+
+    _, _, _, _, _, report, resolved, _ = resolve_checkpoint(
+        checkpoint,
+        train_seed_override=None,
+        model_snapshot_report=model_report,
+    )
+
+    assert resolved == config
+    assert report["execution_geometry"] == config["execution_geometry"]
+    assert report["execution_geometry"]["physical_batch_size"] == 64
+    assert report["execution_geometry"]["serving_batch_size"] == 8
+    assert report["execution_geometry"]["expert_batch_isolation"] == "sample_isolated_grouped_mm_v2"
 
 
 @pytest.mark.parametrize(
@@ -462,6 +564,14 @@ def test_v5_health_exposes_exact_real_geometry_and_null_fake_identities() -> Non
         serving_runtime_sha256="a" * 64,
     )
     assert real["execution_geometry"] == LIBERO_EXECUTION_GEOMETRY
+    assert real["training_execution_geometry"] == LIBERO_EXECUTION_GEOMETRY
+    assert real["serving_execution_geometry"] == {
+        "experts_implementation": "grouped_mm",
+        "expert_batch_isolation": EXPERT_BATCH_ISOLATION,
+        "physical_batch_size": PHYSICAL_BATCH_SIZE,
+        "execution_profile": "duovla-tp2-sequential-v1-serve-b8-v1",
+        "tensor_parallel_size": 2,
+    }
     assert real["serving_runtime_sha256"] == "a" * 64
     assert real["latency_runtime_sha256"] == "b" * 64
 
@@ -482,9 +592,105 @@ def test_v5_health_exposes_exact_real_geometry_and_null_fake_identities() -> Non
         "latency_runtime_sha256",
         "model_revision",
         "normalization_content_sha256",
+        "serving_execution_geometry",
         "serving_runtime_sha256",
+        "training_execution_geometry",
     ):
         assert fake[name] is None
+
+
+def test_b64_v2_checkpoint_geometry_dispatches_to_b8_v2_serving() -> None:
+    config = load_resolved_toml(PROJECT_ROOT / "configs/libero_single_gpu.toml")
+    config["model"]["expert_batch_isolation"] = "sample_isolated_grouped_mm_v2"
+    config["optimization"].update(
+        physical_batch_size=64,
+        microbatch_size=64,
+        gradient_accumulation_steps=1,
+        global_batch_size=64,
+        serving_batch_size=8,
+    )
+    config["execution_profile"] = "duovla-single-gpu-tp1-fused-v2-train-b64-serve-b8-v1"
+    kernel_sha256 = SERVER.sha256_file(
+        PROJECT_ROOT / "src/duo_vla/backbones/shared_weight_grouped_mm_triton.py"
+    )
+    training_geometry = {
+        "experts_implementation": "grouped_mm",
+        "expert_batch_isolation": "sample_isolated_grouped_mm_v2",
+        "physical_batch_size": 64,
+        "serving_batch_size": 8,
+        "fixed_physical_prefix_width": 545,
+        "prefix_geometry_content_sha256": config["benchmark"]["prefix_geometry_content_sha256"],
+        "execution_profile": "duovla-single-gpu-tp1-fused-v2-train-b64-serve-b8-v1",
+        "tensor_parallel_size": 1,
+        "shared_weight_kernel_sha256": kernel_sha256,
+    }
+    config["execution_geometry"] = training_geometry
+
+    assert _execution_geometry_from_config(config) == training_geometry
+    health = _health_payload(
+        mode="real",
+        train_seed=0,
+        checkpoint_report={"execution_geometry": training_geometry},
+        policy_contract={
+            "objective": "rectified_flow",
+            "sampler": "euler_uniform",
+            "nfe": 10,
+            "inference_seed_behavior": "episode_identity_gaussian_noise",
+        },
+        latency_runtime_sha256="b" * 64,
+        serving_runtime_sha256="a" * 64,
+    )
+    assert health["execution_geometry"] == training_geometry
+    assert health["training_execution_geometry"] == training_geometry
+    assert health["serving_execution_geometry"] == {
+        "experts_implementation": "grouped_mm",
+        "expert_batch_isolation": "sample_isolated_grouped_mm_v2",
+        "physical_batch_size": 8,
+        "execution_profile": "duovla-single-gpu-tp1-fused-v2-serve-b8-v1",
+        "tensor_parallel_size": 1,
+        "shared_weight_kernel_sha256": kernel_sha256,
+    }
+
+    install, verify = _expert_backend_functions("sample_isolated_grouped_mm_v2")
+    assert install.__name__ == "install_sample_isolated_grouped_mm_experts_v2"
+    assert verify.__name__ == "verify_sample_isolated_grouped_mm_experts_v2"
+
+
+def test_checkpoint_geometry_rejects_serving_or_declared_training_drift() -> None:
+    config = load_resolved_toml(PROJECT_ROOT / "configs/libero_single_gpu.toml")
+    config["optimization"].update(
+        physical_batch_size=64,
+        microbatch_size=64,
+        gradient_accumulation_steps=1,
+    )
+    with pytest.raises(RuntimeError, match="explicitly configure serving batch eight"):
+        _execution_geometry_from_config(config)
+
+    config["optimization"].update(
+        physical_batch_size=8,
+        microbatch_size=8,
+        gradient_accumulation_steps=8,
+    )
+    config["optimization"]["serving_batch_size"] = 64
+    with pytest.raises(RuntimeError, match="serving batch size must be eight"):
+        _execution_geometry_from_config(config)
+
+    config["optimization"]["serving_batch_size"] = 8
+    config["execution_geometry"] = {
+        "experts_implementation": "grouped_mm",
+        "expert_batch_isolation": EXPERT_BATCH_ISOLATION,
+        "physical_batch_size": 32,
+        "serving_batch_size": 8,
+        "fixed_physical_prefix_width": 545,
+        "prefix_geometry_content_sha256": config["benchmark"]["prefix_geometry_content_sha256"],
+        "execution_profile": "duovla-single-gpu-tp1-v1",
+        "tensor_parallel_size": 1,
+    }
+    with pytest.raises(RuntimeError, match="differs from its training tables"):
+        _execution_geometry_from_config(config)
+
+    with pytest.raises(RuntimeError, match="unsupported checkpoint expert batch isolation"):
+        _expert_backend_functions("sample_isolated_grouped_mm_v3")
 
 
 def _set_canonical_serving_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -553,7 +759,10 @@ def test_serving_runtime_is_strict_deterministic_and_content_addressed(
         flash_sdp_enabled=lambda: True,
         get_device_capability=lambda _index: (8, 6),
         get_device_name=lambda _index: "Test GPU",
-        get_device_properties=lambda index: SimpleNamespace(uuid=("GPU-0", "GPU-1")[index]),
+        get_device_properties=lambda index: SimpleNamespace(
+            total_memory=96 * 2**30,
+            uuid=("GPU-0", "GPU-1")[index],
+        ),
         math_sdp_enabled=lambda: True,
         mem_efficient_sdp_enabled=lambda: True,
         nccl=SimpleNamespace(version=lambda: (2, 29, 3)),
@@ -589,6 +798,7 @@ def test_serving_runtime_is_strict_deterministic_and_content_addressed(
                 "logical_index": index,
                 "name": "Test GPU",
                 "physical_index": index,
+                "total_memory_bytes": 96 * 2**30,
                 "uuid": f"GPU-{index}",
             }
             for index in range(2)
@@ -610,6 +820,10 @@ def test_serving_runtime_is_strict_deterministic_and_content_addressed(
         "execution_geometry": LIBERO_EXECUTION_GEOMETRY,
         "source_tree_sha256": "d" * 64,
         "train_venv": _train_venv_identity(),
+        "training_execution_environment": {
+            "gpu_total_memory_bytes": [96 * 2**30, 96 * 2**30],
+            "gpu_uuids": ["GPU-0", "GPU-1"],
+        },
         "training_execution_environment_sha256": "e" * 64,
     }
     first, first_sha256 = configure_and_identify_serving_runtime(
@@ -652,6 +866,23 @@ def test_serving_runtime_is_strict_deterministic_and_content_addressed(
     changed_binary["hardware"]["binaries"]["torch_extension_sha256"] = "f" * 64
     _, changed_binary_sha256 = latency_runtime_identity(changed_binary)
     assert changed_binary_sha256 != latency_sha256
+
+    changed_checkpoint = copy.deepcopy(checkpoint_report)
+    changed_checkpoint["training_execution_environment"]["gpu_uuids"][0] = "GPU-other"
+    with pytest.raises(RuntimeError, match="UUIDs differ"):
+        configure_and_identify_serving_runtime(
+            fake_torch,
+            project_root=PROJECT_ROOT,
+            checkpoint_report=changed_checkpoint,
+        )
+
+
+def test_single_gpu_policy_launcher_selects_only_qualified_training_device() -> None:
+    source = (PROJECT_ROOT / "scripts/run_libero_policy_server_single_gpu.sh").read_text(encoding="utf-8")
+
+    assert 'requested_physical_gpu="${DUO_VLA_PHYSICAL_GPU:-0}"' in source
+    assert '"CUDA_VISIBLE_DEVICES=${requested_physical_gpu}"' in source
+    assert "^(0|1)$" in source
 
 
 def test_canonical_libero_server_launcher_pins_deterministic_runtime() -> None:

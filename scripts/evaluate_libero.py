@@ -181,7 +181,7 @@ _libero_bridge = _load_local_module("libero_bridge", _EVALUATOR_SCRIPT_DIR / "li
 from libero_bridge import (  # noqa: E402
     ACTION_DIM,
     IMAGE_SHAPE,
-    LIBERO_EXECUTION_GEOMETRY,
+    LIBERO_EXECUTION_GEOMETRY,  # noqa: F401 -- re-exported for protocol fixtures.
     PROTOCOL,
     SUITES,
     PolicyClient,
@@ -252,8 +252,12 @@ TASK_INVENTORY_SHA256 = "d00c211a09f34003089ba5a4dbbbb0e11af2543f4bba9cb1901a04a
 ORIGINAL_HDF5_INVENTORY_RAW_SHA256 = "3b5f9b164434c91c41a3ff1e9681d91ab856969699c40fd7247ba93ed909cd7c"
 OPEN_GRIPPER_NOOP = np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0], dtype=np.float32)
 PREREGISTRATION_SCHEMA = "duo-vla-libero-official-preregistration-v5"
+SINGLE_GPU_PREREGISTRATION_SCHEMA = "duo-vla-libero-official-preregistration-single-gpu-tp1-v1"
+SPATIAL_PREREGISTRATION_SCHEMA = "duo-vla-libero-official-spatial-preregistration-v1"
 OFFICIAL_RUN_SCHEMA = "duo-vla-libero-official-run-v3"
 OFFICIAL_SUMMARY_SCHEMA = "duo-vla-libero-official-summary-v2"
+SPATIAL_OFFICIAL_RUN_SCHEMA = "duo-vla-libero-official-spatial-run-v1"
+SPATIAL_OFFICIAL_SUMMARY_SCHEMA = "duo-vla-libero-official-spatial-summary-v1"
 OUTPUT_ROOTS_SCHEMA = "duo-vla-libero-official-output-roots-v1"
 OUTPUT_CLAIM_SCHEMA = "duo-vla-libero-official-output-claim-v1"
 CLAIM_RECORD_SCHEMA = "duo-vla-libero-official-claim-record-v1"
@@ -274,6 +278,7 @@ OFFICIAL_FLOW_CHECKPOINT_NFE = 10
 OFFICIAL_RESETS_PER_TASK = 50
 OFFICIAL_FULL_EPISODES = 2_000
 OFFICIAL_PRIMARY_EPISODES = 1_999
+SPATIAL_OFFICIAL_EPISODES = 500
 OFFICIAL_POLICY_WARMUP_CALLS = 2
 OFFICIAL_POLICY_WARMUP_REPLAN_ID = max(POLICY_BUDGETS.values())
 OFFICIAL_EXCLUDED_EPISODE = {"reset_id": 0, "suite": "libero_goal", "task_id": 7}
@@ -299,6 +304,41 @@ _PREREGISTRATION_FIELDS = {
     "suites",
     "task_ids",
     "training_seeds",
+}
+_SPATIAL_PREREGISTRATION_FIELDS = {
+    "benchmark_protocol",
+    "cells",
+    "episode_count",
+    "episode_matrix_sha256",
+    "episodes",
+    "evaluation_seed",
+    "expert_replay_qualification",
+    "execution_horizons",
+    "final_checkpoint_update",
+    "final_freeze_token_sha256",
+    "official_output_roots",
+    "official_resets_per_task",
+    "policy_warmup_calls",
+    "reporting_scope",
+    "schema",
+    "simulator_attestation_sha256",
+    "suites",
+    "task_ids",
+    "training_seeds",
+}
+SPATIAL_REPORT_LABEL = (
+    "libero_spatial_official_500_single_checkpoint_single_policy_cell_"
+    "not_full_g6_not_three_seed_aggregate"
+)
+SPATIAL_REPORTING_SCOPE = {
+    "claim_label": SPATIAL_REPORT_LABEL,
+    "full_g6_claim_allowed": False,
+    "goal_exclusion_applied": False,
+    "selected_checkpoint_count": 1,
+    "selected_policy_cell_count": 1,
+    "suite": "libero_spatial",
+    "three_seed_aggregate_claim_allowed": False,
+    "training_seed_count": 1,
 }
 _CELL_FIELDS = {
     "cell_id",
@@ -1133,6 +1173,18 @@ def official_episode_matrix(contamination: Mapping[str, Any]) -> list[dict[str, 
     return episodes
 
 
+def official_spatial_episode_matrix() -> list[dict[str, Any]]:
+    """Build all 500 published Spatial resets without the Goal exclusion."""
+
+    episodes = [
+        {"reset_id": reset_id, "suite": "libero_spatial", "task_id": task_id}
+        for task_id in range(10)
+        for reset_id in range(OFFICIAL_RESETS_PER_TASK)
+    ]
+    require(len(episodes) == SPATIAL_OFFICIAL_EPISODES, "canonical LIBERO Spatial episode count changed")
+    return episodes
+
+
 def official_cell_id(train_seed: int, objective: str, nfe: int, execution_horizon: int) -> str:
     label = "flow" if objective == "rectified_flow" else "direct"
     return f"seed-{train_seed}-{label}-nfe-{nfe}-k-{execution_horizon}"
@@ -1185,7 +1237,7 @@ def _validate_registered_cell(
         hmac.compare_digest(cell["episode_matrix_sha256"], episode_matrix_sha256),
         "cell episode matrix differs from the frozen primary matrix",
     )
-    require(cell["execution_geometry"] == LIBERO_EXECUTION_GEOMETRY, "cell execution geometry mismatch")
+    validate_execution_geometry(cell["execution_geometry"])
     train_seed = cell["train_seed"]
     objective = cell["objective"]
     nfe = cell["nfe"]
@@ -1241,7 +1293,10 @@ def validate_preregistration_manifest(
 ) -> list[dict[str, Any]]:
     require(isinstance(manifest, dict), "pre-registration manifest must be an object")
     _require_exact_keys(manifest, _PREREGISTRATION_FIELDS, "pre-registration manifest")
-    require(manifest["schema"] == PREREGISTRATION_SCHEMA, "pre-registration schema mismatch")
+    require(
+        manifest["schema"] in {PREREGISTRATION_SCHEMA, SINGLE_GPU_PREREGISTRATION_SCHEMA},
+        "pre-registration schema mismatch",
+    )
     roots = validate_official_output_roots(manifest["official_output_roots"])
     require(
         manifest["aggregation_python_version"] == AGGREGATION_PYTHON_VERSION,
@@ -1400,6 +1455,11 @@ def validate_preregistration_manifest(
     factors = {(cell["train_seed"], cell["objective"], cell["nfe"], cell["execution_horizon"]) for cell in checked}
     require(factors == _official_factor_matrix(), "pre-registration does not contain the exact 24-cell factor matrix")
     require(len(checked) == len(factors) == 24, "pre-registration must contain exactly 24 policy cells")
+    execution_geometries = {canonical_json_bytes(cell["execution_geometry"]) for cell in checked}
+    require(len(execution_geometries) == 1, "all official cells must share one execution geometry")
+    single_gpu = checked[0]["execution_geometry"].get("execution_profile") == "duovla-single-gpu-tp1-v1"
+    expected_schema = SINGLE_GPU_PREREGISTRATION_SCHEMA if single_gpu else PREREGISTRATION_SCHEMA
+    require(manifest["schema"] == expected_schema, "pre-registration schema differs from execution topology")
     require(
         len({cell["output_claim"]["output_dir"] for cell in checked}) == 24,
         "pre-registration must assign one output directory per cell",
@@ -1478,6 +1538,207 @@ def validate_preregistration_manifest(
     return checked
 
 
+def _validate_spatial_expert_replay_identity(
+    expert_replay: Any,
+    *,
+    manifest_simulator_attestation_sha256: Any,
+    simulator_attestation_sha256: str,
+) -> Mapping[str, Any]:
+    """Apply the frozen replay/runtime identity checks to the Spatial-only schema."""
+
+    require(isinstance(expert_replay, Mapping), "expert replay qualification identity must be an object")
+    _require_exact_keys(
+        expert_replay,
+        _EXPERT_REPLAY_QUALIFICATION_FIELDS,
+        "expert replay qualification identity",
+    )
+    config_file_sha256 = expert_replay["config_file_sha256"]
+    require(isinstance(config_file_sha256, Mapping), "expert replay qualification config identity is invalid")
+    _require_exact_keys(
+        config_file_sha256,
+        {"direct_regression", "rectified_flow"},
+        "expert replay qualification config identity",
+    )
+    for name, value in config_file_sha256.items():
+        _require_sha256(value, f"expert replay qualification config {name}")
+    for name in (
+        "content_sha256",
+        "dataset_content_inventory_sha256",
+        "dataset_tree_metadata_sha256",
+        "evidence_manifest_raw_sha256",
+        "gates_sha256",
+        "normalization_content_sha256",
+        "normalization_raw_sha256",
+        "original_hdf5_inventory_content_sha256",
+        "original_hdf5_inventory_raw_sha256",
+        "project_source_tree_sha256",
+        "raw_evidence_root_sha256",
+        "report_sha256",
+        "simulator_attestation_raw_sha256",
+        "simulator_attestation_sha256",
+        "simulator_runtime_sha256",
+        "task_inventory_sha256",
+    ):
+        _require_sha256(expert_replay[name], f"expert replay qualification {name}")
+    require(
+        expert_replay["schema"] == "duo-vla-libero-expert-replay-qualification-v1"
+        and expert_replay["kind"] == "libero-40-task-regenerated-expert-replay"
+        and expert_replay["status"] == "passed",
+        "expert replay qualification schema/kind/status mismatch",
+    )
+    require(
+        expert_replay["task_count"] == expert_replay["successful_task_count"] == 40
+        and expert_replay["demonstration_count"] == expert_replay["successful_demonstration_count"] >= 40,
+        "expert replay qualification is not a 40/40 successful replay",
+    )
+    require(
+        expert_replay["dataset_tree_metadata_sha256"] == DATASET_TREE_METADATA_SHA256
+        and expert_replay["dataset_content_inventory_sha256"] == DATASET_CONTENT_INVENTORY_SHA256,
+        "expert replay qualification dataset identity mismatch",
+    )
+    require(
+        expert_replay["dataset_snapshot_files_verified"] == DATASET_SNAPSHOT_FILES_VERIFIED
+        and expert_replay["dataset_snapshot_total_bytes"] == DATASET_SNAPSHOT_TOTAL_BYTES,
+        "expert replay qualification dataset snapshot counts mismatch",
+    )
+    validate_train_venv_identity(
+        expert_replay["train_venv_identity"],
+        name="expert replay qualification train-venv identity",
+    )
+    validator_runtime = validate_validator_runtime_identity(expert_replay["validator_runtime_identity"])
+    require(
+        validator_runtime["simulator_runtime_sha256"] == expert_replay["simulator_runtime_sha256"],
+        "expert replay validator runtime differs from its simulator runtime identity",
+    )
+    require(
+        expert_replay["normalization_content_sha256"] == NORMALIZATION_SHA256,
+        "expert replay qualification normalization identity mismatch",
+    )
+    require(
+        expert_replay["original_hdf5_repository_id"] == ORIGINAL_HDF5_REPOSITORY_ID
+        and expert_replay["original_hdf5_revision"] == ORIGINAL_HDF5_REVISION,
+        "expert replay qualification original HDF5 repository identity mismatch",
+    )
+    require(
+        expert_replay["original_hdf5_inventory_content_sha256"] == ORIGINAL_HDF5_CONTENT_SHA256,
+        "expert replay qualification original HDF5 inventory identity mismatch",
+    )
+    require(
+        expert_replay["original_hdf5_inventory_raw_sha256"] == ORIGINAL_HDF5_INVENTORY_RAW_SHA256,
+        "expert replay qualification original HDF5 raw inventory identity mismatch",
+    )
+    require(
+        expert_replay["original_hdf5_file_count"] == ORIGINAL_HDF5_FILE_COUNT
+        and expert_replay["original_hdf5_total_bytes"] == ORIGINAL_HDF5_TOTAL_BYTES,
+        "expert replay qualification original HDF5 size identity mismatch",
+    )
+    require(
+        expert_replay["task_inventory_sha256"] == TASK_INVENTORY_SHA256,
+        "expert replay qualification task inventory identity mismatch",
+    )
+    _require_sha256(manifest_simulator_attestation_sha256, "simulator_attestation_sha256")
+    _require_sha256(simulator_attestation_sha256, "current simulator attestation SHA-256")
+    require(
+        hmac.compare_digest(manifest_simulator_attestation_sha256, simulator_attestation_sha256),
+        "current simulator attestation differs from pre-registration",
+    )
+    require(
+        expert_replay["simulator_attestation_sha256"] == manifest_simulator_attestation_sha256,
+        "expert replay qualification simulator attestation mismatch",
+    )
+    return expert_replay
+
+
+def validate_spatial_preregistration_manifest(
+    manifest: Any,
+    *,
+    simulator_attestation_sha256: str,
+) -> list[dict[str, Any]]:
+    """Validate the sealed one-cell, 500-reset official Spatial protocol."""
+
+    require(isinstance(manifest, dict), "Spatial pre-registration manifest must be an object")
+    _require_exact_keys(manifest, _SPATIAL_PREREGISTRATION_FIELDS, "Spatial pre-registration manifest")
+    require(manifest["schema"] == SPATIAL_PREREGISTRATION_SCHEMA, "Spatial pre-registration schema mismatch")
+    roots = validate_official_output_roots(manifest["official_output_roots"])
+    require(manifest["benchmark_protocol"] == PROTOCOL, "Spatial pre-registration protocol mismatch")
+    require(manifest["suites"] == ["libero_spatial"], "Spatial pre-registration must contain only libero_spatial")
+    require(manifest["task_ids"] == list(range(10)), "Spatial pre-registration task set changed")
+    require(
+        manifest["official_resets_per_task"] == OFFICIAL_RESETS_PER_TASK,
+        "Spatial pre-registration official reset count changed",
+    )
+    require(
+        manifest["policy_warmup_calls"] == OFFICIAL_POLICY_WARMUP_CALLS,
+        f"Spatial pre-registration policy warm-up count must equal {OFFICIAL_POLICY_WARMUP_CALLS}",
+    )
+    require(
+        manifest["final_checkpoint_update"] == FINAL_CHECKPOINT_UPDATE,
+        "Spatial pre-registration final checkpoint update changed",
+    )
+    require(
+        type(manifest["evaluation_seed"]) is int and 0 <= manifest["evaluation_seed"] < 2**63,
+        "Spatial pre-registration evaluation_seed is invalid",
+    )
+    _require_sha256(manifest["final_freeze_token_sha256"], "final_freeze_token_sha256")
+    require(
+        manifest["reporting_scope"] == SPATIAL_REPORTING_SCOPE,
+        "Spatial reporting scope must prohibit full G6 and three-seed aggregate claims",
+    )
+    expert_replay = _validate_spatial_expert_replay_identity(
+        manifest["expert_replay_qualification"],
+        manifest_simulator_attestation_sha256=manifest["simulator_attestation_sha256"],
+        simulator_attestation_sha256=simulator_attestation_sha256,
+    )
+    episodes = official_spatial_episode_matrix()
+    require(
+        manifest["episode_count"] == SPATIAL_OFFICIAL_EPISODES,
+        "Spatial pre-registration episode count must equal 500",
+    )
+    require(manifest["episodes"] == episodes, "Spatial pre-registration episode matrix changed")
+    episode_sha256 = canonical_sha256(episodes)
+    _require_sha256(manifest["episode_matrix_sha256"], "Spatial pre-registration episode_matrix_sha256")
+    require(
+        hmac.compare_digest(manifest["episode_matrix_sha256"], episode_sha256),
+        "Spatial pre-registration episode matrix SHA-256 mismatch",
+    )
+    cells = manifest["cells"]
+    require(
+        isinstance(cells, list) and len(cells) == 1,
+        "Spatial pre-registration must contain exactly one policy cell",
+    )
+    checked = [
+        _validate_registered_cell(
+            cells[0],
+            episode_matrix_sha256=episode_sha256,
+            roots=roots,
+            final_freeze_token_sha256=manifest["final_freeze_token_sha256"],
+        )
+    ]
+    selected = checked[0]
+    require(
+        manifest["training_seeds"] == [selected["train_seed"]],
+        "Spatial pre-registration must identify exactly the selected cell training seed",
+    )
+    require(
+        manifest["execution_horizons"] == [selected["execution_horizon"]],
+        "Spatial pre-registration must identify exactly the selected cell execution horizon",
+    )
+    require(
+        (
+            selected["checkpoint"]["source_tree_sha256"],
+            selected["checkpoint"]["dataset_tree_sha256"],
+            selected["checkpoint"]["dataset_content_inventory_sha256"],
+        )
+        == (
+            expert_replay["project_source_tree_sha256"],
+            expert_replay["dataset_tree_metadata_sha256"],
+            expert_replay["dataset_content_inventory_sha256"],
+        ),
+        "Spatial checkpoint differs from the expert-replay-qualified source/data identity",
+    )
+    return checked
+
+
 def load_preregistration(
     path: Path,
     *,
@@ -1512,6 +1773,44 @@ def load_preregistration(
     require(
         selected["execution_horizon"] == execution_horizon,
         "CLI execution horizon differs from the pre-registered cell",
+    )
+    return dict(manifest), selected, manifest_sha256
+
+
+def load_spatial_preregistration(
+    path: Path,
+    *,
+    cell_id: str,
+    execution_horizon: int,
+    evaluation_seed: int,
+    final_freeze_token: str,
+    preregistration_sha256: str,
+    simulator_attestation_sha256: str,
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    manifest, manifest_sha256 = _read_strict_json(
+        path,
+        name="LIBERO Spatial pre-registration manifest",
+        expected_sha256=preregistration_sha256,
+    )
+    cells = validate_spatial_preregistration_manifest(
+        manifest,
+        simulator_attestation_sha256=simulator_attestation_sha256,
+    )
+    require(
+        manifest["evaluation_seed"] == evaluation_seed,
+        "CLI evaluation seed differs from Spatial pre-registration",
+    )
+    require(isinstance(final_freeze_token, str) and bool(final_freeze_token.strip()), "final freeze token is empty")
+    token_sha256 = hashlib.sha256(final_freeze_token.encode("utf-8")).hexdigest()
+    require(
+        hmac.compare_digest(token_sha256, manifest["final_freeze_token_sha256"]),
+        "final freeze token does not match Spatial pre-registration",
+    )
+    selected = cells[0]
+    require(selected["cell_id"] == cell_id, "selected --cell-id is absent from Spatial pre-registration")
+    require(
+        selected["execution_horizon"] == execution_horizon,
+        "CLI execution horizon differs from the Spatial pre-registered cell",
     )
     return dict(manifest), selected, manifest_sha256
 
@@ -1698,8 +1997,7 @@ def validate_policy_health(health: dict[str, Any], *, allow_fake_policy: bool) -
     require(checkpoint.get("train_seed") == health.get("train_seed"), "checkpoint and policy train seeds disagree")
     execution_geometry = validate_execution_geometry(health.get("execution_geometry"))
     require(
-        checkpoint.get("execution_geometry") == execution_geometry == LIBERO_EXECUTION_GEOMETRY,
-        "checkpoint and live execution geometry disagree",
+        checkpoint.get("execution_geometry") == execution_geometry, "checkpoint and live execution geometry disagree"
     )
     require(
         isinstance(checkpoint.get("manifest_sha256"), str) and len(checkpoint["manifest_sha256"]) == 64,
@@ -1995,7 +2293,7 @@ def validate_official_policy_health(
         "live latency runtime differs from pre-registration",
     )
     require(
-        health["execution_geometry"] == selected_cell["execution_geometry"] == LIBERO_EXECUTION_GEOMETRY,
+        health["execution_geometry"] == selected_cell["execution_geometry"],
         "live execution geometry differs from pre-registration",
     )
     selected_policy = {name: health[name] for name in ("inference_seed_behavior", "nfe", "objective", "sampler")}
@@ -2273,6 +2571,42 @@ def bind_official_summary(
         "latency_scope": "episode_policy_calls_only",
     }
     result["schema"] = OFFICIAL_SUMMARY_SCHEMA
+    return result
+
+
+def bind_official_spatial_summary(
+    summary: dict[str, Any],
+    *,
+    episode_matrix_sha256: str,
+) -> dict[str, Any]:
+    require(summary["complete_40_task_macro"] is False, "Spatial summary cannot claim a complete 40-task macro")
+    require(summary["overall_40_task_macro_success"] is None, "Spatial summary cannot report a 40-task macro")
+    require(summary["episodes"] == SPATIAL_OFFICIAL_EPISODES, "Spatial summary denominator is not 500")
+    require(summary["policy_calls"] > 0, "Spatial latency report has no measured episode policy calls")
+    task_counts = {(item["suite"], item["task_id"]): item["episodes"] for item in summary["task_metrics"]}
+    expected_counts = {("libero_spatial", task_id): OFFICIAL_RESETS_PER_TASK for task_id in range(10)}
+    require(task_counts == expected_counts, "Spatial task denominators must contain all 50 published resets")
+    suite_metrics = summary["suites"]
+    require(
+        isinstance(suite_metrics, list)
+        and len(suite_metrics) == 1
+        and suite_metrics[0].get("suite") == "libero_spatial"
+        and suite_metrics[0].get("tasks") == 10
+        and suite_metrics[0].get("episodes") == SPATIAL_OFFICIAL_EPISODES,
+        "Spatial summary suite coverage changed",
+    )
+    result = dict(summary)
+    result["reporting"] = {
+        **SPATIAL_REPORTING_SCOPE,
+        "denominator": SPATIAL_OFFICIAL_EPISODES,
+        "episode_matrix_sha256": episode_matrix_sha256,
+        "excluded_episode_count": 0,
+        "excluded_episodes": [],
+        "latency_scope": "episode_policy_calls_only",
+        "policy_warmup_calls": OFFICIAL_POLICY_WARMUP_CALLS,
+        "policy_warmup_included_in_latency": False,
+    }
+    result["schema"] = SPATIAL_OFFICIAL_SUMMARY_SCHEMA
     return result
 
 
@@ -2896,7 +3230,11 @@ class EvaluationJournal:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("development", "official-score"), default="development")
+    parser.add_argument(
+        "--mode",
+        choices=("development", "official-score", "official-spatial-score"),
+        default="development",
+    )
     parser.add_argument(
         "--socket",
         type=Path,
@@ -2963,6 +3301,33 @@ def validate_mode_arguments(args: argparse.Namespace) -> None:
             require(args.output_dir is not None, "development rollout requires --output-dir")
             require(args.policy_warmup_calls > 0, "development rollout requires at least one warm-up call")
         return
+    if args.mode == "official-spatial-score":
+        require(not args.dry_run, "official-spatial-score cannot use --dry-run")
+        require(not args.allow_fake_policy, "official-spatial-score cannot allow a fake policy")
+        require(args.reset_source == "official", "official-spatial-score requires published official resets")
+        require(args.dev_state_bank is None, "official-spatial-score cannot receive a development reset bank")
+        require(args.suite == "libero_spatial", "official-spatial-score requires --suite libero_spatial")
+        require(args.task_ids == "all", "official-spatial-score requires --task-ids all")
+        require(args.init_state_ids == "all", "official-spatial-score requires --init-state-ids all")
+        require(args.output_dir is not None, "official-spatial-score requires --output-dir")
+        require(
+            args.policy_warmup_calls == OFFICIAL_POLICY_WARMUP_CALLS,
+            f"official-spatial-score requires exactly {OFFICIAL_POLICY_WARMUP_CALLS} policy warm-up calls",
+        )
+        require(
+            args.preregistration_manifest is not None,
+            "official-spatial-score requires --preregistration-manifest",
+        )
+        _require_sha256(args.preregistration_sha256, "official-spatial-score --preregistration-sha256")
+        require(
+            isinstance(args.cell_id, str) and bool(args.cell_id),
+            "official-spatial-score requires --cell-id",
+        )
+        require(
+            isinstance(args.final_freeze_token, str) and bool(args.final_freeze_token.strip()),
+            "official-spatial-score requires an explicit --final-freeze-token",
+        )
+        return
     require(not args.dry_run, "official-score cannot use --dry-run")
     require(not args.allow_fake_policy, "official-score cannot allow a fake policy")
     require(args.reset_source == "official", "official-score requires published official resets")
@@ -2984,6 +3349,238 @@ def validate_mode_arguments(args: argparse.Namespace) -> None:
     )
 
 
+def _run_official_spatial_score(
+    args: argparse.Namespace,
+    *,
+    project_root: Path,
+    evaluator_environment: Mapping[str, str],
+    startup_sources: Mapping[str, Mapping[str, Any]],
+) -> None:
+    assert args.preregistration_manifest is not None
+    assert args.preregistration_sha256 is not None
+    assert args.cell_id is not None
+    assert args.final_freeze_token is not None
+    assert args.output_dir is not None
+    recorded_manifest, _ = _read_strict_json(
+        args.preregistration_manifest.resolve(),
+        name="LIBERO Spatial pre-registration manifest",
+        expected_sha256=args.preregistration_sha256,
+    )
+    recorded_attestation_sha256 = recorded_manifest.get("simulator_attestation_sha256")
+    _require_sha256(recorded_attestation_sha256, "recorded simulator attestation SHA-256")
+    manifest, selected_cell, preregistration_sha256 = load_spatial_preregistration(
+        args.preregistration_manifest.resolve(),
+        cell_id=args.cell_id,
+        execution_horizon=args.execution_horizon,
+        evaluation_seed=args.evaluation_seed,
+        final_freeze_token=args.final_freeze_token,
+        preregistration_sha256=args.preregistration_sha256,
+        simulator_attestation_sha256=recorded_attestation_sha256,
+    )
+    roots = validate_official_output_roots(manifest["official_output_roots"], require_live=True)
+    output_claim = selected_cell["output_claim"]
+    expected_output_dir = Path(output_claim["output_dir"])
+    expected_claim_path = Path(output_claim["claim_path"])
+    require(
+        args.output_dir.is_absolute() and args.output_dir == expected_output_dir,
+        "official-spatial-score --output-dir differs from the pre-registered canonical output directory",
+    )
+    official_episodes = official_spatial_episode_matrix()
+    created_utc = datetime.now(UTC).isoformat()
+
+    def output_commit_guard() -> None:
+        require_evaluator_sources_unchanged(startup_sources, project_root=project_root)
+        validate_official_output_roots(roots, require_live=True)
+
+    claim_record = build_claim_record(
+        output_claim,
+        cell_id=selected_cell["cell_id"],
+        preregistration_sha256=preregistration_sha256,
+        final_freeze_token_sha256=manifest["final_freeze_token_sha256"],
+        created_utc=created_utc,
+    )
+    claim_payload = (
+        json.dumps(claim_record, allow_nan=False, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    ).encode("ascii")
+    claim_json_sha256 = publish_bytes_and_sha256_exclusive(
+        expected_claim_path,
+        claim_payload,
+        commit_guard=output_commit_guard,
+    )
+    run_manifest = {
+        "cell": selected_cell,
+        "claim_json_sha256": claim_json_sha256,
+        "created_utc": created_utc,
+        "episode_count": len(official_episodes),
+        "episode_matrix_sha256": canonical_sha256(official_episodes),
+        "evaluation_seed": args.evaluation_seed,
+        "evaluator_environment": dict(evaluator_environment),
+        "execution_horizon": args.execution_horizon,
+        "final_freeze_token_sha256": manifest["final_freeze_token_sha256"],
+        "init_state_ids": list(range(OFFICIAL_RESETS_PER_TASK)),
+        "mode": "official-spatial-score",
+        "output_claim": output_claim,
+        "policy_socket": str(args.socket),
+        "policy_warmup": {
+            "attempted_count": 0,
+            "completed_count": 0,
+            "current_request": None,
+            "expected_count": args.policy_warmup_calls,
+            "included_in_episode_latency": False,
+            "reports": [],
+            "status": "pending",
+        },
+        "preregistration_manifest": str(args.preregistration_manifest.resolve()),
+        "preregistration_sha256": preregistration_sha256,
+        "protocol": PROTOCOL,
+        "reporting_scope": dict(SPATIAL_REPORTING_SCOPE),
+        "reset_identity": {
+            "bank": None,
+            "id_field": "published_init_state_id",
+            "source": "official",
+            "state_sha256": None,
+        },
+        "reset_source": "official",
+        "schema": SPATIAL_OFFICIAL_RUN_SCHEMA,
+        "suites": ["libero_spatial"],
+        "task_ids": list(range(10)),
+        "validator_runtime_identity": manifest["expert_replay_qualification"]["validator_runtime_identity"],
+    }
+    journal = EvaluationJournal(
+        expected_output_dir,
+        run_manifest,
+        claim_path=expected_claim_path,
+        claim_json_sha256=claim_json_sha256,
+        commit_guard=output_commit_guard,
+    )
+    journal.start()
+    try:
+        simulator_preflight = run_exact_simulator_preflight(project_root, construct_environment=True)
+        simulator_attestation_sha256 = canonical_sha256(simulator_preflight)
+        require(
+            hmac.compare_digest(simulator_attestation_sha256, recorded_attestation_sha256),
+            "current simulator attestation differs from Spatial pre-registration",
+        )
+        qualified_validator_runtime = validate_validator_runtime_against_attestation(
+            manifest["expert_replay_qualification"]["validator_runtime_identity"],
+            simulator_preflight,
+        )
+        live_eval_venv = validate_eval_venv_identity(
+            simulator_preflight.get("eval_venv_identity"),
+            name="current simulator eval-venv identity",
+        )
+        require(
+            canonical_json_bytes(live_eval_venv)
+            == canonical_json_bytes(qualified_validator_runtime["eval_venv_identity"]),
+            "current evaluator venv differs from the expert replay validator runtime",
+        )
+        project_sources = simulator_preflight.get("project_sources")
+        require(isinstance(project_sources, Mapping), "simulator attestation has no project sources")
+        for name, attested_name in (("evaluate_libero.py", "evaluator"), ("libero_bridge.py", "bridge")):
+            require(
+                project_sources.get(attested_name) == startup_sources[name]["sha256"],
+                f"simulator-attested {attested_name} source differs from evaluator startup",
+            )
+        journal.update_running(
+            {
+                "simulator_attestation_sha256": simulator_attestation_sha256,
+                "simulator_preflight": simulator_preflight,
+            }
+        )
+        partial_reports: list[dict[str, Any]] = []
+
+        def record_warmup_attempt(index: int, intent: Mapping[str, Any]) -> None:
+            journal.update_running(
+                {
+                    "policy_warmup": {
+                        "attempted_count": index + 1,
+                        "completed_count": len(partial_reports),
+                        "current_request": dict(intent),
+                        "expected_count": args.policy_warmup_calls,
+                        "included_in_episode_latency": False,
+                        "reports": list(partial_reports),
+                        "status": "running",
+                    }
+                }
+            )
+
+        def record_warmup_report(reports: Sequence[Mapping[str, Any]]) -> None:
+            partial_reports[:] = [dict(report) for report in reports]
+            journal.update_running(
+                {
+                    "policy_warmup": {
+                        "attempted_count": len(reports),
+                        "completed_count": len(reports),
+                        "current_request": None,
+                        "expected_count": args.policy_warmup_calls,
+                        "included_in_episode_latency": False,
+                        "reports": list(partial_reports),
+                        "status": "running",
+                    }
+                }
+            )
+
+        with PolicyClient(args.socket, timeout_seconds=args.policy_timeout_seconds) as client:
+            health = client.health()
+            checkpoint_identity = validate_official_policy_health(
+                health,
+                selected_cell=selected_cell,
+                execution_horizon=args.execution_horizon,
+                expert_replay_qualification=manifest["expert_replay_qualification"],
+            )
+            journal.update_running({"checkpoint": checkpoint_identity, "policy_health": health})
+            warmup_reports = run_policy_warmups(
+                client,
+                health,
+                count=args.policy_warmup_calls,
+                execution_horizon=args.execution_horizon,
+                evaluation_seed=args.evaluation_seed,
+                attempt_callback=record_warmup_attempt,
+                report_callback=record_warmup_report,
+            )
+            policy_warmup = {
+                "count": args.policy_warmup_calls,
+                "included_in_episode_latency": False,
+                "k_independent_response_sha256": canonical_sha256(warmup_k_independent_response(warmup_reports[0])),
+                "replan_id": OFFICIAL_POLICY_WARMUP_REPLAN_ID,
+                "reports": warmup_reports,
+                "validated_before_scoring": True,
+            }
+            journal.update_running({"policy_warmup": policy_warmup})
+            require(journal.episode_sink is not None, "official Spatial episode journal is unavailable")
+            episodes = run_rollouts(
+                client=client,
+                train_seed=health["train_seed"],
+                evaluation_seed=args.evaluation_seed,
+                suites=("libero_spatial",),
+                task_ids=tuple(range(10)),
+                init_state_ids=tuple(range(OFFICIAL_RESETS_PER_TASK)),
+                execution_horizon=args.execution_horizon,
+                episode_sink=journal.episode_sink,
+                reset_source="official",
+                development_bank=None,
+                official_episode_identities=frozenset(
+                    (episode["suite"], episode["task_id"], episode["reset_id"])
+                    for episode in official_episodes
+                ),
+            )
+        observed_order = [
+            {"reset_id": episode["reset_id"], "suite": episode["suite"], "task_id": episode["task_id"]}
+            for episode in episodes
+        ]
+        require(observed_order == official_episodes, "official Spatial episode order differs from pre-registration")
+        summary = bind_official_spatial_summary(
+            summarize_episodes(episodes, execution_horizon=args.execution_horizon),
+            episode_matrix_sha256=canonical_sha256(official_episodes),
+        )
+        journal.complete(summary, episode_records=len(episodes))
+        print(json.dumps(summary, allow_nan=False, indent=2, sort_keys=True))
+    except BaseException as exc:
+        if journal.run_manifest.get("status") != "failed":
+            journal.fail(exc)
+        raise
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     validate_mode_arguments(args)
@@ -2992,6 +3589,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     require(platform.python_version().startswith("3.12."), "LIBERO evaluator requires Python 3.12")
     startup_sources = _IMPORT_EVALUATOR_SOURCE_IDENTITIES
     require_evaluator_sources_unchanged(startup_sources, project_root=project_root)
+
+    if args.mode == "official-spatial-score":
+        _run_official_spatial_score(
+            args,
+            project_root=project_root,
+            evaluator_environment=evaluator_environment,
+            startup_sources=startup_sources,
+        )
+        return
 
     if args.mode == "official-score":
         assert args.preregistration_manifest is not None

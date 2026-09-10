@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create and validate one sealed 24-cell official LIBERO pre-registration."""
+"""Create and validate a sealed full-matrix or single-cell Spatial LIBERO pre-registration."""
 
 # ruff: noqa: E402 -- authenticate local import roots before importing project code.
 
@@ -118,6 +118,10 @@ from evaluate_libero import (
     PREREGISTRATION_SCHEMA,
     PROTOCOL,
     SIMULATOR_ATTESTATION_SCHEMA,
+    SINGLE_GPU_PREREGISTRATION_SCHEMA,
+    SPATIAL_OFFICIAL_EPISODES,
+    SPATIAL_PREREGISTRATION_SCHEMA,
+    SPATIAL_REPORTING_SCOPE,
     SUITES,
     _read_strict_json,
     canonical_sha256,
@@ -125,9 +129,11 @@ from evaluate_libero import (
     derive_output_claim,
     load_contamination_contract,
     official_episode_matrix,
+    official_spatial_episode_matrix,
     publish_bytes_and_sha256_exclusive,
     validate_evaluator_process_environment,
     validate_preregistration_manifest,
+    validate_spatial_preregistration_manifest,
 )
 from qualify_libero_expert_replay import load_qualification_report, qualification_identity
 
@@ -166,6 +172,12 @@ def stable_regular_file_sha256(path: Path) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--mode",
+        choices=("official-score", "official-spatial-score"),
+        default="official-score",
+        help="manifest contract to seal; the default preserves the 24-cell official protocol",
+    )
     parser.add_argument("--cells", type=Path, required=True, help='strict JSON object with one "cells" list')
     parser.add_argument("--simulator-attestation", type=Path, required=True, help="strict preflight JSON report")
     parser.add_argument("--expert-replay-qualification", type=Path, required=True)
@@ -180,7 +192,7 @@ def parse_args() -> argparse.Namespace:
         "--official-output-root",
         type=Path,
         required=True,
-        help="dedicated existing empty canonical directory for the 24 official run directories",
+        help="dedicated existing empty canonical directory for the selected official run directories",
     )
     parser.add_argument(
         "--official-claim-root",
@@ -199,7 +211,7 @@ def main() -> None:
     project_root = Path(__file__).resolve().parents[1]
     validate_evaluator_process_environment(project_root)
     aggregator_path = project_root / "scripts/aggregate_libero_official.py"
-    aggregator_sha256 = stable_regular_file_sha256(aggregator_path)
+    aggregator_sha256 = stable_regular_file_sha256(aggregator_path) if args.mode == "official-score" else None
     creator_path = Path(__file__).resolve()
     creator_sha256 = stable_regular_file_sha256(creator_path)
     evaluator_path = project_root / "scripts/evaluate_libero.py"
@@ -236,8 +248,12 @@ def main() -> None:
         simulator_attestation=attestation,
         simulator_attestation_raw_sha256=attestation_raw_sha256,
     )
-    contamination = load_contamination_contract(project_root)
-    episodes = official_episode_matrix(contamination)
+    if args.mode == "official-spatial-score":
+        contamination = None
+        episodes = official_spatial_episode_matrix()
+    else:
+        contamination = load_contamination_contract(project_root)
+        episodes = official_episode_matrix(contamination)
     episode_matrix_sha256 = canonical_sha256(episodes)
     roots = capture_official_output_roots(
         args.official_output_root,
@@ -283,43 +299,79 @@ def main() -> None:
         },
         "official checkpoints do not use the expert-replay-qualified source/data identity",
     )
-    manifest = {
-        "aggregation_python_version": AGGREGATION_PYTHON_VERSION,
-        "aggregator_sha256": aggregator_sha256,
-        "benchmark_protocol": PROTOCOL,
-        "cells": cells,
-        "contamination": contamination,
-        "episode_count": len(episodes),
-        "episode_matrix_sha256": episode_matrix_sha256,
-        "episodes": episodes,
-        "evaluation_seed": args.evaluation_seed,
-        "expert_replay_qualification": expert_replay_qualification,
-        "execution_horizons": list(OFFICIAL_EXECUTION_HORIZONS),
-        "final_checkpoint_update": FINAL_CHECKPOINT_UPDATE,
-        "final_freeze_token_sha256": freeze_token_sha256,
-        "official_resets_per_task": OFFICIAL_RESETS_PER_TASK,
-        "official_output_roots": roots,
-        "policy_warmup_calls": OFFICIAL_POLICY_WARMUP_CALLS,
-        "schema": PREREGISTRATION_SCHEMA,
-        "simulator_attestation_sha256": simulator_attestation_sha256,
-        "suites": list(SUITES),
-        "task_ids": list(range(10)),
-        "training_seeds": list(OFFICIAL_TRAIN_SEEDS),
-    }
-    validate_preregistration_manifest(
-        manifest,
-        contamination=contamination,
-        simulator_attestation_sha256=simulator_attestation_sha256,
-    )
+    execution_geometries = {canonical_sha256(cell["execution_geometry"]) for cell in cells}
+    require(len(execution_geometries) == 1, "all official cells must share one execution geometry")
+    if args.mode == "official-spatial-score":
+        require(len(cells) == 1, "official-spatial-score requires exactly one selected policy cell")
+        selected = cells[0]
+        manifest = {
+            "benchmark_protocol": PROTOCOL,
+            "cells": cells,
+            "episode_count": SPATIAL_OFFICIAL_EPISODES,
+            "episode_matrix_sha256": episode_matrix_sha256,
+            "episodes": episodes,
+            "evaluation_seed": args.evaluation_seed,
+            "expert_replay_qualification": expert_replay_qualification,
+            "execution_horizons": [selected["execution_horizon"]],
+            "final_checkpoint_update": FINAL_CHECKPOINT_UPDATE,
+            "final_freeze_token_sha256": freeze_token_sha256,
+            "official_resets_per_task": OFFICIAL_RESETS_PER_TASK,
+            "official_output_roots": roots,
+            "policy_warmup_calls": OFFICIAL_POLICY_WARMUP_CALLS,
+            "reporting_scope": dict(SPATIAL_REPORTING_SCOPE),
+            "schema": SPATIAL_PREREGISTRATION_SCHEMA,
+            "simulator_attestation_sha256": simulator_attestation_sha256,
+            "suites": ["libero_spatial"],
+            "task_ids": list(range(10)),
+            "training_seeds": [selected["train_seed"]],
+        }
+        validate_spatial_preregistration_manifest(
+            manifest,
+            simulator_attestation_sha256=simulator_attestation_sha256,
+        )
+    else:
+        assert contamination is not None
+        assert aggregator_sha256 is not None
+        single_gpu = cells[0]["execution_geometry"].get("execution_profile") == "duovla-single-gpu-tp1-v1"
+        preregistration_schema = SINGLE_GPU_PREREGISTRATION_SCHEMA if single_gpu else PREREGISTRATION_SCHEMA
+        manifest = {
+            "aggregation_python_version": AGGREGATION_PYTHON_VERSION,
+            "aggregator_sha256": aggregator_sha256,
+            "benchmark_protocol": PROTOCOL,
+            "cells": cells,
+            "contamination": contamination,
+            "episode_count": len(episodes),
+            "episode_matrix_sha256": episode_matrix_sha256,
+            "episodes": episodes,
+            "evaluation_seed": args.evaluation_seed,
+            "expert_replay_qualification": expert_replay_qualification,
+            "execution_horizons": list(OFFICIAL_EXECUTION_HORIZONS),
+            "final_checkpoint_update": FINAL_CHECKPOINT_UPDATE,
+            "final_freeze_token_sha256": freeze_token_sha256,
+            "official_resets_per_task": OFFICIAL_RESETS_PER_TASK,
+            "official_output_roots": roots,
+            "policy_warmup_calls": OFFICIAL_POLICY_WARMUP_CALLS,
+            "schema": preregistration_schema,
+            "simulator_attestation_sha256": simulator_attestation_sha256,
+            "suites": list(SUITES),
+            "task_ids": list(range(10)),
+            "training_seeds": list(OFFICIAL_TRAIN_SEEDS),
+        }
+        validate_preregistration_manifest(
+            manifest,
+            contamination=contamination,
+            simulator_attestation_sha256=simulator_attestation_sha256,
+        )
     output = args.output.resolve()
     require(output.parent.is_dir(), "pre-registration output parent must already exist")
     payload = (json.dumps(manifest, allow_nan=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
     def commit_guard() -> None:
-        require(
-            stable_regular_file_sha256(aggregator_path) == aggregator_sha256,
-            "official aggregator changed while creating the pre-registration",
-        )
+        if args.mode == "official-score":
+            require(
+                stable_regular_file_sha256(aggregator_path) == aggregator_sha256,
+                "official aggregator changed while creating the pre-registration",
+            )
         require(
             stable_regular_file_sha256(creator_path) == creator_sha256
             and stable_regular_file_sha256(evaluator_path) == evaluator_sha256,

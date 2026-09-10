@@ -27,6 +27,7 @@ class OverfitResult:
     final_loss: float
     best_loss: float
     reduction: float
+    reconstructed_normalized_action_mae: float
     elapsed_seconds: float
 
 
@@ -113,6 +114,8 @@ def run_fixed_batch_overfit(
             action_valid_mask=action_mask,
         )
         final_loss = float(masked_velocity_mse(final_prediction, pair.target_velocity, action_mask))
+        final_clean = pair.noisy_actions + (1.0 - pair.timesteps[:, None, None]) * final_prediction
+        reconstructed_normalized_action_mae = float((final_clean - clean_actions).abs().mean())
     return OverfitResult(
         seed=seed,
         device=str(target_device),
@@ -121,6 +124,7 @@ def run_fixed_batch_overfit(
         final_loss=final_loss,
         best_loss=min(best_loss, final_loss),
         reduction=initial_loss / max(final_loss, torch.finfo(torch.float32).tiny),
+        reconstructed_normalized_action_mae=reconstructed_normalized_action_mae,
         elapsed_seconds=elapsed,
     )
 

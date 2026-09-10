@@ -53,6 +53,17 @@ wall time, checkpoint storage, and rollout cost. The full 30,000-update, three-s
 resource estimate and the immutable training-recipe registration are accepted. Reducing updates or seeds creates a separately
 labeled pilot protocol and must not be reported as the predeclared benchmark comparison.
 
+The GPU-0-only implementation and its separate TP=1 artifact topology are documented in
+[GPU 0 / TP=1 G6 execution profile](single_gpu_g6.md). It retains physical B=8/BF16 and does not modify the preserved
+TP=2 recipe.
+
+The final TP=1 qualification measured 31.072/30.590 seconds per LIBERO flow/direct update and 21.673/21.442 seconds per
+CALVIN flow/direct update. The corresponding twelve-run, three-seed campaign projection is 109.143 serial GPU-0 days
+for optimizer updates alone. The compute report is frozen at
+`/hdd2/hyunbin/vla/cache/reports/g6/g6-compute-qualification-tp1-v1.json` (SHA-256
+`f5192d82076ea61e79ce9bc4abf04a0976eff880d54123dc3cd79eb713ec6059`). This reaches the explicit-approval STOP; it
+does not authorize or start any 30,000-update run.
+
 ## Staged runs
 
 | Gate | Data/model | Pass criterion |

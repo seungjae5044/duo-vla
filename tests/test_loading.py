@@ -15,6 +15,7 @@ transformers = pytest.importorskip("transformers", minversion="5.15.0")
 from transformers import DiffusionGemmaConfig  # noqa: E402
 
 from duo_vla.backbones.loading import (  # noqa: E402
+    DATA_PARALLEL_REPLICA_MODE,
     DiffusionGemmaModelSpec,
     expected_decoder_attention_lora_adapter_config,
     expected_decoder_attention_lora_weight_schema,
@@ -23,6 +24,12 @@ from duo_vla.backbones.loading import (  # noqa: E402
     validate_decoder_attention_lora_adapter_config,
     validate_decoder_attention_lora_weights,
 )
+
+
+def test_model_download_includes_the_complete_authenticated_snapshot_inventory() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    launcher = (project_root / "scripts/download_model.sh").read_text(encoding="utf-8")
+    assert "--include 'README.md'" in launcher
 
 
 def _fake_loaded_model(*, v_projection_layers: tuple[int, ...] = (0,)) -> nn.Module:
@@ -152,9 +159,68 @@ def test_loader_enforces_lora_topology_before_returning_model(monkeypatch: pytes
     loaded = load_diffusion_gemma_bf16_tp(_tiny_spec(), tp_size=1, local_files_only=True)
 
     assert loaded is model
+    assert loaded._tp_size == 1
+    assert loaded._from_pretrained_kwargs["device_map"] == {"": 0}
+    assert "distributed_config" not in loaded._from_pretrained_kwargs
     assert all(not parameter.requires_grad for parameter in loaded.parameters())
     assert loaded._from_pretrained_kwargs["experts_implementation"] == "grouped_mm"
     assert _tiny_spec().expected_experts_implementation == "grouped_mm"
+
+
+@pytest.mark.parametrize("local_rank", (0, 1))
+def test_loader_places_explicit_dp2_tp1_replica_on_local_rank(
+    monkeypatch: pytest.MonkeyPatch,
+    local_rank: int,
+) -> None:
+    model = _fake_loaded_model()
+    _patch_loader_dependencies(monkeypatch, model)
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("LOCAL_RANK", str(local_rank))
+
+    loaded = load_diffusion_gemma_bf16_tp(
+        _tiny_spec(),
+        tp_size=1,
+        replica_mode=DATA_PARALLEL_REPLICA_MODE,
+        local_files_only=True,
+    )
+
+    assert loaded is model
+    assert loaded._tp_size == 1
+    assert loaded._replica_mode == DATA_PARALLEL_REPLICA_MODE
+    assert loaded._data_parallel_world_size == 2
+    assert loaded._from_pretrained_kwargs["device_map"] == {"": local_rank}
+    assert "distributed_config" not in loaded._from_pretrained_kwargs
+
+
+def test_loader_keeps_tp_and_dp_replica_modes_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = _fake_loaded_model()
+    _patch_loader_dependencies(monkeypatch, model)
+
+    with pytest.raises(ValueError, match="unsupported DiffusionGemma replica mode"):
+        load_diffusion_gemma_bf16_tp(_tiny_spec(), tp_size=1, replica_mode="implicit")
+    with pytest.raises(ValueError, match="requires tp_size=1"):
+        load_diffusion_gemma_bf16_tp(_tiny_spec(), tp_size=2, replica_mode=DATA_PARALLEL_REPLICA_MODE)
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    with pytest.raises(RuntimeError, match="requires explicit replica_mode"):
+        load_diffusion_gemma_bf16_tp(_tiny_spec(), tp_size=1)
+
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    with pytest.raises(RuntimeError, match="requires WORLD_SIZE=2"):
+        load_diffusion_gemma_bf16_tp(
+            _tiny_spec(),
+            tp_size=1,
+            replica_mode=DATA_PARALLEL_REPLICA_MODE,
+        )
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("LOCAL_RANK", "2")
+    with pytest.raises(RuntimeError, match="invalid LOCAL_RANK=2"):
+        load_diffusion_gemma_bf16_tp(
+            _tiny_spec(),
+            tp_size=1,
+            replica_mode=DATA_PARALLEL_REPLICA_MODE,
+        )
 
 
 def test_loader_rejects_backend_override_and_loaded_backend_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:

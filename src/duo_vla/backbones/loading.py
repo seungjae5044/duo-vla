@@ -1,4 +1,4 @@
-"""Pinned DiffusionGemma loading for the supported two-GPU BF16 setup."""
+"""Pinned DiffusionGemma loading for the qualified one- and two-GPU BF16 setups."""
 
 from __future__ import annotations
 
@@ -62,6 +62,7 @@ class DiffusionGemmaModelSpec:
 
 
 DEFAULT_DIFFUSION_GEMMA_SPEC = DiffusionGemmaModelSpec()
+DATA_PARALLEL_REPLICA_MODE = "data_parallel"
 
 
 def expected_decoder_attention_lora_targets(
@@ -289,13 +290,18 @@ def load_diffusion_gemma_bf16_tp(
     spec: DiffusionGemmaModelSpec = DEFAULT_DIFFUSION_GEMMA_SPEC,
     *,
     tp_size: int = 2,
+    replica_mode: str | None = None,
     local_files_only: bool = False,
     **from_pretrained_kwargs: Any,
 ) -> nn.Module:
-    """Load the pinned official checkpoint with native tensor parallelism and freeze its base tensors."""
+    """Load the pinned checkpoint with either native TP or explicit full-model DP replication."""
 
     if tp_size <= 0:
         raise ValueError("tp_size must be positive")
+    if replica_mode not in {None, DATA_PARALLEL_REPLICA_MODE}:
+        raise ValueError(f"unsupported DiffusionGemma replica mode: {replica_mode!r}")
+    if replica_mode is not None and tp_size != 1:
+        raise ValueError("data-parallel replica loading requires tp_size=1")
     if "device_map" in from_pretrained_kwargs:
         raise ValueError("device_map must not be combined with native tensor parallel loading")
     if "experts_implementation" in from_pretrained_kwargs:
@@ -310,6 +316,10 @@ def load_diffusion_gemma_bf16_tp(
         raise RuntimeError(
             f"tp_size={tp_size} requires torchrun with WORLD_SIZE={tp_size}; observed WORLD_SIZE={world_size}"
         )
+    if replica_mode == DATA_PARALLEL_REPLICA_MODE and world_size != 2:
+        raise RuntimeError(f"data-parallel replica loading requires WORLD_SIZE=2; observed WORLD_SIZE={world_size}")
+    if tp_size == 1 and replica_mode is None and world_size != 1:
+        raise RuntimeError("TP=1 loading inside a multi-process job requires explicit replica_mode='data_parallel'")
 
     try:
         import torch
@@ -332,21 +342,38 @@ def load_diffusion_gemma_bf16_tp(
         revision=spec.revision,
         local_files_only=local_files_only,
     )
+    topology_kwargs: dict[str, Any]
+    if tp_size == 1:
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        expected_local_ranks = {0} if replica_mode is None else set(range(world_size))
+        if local_rank not in expected_local_ranks:
+            raise RuntimeError(
+                f"TP=1 {replica_mode or 'standalone'} loading received invalid LOCAL_RANK={local_rank}; "
+                f"expected one of {sorted(expected_local_ranks)}"
+            )
+        topology_kwargs = {"device_map": {"": local_rank}}
+    else:
+        topology_kwargs = {
+            "distributed_config": DistributedConfig(
+                tp_size=tp_size,
+                tp_plan=symmetric_diffusion_gemma_tp_plan(config),
+            )
+        }
     model = DiffusionGemmaForBlockDiffusion.from_pretrained(
         spec.model_id,
         revision=spec.revision,
         config=config,
         dtype=torch.bfloat16,
-        distributed_config=DistributedConfig(
-            tp_size=tp_size,
-            tp_plan=symmetric_diffusion_gemma_tp_plan(config),
-        ),
         low_cpu_mem_usage=True,
         local_files_only=local_files_only,
         attn_implementation="sdpa",
         experts_implementation=spec.expected_experts_implementation,
+        **topology_kwargs,
         **from_pretrained_kwargs,
     )
+    model._tp_size = tp_size
+    model._replica_mode = replica_mode
+    model._data_parallel_world_size = world_size if replica_mode == DATA_PARALLEL_REPLICA_MODE else 1
     config = model.config
     observed = (
         config.text_config.hidden_size,

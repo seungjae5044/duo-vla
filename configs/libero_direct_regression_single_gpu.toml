@@ -1,0 +1,5 @@
+extends = "libero_direct_regression.toml"
+execution_profile = "duovla-single-gpu-tp1-v1"
+
+[model]
+tensor_parallel_size = 1

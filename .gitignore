@@ -11,9 +11,34 @@ dist/
 
 # Local-only artifacts
 /data/
+/datasets/
+/models/
 /checkpoints/
 /outputs/
 /runs/
 /videos/
 /wandb/
+/cache/
+/artifacts/
+/logs/
+/profiles/
+/tensorboard/
+/tmp/
+/workspaces/
+
+# Generated reports are local; retain the existing reviewed qualification evidence.
+/reports/*
+!/reports/qualifications/
+/reports/qualifications/*
+!/reports/qualifications/calvin-abc-d-zip64-readiness-v1.json
+!/reports/qualifications/libero-direct-fixed-b8-strict-smoke-v1.json
+!/reports/qualifications/libero-fixed-b8-strict-v1.json
+!/reports/qualifications/libero-strict-lora-load-audit-v1.md
+
+# Secrets stay local; credential-free environment examples may be committed.
 .env
+.env.*
+!.env.example
+!.env.*.example
+
+# Keep source, configs (including identity JSON), tests, docs, and env lockfiles tracked.

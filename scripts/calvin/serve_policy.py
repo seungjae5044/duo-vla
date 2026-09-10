@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Persistent TP=2 Duo-VLA policy server for the isolated CALVIN evaluator."""
+"""Persistent TP1 or TP2 Duo-VLA policy server for the isolated CALVIN evaluator."""
 
 # ruff: noqa: E402 -- authenticate local import roots before importing project code.
 
@@ -79,9 +79,12 @@ def _activate_project_source_root() -> Path:
     finally:
         os.close(root_descriptor)
     source_text = str(source_root)
-    sys.path[:] = [source_text] + [
-        entry for entry in sys.path if str(Path(entry or os.getcwd()).resolve()) != source_text
-    ]
+    canonical_entries: list[str] = []
+    for entry in sys.path:
+        resolved = str(Path(entry or os.getcwd()).resolve())
+        if resolved != source_text and resolved not in canonical_entries:
+            canonical_entries.append(resolved)
+    sys.path[:] = [source_text, *canonical_entries]
     return source_root
 
 
@@ -147,7 +150,18 @@ from calvin_bridge import (
     serve_unix_policy,
 )
 
+from duo_vla.calvin_execution import (
+    FUSED_BACKEND,
+    OPTIMIZED_SOURCE_PATHS,
+    canonical_recipe_name,
+    execution_from_config,
+    expert_backend_functions,
+)
+from duo_vla.calvin_execution import (
+    execution_geometry as calvin_execution_geometry,
+)
 from duo_vla.runtime_integrity import (
+    canonical_visible_cuda_world_size,
     content_address_train_venv,
     require_matching_train_venv,
     static_environment_identity,
@@ -159,6 +173,7 @@ _validate_project_module_origins({"duo_vla", "duo_vla.runtime_integrity"})
 MODEL_ID = "google/diffusiongemma-26B-A4B-it"
 ARCHIVE_SHA256 = "c2036c67eb4c06966af1d1e1665bdb572c69e1404f5e77ffd46b384ff2b79f74"
 TRAIN_LOCK_SHA256 = "0b1fb188747ee99224078b3c40975ca7e6f8e082e22d2860f9b50ee679a67c46"
+SINGLE_GPU_TRAIN_LOCK_SHA256 = "bea1c95bf906ba68bb8065f5329f7f65a67f7bbbca472d870e06bc208333b0c1"
 EXPECTED_TRAIN_PYTHON = "3.11.15"
 CALVIN_STATE_ADAPTER = "robot_obs[0:7]+robot_obs[14:15]"
 CALVIN_ACTION_ADAPTER = "identity_official_scaled_rel_actions"
@@ -166,13 +181,14 @@ CALVIN_CAMERA_SHAPES = {"rgb_static": [200, 200, 3], "rgb_gripper": [84, 84, 3]}
 EXPERTS_IMPLEMENTATION = "grouped_mm"
 EXPERT_BATCH_ISOLATION = "sample_isolated_grouped_mm_v1"
 PHYSICAL_BATCH_SIZE = 8
-_EXECUTION_GEOMETRY_FIELDS = {
+_BASE_EXECUTION_GEOMETRY_FIELDS = {
     "expert_batch_isolation",
     "experts_implementation",
     "fixed_physical_prefix_width",
     "physical_batch_size",
     "prefix_geometry_content_sha256",
 }
+_EXECUTION_TOPOLOGY_FIELDS = {"execution_profile", "tensor_parallel_size"}
 PINNED_CALVIN_SOURCE_REVISIONS = {
     "calvin": "fa03f01f19c65920e18cf37398a9ce859274af76",
     "calvin_env": "1431a46bd36bde5903fb6345e68b5ccc30def666",
@@ -190,6 +206,11 @@ EXPECTED_TRAIN_PACKAGES = {
     "torch": "2.13.0+cu126",
     "torchvision": "0.28.0+cu126",
     "transformers": "5.15.0",
+}
+SINGLE_GPU_EXPECTED_TRAIN_PACKAGES = {
+    **EXPECTED_TRAIN_PACKAGES,
+    "torch": "2.13.0+cu129",
+    "torchvision": "0.28.0+cu129",
 }
 REQUIRED_TRAIN_ENVIRONMENT = {
     "BLIS_NUM_THREADS": "1",
@@ -288,6 +309,33 @@ _CALVIN_SOURCE_EXPLICIT_RELATIVE_PATHS = (
     "pyproject.toml",
     "uv.lock",
 )
+_CALVIN_SINGLE_GPU_SOURCE_EXPLICIT_RELATIVE_PATHS = (
+    *_CALVIN_SOURCE_EXPLICIT_RELATIVE_PATHS,
+    *OPTIMIZED_SOURCE_PATHS,
+    "configs/calvin_abc_to_d_single_gpu.toml",
+    "configs/calvin_abc_to_d_direct_single_gpu.toml",
+    "envs/train-single-gpu/pyproject.toml",
+    "envs/train-single-gpu/uv.lock",
+    "scripts/bootstrap_train_single_gpu_env.sh",
+    "scripts/run_calvin_train_single_gpu.sh",
+    "scripts/calvin/run_policy_server_single_gpu.sh",
+)
+
+
+def _train_runtime_pins(world_size: int) -> tuple[Path, str, dict[str, str], str, str]:
+    if world_size == 1:
+        return (
+            Path("envs/train-single-gpu/uv.lock"),
+            SINGLE_GPU_TRAIN_LOCK_SHA256,
+            SINGLE_GPU_EXPECTED_TRAIN_PACKAGES,
+            "12.9",
+            "train-single-gpu",
+        )
+    if world_size == 2:
+        return Path("uv.lock"), TRAIN_LOCK_SHA256, EXPECTED_TRAIN_PACKAGES, "12.6", "train"
+    raise ValueError("training world size must be one or two")
+
+
 _CALVIN_NORMALIZATION_FIELDS = frozenset(
     {"action", "algorithm", "content_sha256", "counts", "dataset", "schema", "split", "state"}
 )
@@ -541,6 +589,11 @@ def _validate_checkpoint_calvin_identity(value: Any, expected_storage: dict[str,
 
 
 def _execution_geometry_from_config(config: dict[str, Any]) -> dict[str, Any]:
+    if config.get("model", {}).get("expert_batch_isolation") == FUSED_BACKEND:
+        geometry = calvin_execution_geometry(config)
+        _calvin_bridge._validate_execution_geometry(geometry, allow_none=False)
+        require(config.get("execution_geometry") == geometry, "resolved optimized execution geometry mismatch")
+        return geometry
     model = config.get("model")
     optimization = config.get("optimization")
     benchmark = config.get("benchmark")
@@ -571,6 +624,18 @@ def _execution_geometry_from_config(config: dict[str, Any]) -> dict[str, Any]:
         "fixed physical prefix width is invalid",
     )
     require(_valid_sha256(geometry["prefix_geometry_content_sha256"]), "prefix geometry SHA-256 is invalid")
+    tensor_parallel_size = model.get("tensor_parallel_size")
+    execution_profile = config.get("execution_profile")
+    require(tensor_parallel_size in {1, 2}, "tensor parallel size must be one or two")
+    if execution_profile is None:
+        require(tensor_parallel_size == 2, "legacy execution geometry is restricted to tensor parallel size two")
+    else:
+        expected_profile = "duovla-single-gpu-tp1-v1" if tensor_parallel_size == 1 else "duovla-tp2-v1"
+        require(execution_profile == expected_profile, "execution profile differs from tensor topology")
+        geometry.update(
+            execution_profile=execution_profile,
+            tensor_parallel_size=tensor_parallel_size,
+        )
     require(config.get("execution_geometry") == geometry, "resolved execution-geometry identity mismatch")
     return geometry
 
@@ -580,12 +645,24 @@ def _validate_execution_geometry(value: Any, *, allow_none: bool = False) -> dic
         return None
     require(isinstance(value, dict), "execution geometry must be an object")
     assert isinstance(value, dict)
-    require(set(value) == _EXECUTION_GEOMETRY_FIELDS, "execution geometry fields differ")
+    if value.get("expert_batch_isolation") == FUSED_BACKEND:
+        _calvin_bridge._validate_execution_geometry(value, allow_none=False)
+        return dict(value)
+    fields = set(value)
+    require(
+        fields
+        in (
+            _BASE_EXECUTION_GEOMETRY_FIELDS,
+            _BASE_EXECUTION_GEOMETRY_FIELDS | _EXECUTION_TOPOLOGY_FIELDS,
+        ),
+        "execution geometry fields differ",
+    )
     # Reuse the config validator without permitting a second representation.
     envelope = {
         "model": {
             "expert_batch_isolation": value.get("expert_batch_isolation"),
             "experts_implementation": value.get("experts_implementation"),
+            "tensor_parallel_size": value.get("tensor_parallel_size", 2),
         },
         "optimization": {"physical_batch_size": value.get("physical_batch_size")},
         "benchmark": {
@@ -594,17 +671,21 @@ def _validate_execution_geometry(value: Any, *, allow_none: bool = False) -> dic
         },
         "execution_geometry": value,
     }
+    if fields != _BASE_EXECUTION_GEOMETRY_FIELDS:
+        envelope["execution_profile"] = value.get("execution_profile")
     return _execution_geometry_from_config(envelope)
 
 
-def _source_tree_sha256(root: Path) -> str:
+def _source_tree_sha256(root: Path, *, single_gpu: bool = False) -> str:
     """Repeat the trainer's injectively framed source identity."""
 
     from duo_vla.calvin_source_identity import calvin_source_tree_sha256
 
     return calvin_source_tree_sha256(
         root,
-        explicit_relative_paths=_CALVIN_SOURCE_EXPLICIT_RELATIVE_PATHS,
+        explicit_relative_paths=(
+            _CALVIN_SINGLE_GPU_SOURCE_EXPLICIT_RELATIVE_PATHS if single_gpu else _CALVIN_SOURCE_EXPLICIT_RELATIVE_PATHS
+        ),
         magic=_CALVIN_SOURCE_TREE_HASH_MAGIC,
     )
 
@@ -644,7 +725,9 @@ def _validated_serving_process_environment(
     hf_home = Path(hf_value).resolve()
     require(str(cache_root) == cache_value, "DUO_VLA_CACHE_ROOT must be canonical")
     require(str(hf_home) == hf_value, "HF_HOME must be canonical")
-    expected_prefix = (cache_root / "venvs/train").resolve()
+    expected_world_size = canonical_visible_cuda_world_size(os.environ)
+    _, _, _, _, environment_name = _train_runtime_pins(expected_world_size)
+    expected_prefix = (cache_root / f"venvs/{environment_name}").resolve()
     require(
         Path(sys.prefix).resolve() == expected_prefix,
         f"policy server requires the pinned train venv: {expected_prefix}",
@@ -653,10 +736,10 @@ def _validated_serving_process_environment(
     compact_version = f"python{sys.version_info.major}{sys.version_info.minor}"
     expected_sys_path = [
         str((canonical_project / "src").resolve()),
-        str(Path(sys.base_prefix) / "lib" / f"{compact_version}.zip"),
-        str(Path(sys.base_prefix) / "lib" / version),
-        str(Path(sys.base_exec_prefix) / "lib" / version / "lib-dynload"),
-        str(expected_prefix / "lib" / version / "site-packages"),
+        str((Path(sys.base_prefix) / "lib" / f"{compact_version}.zip").resolve()),
+        str((Path(sys.base_prefix) / "lib" / version).resolve()),
+        str((Path(sys.base_exec_prefix) / "lib" / version / "lib-dynload").resolve()),
+        str((expected_prefix / "lib" / version / "site-packages").resolve()),
     ]
     require(sys.path == expected_sys_path, f"policy server import search path differs: {sys.path}")
 
@@ -667,6 +750,7 @@ def _validated_serving_process_environment(
         "HF_HOME": str(hf_home),
     }
     expected_environment = {**REQUIRED_SERVING_ENVIRONMENT, **expected_paths}
+    expected_environment["CUDA_VISIBLE_DEVICES"] = os.environ["CUDA_VISIBLE_DEVICES"]
     observed_environment = {name: os.environ.get(name) for name in expected_environment}
     require(
         observed_environment == expected_environment,
@@ -676,7 +760,11 @@ def _validated_serving_process_environment(
     unexpected = sorted(relevant_names - set(expected_environment))
     require(not unexpected, f"policy server environment contains unpinned overrides: {unexpected}")
 
-    rank_environment = validate_torchrun_rank_environment(os.environ, required=require_tp_launch)
+    rank_environment = validate_torchrun_rank_environment(
+        os.environ,
+        required=require_tp_launch,
+        expected_world_size=expected_world_size,
+    )
     return (
         {
             "distributed": rank_environment,
@@ -1073,6 +1161,13 @@ def _load_checkpoint_prefix_geometry(
         expected_fixed_physical_prefix_width=geometry["fixed_physical_prefix_width"],
     )
     require(manifest.get("execution_geometry") == geometry, "checkpoint execution geometry differs from config")
+    if geometry["expert_batch_isolation"] == FUSED_BACKEND:
+        for key, expected in geometry.items():
+            observed = manifest.get(key)
+            require(
+                type(observed) is type(expected) and observed == expected,
+                f"checkpoint optimized execution-geometry field differs: {key}",
+            )
     require(
         manifest.get("experts_implementation") == geometry["experts_implementation"]
         and manifest.get("expert_batch_isolation") == geometry["expert_batch_isolation"]
@@ -1135,30 +1230,43 @@ def _validate_checkpoint_training_environment(
     require(set(execution) == expected_outer_fields, "checkpoint training environment fields differ")
     runtime = execution.get("authenticated_runtime")
     require(isinstance(runtime, dict), "checkpoint has no authenticated training runtime")
+    model = config.get("model")
+    tensor_parallel_size = model.get("tensor_parallel_size") if isinstance(model, dict) else execution.get("world_size")
+    require(tensor_parallel_size in {1, 2}, "checkpoint tensor-parallel size is invalid")
+    optimized = isinstance(model, dict) and model.get("expert_batch_isolation") == FUSED_BACKEND
+    topology = execution_from_config(config) if optimized else None
+    training_world_size = topology.world_size if topology is not None else tensor_parallel_size
+    expected_runtime_fields = {
+        "environment",
+        "lock_sha256",
+        "module_origins",
+        "packages",
+        "python",
+        "static_environment_sha256",
+        "sys_path",
+        "torchrun",
+        "train_venv",
+    }
+    if tensor_parallel_size == 1:
+        expected_runtime_fields.add("lock_path")
     require(
-        set(runtime)
-        == {
-            "environment",
-            "lock_sha256",
-            "module_origins",
-            "packages",
-            "python",
-            "static_environment_sha256",
-            "sys_path",
-            "torchrun",
-            "train_venv",
-        },
+        set(runtime) == expected_runtime_fields,
         "checkpoint authenticated training-runtime fields differ",
     )
-    require(runtime.get("lock_sha256") == TRAIN_LOCK_SHA256, "checkpoint training lock identity mismatch")
-    require(runtime.get("packages") == EXPECTED_TRAIN_PACKAGES, "checkpoint training package identity mismatch")
-    require(runtime.get("python") == EXPECTED_TRAIN_PYTHON, "checkpoint training Python identity mismatch")
-
     project_root = project_root.resolve()
     cache_root = Path(os.environ.get("DUO_VLA_CACHE_ROOT", "/root/.cache/duo-vla")).resolve()
-    train_prefix = (cache_root / "venvs/train").resolve()
+    relative_lock_path, expected_lock_sha256, expected_packages, expected_cuda_runtime, environment_name = (
+        _train_runtime_pins(tensor_parallel_size)
+    )
+    train_prefix = (cache_root / f"venvs/{environment_name}").resolve()
+    if tensor_parallel_size == 1:
+        require(runtime.get("lock_path") == relative_lock_path.as_posix(), "checkpoint training lock path mismatch")
+    require(runtime.get("lock_sha256") == expected_lock_sha256, "checkpoint training lock identity mismatch")
+    require(runtime.get("packages") == expected_packages, "checkpoint training package identity mismatch")
+    require(runtime.get("python") == EXPECTED_TRAIN_PYTHON, "checkpoint training Python identity mismatch")
     expected_environment = {
         **REQUIRED_TRAIN_ENVIRONMENT,
+        "CUDA_VISIBLE_DEVICES": "0" if training_world_size == 1 else "0,1",
         "DUO_VLA_CACHE_ROOT": str(cache_root),
         "DUO_VLA_PROJECT_ROOT": str(project_root),
         "DUO_VLA_TRAIN_VENV": str(train_prefix),
@@ -1177,8 +1285,8 @@ def _validate_checkpoint_training_environment(
     require(
         isinstance(torchrun_identity, dict)
         and torchrun_identity.get("local_rank_equals_rank") is True
-        and torchrun_identity.get("local_world_size") == 2
-        and torchrun_identity.get("world_size") == 2,
+        and torchrun_identity.get("local_world_size") == training_world_size
+        and torchrun_identity.get("world_size") == training_world_size,
         "checkpoint training torchrun identity is invalid",
     )
     site_packages = train_prefix / f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
@@ -1208,16 +1316,16 @@ def _validate_checkpoint_training_environment(
     compact_version = f"python{sys.version_info.major}{sys.version_info.minor}"
     expected_sys_path = [
         str((project_root / "src").resolve()),
-        str(Path(sys.base_prefix) / "lib" / f"{compact_version}.zip"),
-        str(Path(sys.base_prefix) / "lib" / version),
-        str(Path(sys.base_exec_prefix) / "lib" / version / "lib-dynload"),
-        str(train_prefix / "lib" / version / "site-packages"),
+        str((Path(sys.base_prefix) / "lib" / f"{compact_version}.zip").resolve()),
+        str((Path(sys.base_prefix) / "lib" / version).resolve()),
+        str((Path(sys.base_exec_prefix) / "lib" / version / "lib-dynload").resolve()),
+        str((train_prefix / "lib" / version / "site-packages").resolve()),
     ]
     require(runtime.get("sys_path") == expected_sys_path, "checkpoint training sys.path differs")
 
     expected_values = {
         "cublas_workspace_config": REQUIRED_TRAIN_ENVIRONMENT["CUBLAS_WORKSPACE_CONFIG"],
-        "cuda_runtime": "12.6",
+        "cuda_runtime": expected_cuda_runtime,
         "cudnn_benchmark": False,
         "cudnn_deterministic": True,
         "cudnn_tf32": False,
@@ -1225,12 +1333,12 @@ def _validate_checkpoint_training_environment(
         "deterministic_warn_only": False,
         "float32_matmul_precision": "highest",
         "matmul_tf32": False,
-        "peft": EXPECTED_TRAIN_PACKAGES["peft"],
+        "peft": expected_packages["peft"],
         "python": EXPECTED_TRAIN_PYTHON,
         "python_hash_seed": str(run_seed),
-        "torch": EXPECTED_TRAIN_PACKAGES["torch"],
-        "transformers": EXPECTED_TRAIN_PACKAGES["transformers"],
-        "world_size": 2,
+        "torch": expected_packages["torch"],
+        "transformers": expected_packages["transformers"],
+        "world_size": training_world_size,
     }
     mismatches = {
         name: {"expected": expected, "observed": execution.get(name)}
@@ -1242,7 +1350,7 @@ def _validate_checkpoint_training_environment(
     gpu_names = execution.get("gpu_names")
     require(
         isinstance(gpu_capability, list)
-        and len(gpu_capability) == 2
+        and len(gpu_capability) == training_world_size
         and all(
             isinstance(value, list) and len(value) == 2 and all(type(component) is int for component in value)
             for value in gpu_capability
@@ -1251,7 +1359,7 @@ def _validate_checkpoint_training_environment(
     )
     require(
         isinstance(gpu_names, list)
-        and len(gpu_names) == 2
+        and len(gpu_names) == training_world_size
         and all(isinstance(value, str) and bool(value) for value in gpu_names),
         "checkpoint training GPU name identity is invalid",
     )
@@ -1354,15 +1462,34 @@ def resolve_checkpoint(
         and isinstance(training, dict)
         and isinstance(run, dict)
     )
+    optimized_execution = (
+        execution_from_config(config) if model.get("expert_batch_isolation") == FUSED_BACKEND else None
+    )
+    expected_profile = (
+        optimized_execution.profile
+        if optimized_execution
+        else "duovla-single-gpu-tp1-v1"
+        if model.get("tensor_parallel_size") == 1
+        else "duovla-tp2-v1"
+    )
+    training_batch = optimized_execution.physical_batch if optimized_execution else PHYSICAL_BATCH_SIZE
+    training_accumulation = optimized_execution.accumulation if optimized_execution else 8
     expected_config = {
         "protocol": (config.get("protocol"), PROTOCOL),
         "model.id": (model.get("id"), MODEL_ID),
         "model.revision": (model.get("revision"), MODEL_REVISION),
         "model.dtype": (model.get("dtype"), "bfloat16"),
-        "model.tensor_parallel_size": (model.get("tensor_parallel_size"), 2),
+        "model.tensor_parallel_size": (model.get("tensor_parallel_size"), model.get("tensor_parallel_size")),
+        "execution_profile": (
+            config.get("execution_profile") or "duovla-tp2-v1",
+            expected_profile,
+        ),
         "model.attention_implementation": (model.get("attention_implementation"), "sdpa"),
         "model.experts_implementation": (model.get("experts_implementation"), EXPERTS_IMPLEMENTATION),
-        "model.expert_batch_isolation": (model.get("expert_batch_isolation"), EXPERT_BATCH_ISOLATION),
+        "model.expert_batch_isolation": (
+            model.get("expert_batch_isolation"),
+            FUSED_BACKEND if optimized_execution else EXPERT_BATCH_ISOLATION,
+        ),
         "benchmark.dataset": (benchmark.get("dataset"), "task_ABC_D"),
         "benchmark.train_split": (benchmark.get("train_split"), "training"),
         "benchmark.evaluation_split": (benchmark.get("evaluation_split"), "validation"),
@@ -1384,18 +1511,19 @@ def resolve_checkpoint(
         "lora.projections": (lora.get("projections"), ["q_proj", "k_proj", "v_proj", "o_proj"]),
         "lora.scope": (lora.get("scope"), "decoder_self_attention_only"),
         "optimization.global_batch_size": (optimization.get("global_batch_size"), 64),
-        "optimization.microbatch_size": (optimization.get("microbatch_size"), PHYSICAL_BATCH_SIZE),
-        "optimization.gradient_accumulation_steps": (optimization.get("gradient_accumulation_steps"), 8),
-        "optimization.physical_batch_size": (optimization.get("physical_batch_size"), PHYSICAL_BATCH_SIZE),
+        "optimization.microbatch_size": (optimization.get("microbatch_size"), training_batch),
+        "optimization.gradient_accumulation_steps": (
+            optimization.get("gradient_accumulation_steps"),
+            training_accumulation,
+        ),
+        "optimization.physical_batch_size": (optimization.get("physical_batch_size"), training_batch),
         "optimization.total_updates": (optimization.get("total_updates"), 30_000),
         "training.seeds": (training.get("seeds"), [0, 1, 2]),
         "run.task": (run.get("task"), None),
     }
     mismatches = [name for name, (observed, expected) in expected_config.items() if observed != expected]
     require(not mismatches, f"resolved CALVIN configuration mismatches: {mismatches}")
-    canonical_config_name = (
-        "calvin_abc_to_d.toml" if contract.objective == "rectified_flow" else "calvin_abc_to_d_direct.toml"
-    )
+    canonical_config_name = canonical_recipe_name(config, contract.objective)
     canonical_recipe = load_resolved_toml(project_root / "configs" / canonical_config_name)
     recipe_sections = (
         "protocol",
@@ -1408,6 +1536,7 @@ def resolve_checkpoint(
         "sampling",
         "benchmark",
         "reproducibility",
+        "distributed",
     )
     recipe_mismatches = [name for name in recipe_sections if config.get(name) != canonical_recipe.get(name)]
     require(not recipe_mismatches, f"resolved config differs from the canonical comparison recipe: {recipe_mismatches}")
@@ -1526,7 +1655,10 @@ def resolve_checkpoint(
         and manifest.get("calvin_tacto_revision") == source_revisions["tacto"],
         "checkpoint individual CALVIN source revisions mismatch",
     )
-    current_source_sha256 = _source_tree_sha256(project_root)
+    current_source_sha256 = _source_tree_sha256(
+        project_root,
+        single_gpu=config.get("execution_profile") is not None,
+    )
     require(
         manifest.get("source_tree_sha256") == current_source_sha256 == config.get("source_tree_sha256"),
         "training source tree differs from checkpoint",
@@ -1622,11 +1754,18 @@ def train_runtime_preflight(
         platform.python_version() == EXPECTED_TRAIN_PYTHON,
         f"policy server requires Python {EXPECTED_TRAIN_PYTHON}, found {platform.python_version()}",
     )
-    package_versions = {name: importlib.metadata.version(name) for name in EXPECTED_TRAIN_PACKAGES}
-    require(package_versions == EXPECTED_TRAIN_PACKAGES, f"train package pin mismatch: {package_versions}")
-    lock_path = project_root / "uv.lock"
+    world_size = canonical_visible_cuda_world_size(os.environ)
+    relative_lock_path, expected_lock_sha256, expected_packages, expected_cuda_runtime, _ = _train_runtime_pins(
+        world_size
+    )
+    package_versions = {name: importlib.metadata.version(name) for name in expected_packages}
+    require(package_versions == expected_packages, f"train package pin mismatch: {package_versions}")
+    lock_path = project_root / relative_lock_path
     require(lock_path.is_file(), f"missing train lockfile: {lock_path}")
-    require(sha256_file(lock_path) == TRAIN_LOCK_SHA256, "train lockfile SHA-256 mismatch")
+    require(sha256_file(lock_path) == expected_lock_sha256, "train lockfile SHA-256 mismatch")
+    import torch
+
+    require(torch.version.cuda == expected_cuda_runtime, "train CUDA runtime mismatch")
     dataset_report, authenticated_generation = _verify_dataset_with_generation(dataset_root, dataset_manifest)
     require(authenticated_generation is not None, "official serving requires an authenticated v4 dataset generation")
     snapshot_report = model_snapshot_preflight()
@@ -1649,7 +1788,8 @@ def train_runtime_preflight(
     report = {
         "checkpoint": checkpoint_report,
         "dataset": dataset_report,
-        "lock_sha256": TRAIN_LOCK_SHA256,
+        "lock_path": relative_lock_path.as_posix(),
+        "lock_sha256": expected_lock_sha256,
         "model": snapshot_report,
         "execution_geometry": checkpoint_report["execution_geometry"],
         "packages": package_versions,
@@ -1681,11 +1821,19 @@ def configure_and_identify_serving_runtime(torch: Any, preflight_report: dict[st
     require(torch.backends.cudnn.deterministic, "cuDNN deterministic mode must be enabled")
     require(not torch.backends.cudnn.allow_tf32, "cuDNN TF32 must be disabled")
     require(not torch.backends.cuda.matmul.allow_tf32, "CUDA matmul TF32 must be disabled")
-    require(torch.cuda.device_count() == 2, "serving runtime must expose exactly two GPUs")
+    tensor_parallel_size = int(preflight_report["execution_geometry"].get("tensor_parallel_size", 2))
+    require(
+        torch.cuda.device_count() == tensor_parallel_size,
+        "serving runtime GPU count differs from the checkpoint topology",
+    )
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES") or ",".join(
+        str(index) for index in range(tensor_parallel_size)
+    )
     try:
         completed = subprocess.run(
             [
                 "/usr/bin/nvidia-smi",
+                f"--id={visible_devices}",
                 "--query-gpu=index,name,uuid,driver_version,compute_cap",
                 "--format=csv,noheader,nounits",
             ],
@@ -1709,7 +1857,11 @@ def configure_and_identify_serving_runtime(torch: Any, preflight_report: dict[st
                 "uuid": fields[2],
             }
         )
-    require([row["index"] for row in gpu_rows] == [0, 1], "nvidia-smi did not report the two visible GPUs in order")
+    visible_device_ids = [int(value) for value in visible_devices.split(",")]
+    require(
+        [row["index"] for row in gpu_rows] == visible_device_ids,
+        "nvidia-smi did not report the canonical visible GPUs in order",
+    )
     logical_gpu_rows = []
     for logical_index, physical in enumerate(gpu_rows):
         properties = torch.cuda.get_device_properties(logical_index)
@@ -1749,14 +1901,19 @@ def configure_and_identify_serving_runtime(torch: Any, preflight_report: dict[st
     )
     require(torch.version.cuda == training_environment["cuda_runtime"], "serving CUDA runtime differs from training")
     require(torch.backends.cudnn.version() == training_environment["cudnn"], "serving cuDNN differs from training")
-    require(
-        [row["name"] for row in logical_gpu_rows] == training_environment["gpu_names"],
-        "serving GPU names differ from training",
-    )
-    require(
-        [row["compute_capability"] for row in logical_gpu_rows] == training_environment["gpu_capability"],
-        "serving GPU capabilities differ from training",
-    )
+    optimized_geometry = preflight_report["execution_geometry"].get("expert_batch_isolation") == FUSED_BACKEND
+    # Optimized DP training stores consolidated TP1 trainables. The single-GPU
+    # serving hardware is independently attested, not required to replay the
+    # two-device training inventory. Legacy hardware requirements stay intact.
+    if not optimized_geometry:
+        require(
+            [row["name"] for row in logical_gpu_rows] == training_environment["gpu_names"],
+            "serving GPU names differ from training",
+        )
+        require(
+            [row["compute_capability"] for row in logical_gpu_rows] == training_environment["gpu_capability"],
+            "serving GPU capabilities differ from training",
+        )
     payload = {
         "authenticated_software": {
             "bridge_sha256": sha256_file(Path(__file__).with_name("calvin_bridge.py")),
@@ -1765,11 +1922,24 @@ def configure_and_identify_serving_runtime(torch: Any, preflight_report: dict[st
             "model_tree_sha256": model_report["tree_metadata_sha256"],
             "nvidia_smi_sha256": sha256_file(Path("/usr/bin/nvidia-smi")),
             "packages": preflight_report["packages"],
-            "policy_launcher_sha256": sha256_file(Path(__file__).with_name("run_policy_server.sh")),
+            "policy_launcher_sha256": sha256_file(
+                Path(__file__).with_name(
+                    "run_policy_server_single_gpu.sh" if tensor_parallel_size == 1 else "run_policy_server.sh"
+                )
+            ),
             "serve_policy_sha256": sha256_file(Path(__file__)),
             "source_revisions": preflight_report["source_revisions"],
             "source_tree_sha256": checkpoint_report["source_tree_sha256"],
-            "train_launcher_sha256": sha256_file(project_root / "scripts/run_calvin_train.sh"),
+            "train_launcher_sha256": sha256_file(
+                project_root
+                / (
+                    "scripts/run_calvin_train_dp2.sh"
+                    if preflight_report["execution_geometry"].get("data_parallel_size") == 2
+                    else "scripts/run_calvin_train_single_gpu.sh"
+                    if tensor_parallel_size == 1
+                    else "scripts/run_calvin_train.sh"
+                )
+            ),
         },
         "determinism": {
             "cublas_workspace_config": os.environ["CUBLAS_WORKSPACE_CONFIG"],
@@ -1995,10 +2165,6 @@ class RealPolicy:
         from duo_vla.action_interface import ActionInputProjector, VelocityHead
         from duo_vla.backbones.diffusion_gemma import DiffusionGemmaActionDecoder, encode_diffusion_gemma_prefix
         from duo_vla.backbones.loading import DEFAULT_DIFFUSION_GEMMA_SPEC, load_diffusion_gemma_bf16_tp
-        from duo_vla.backbones.sample_isolated_experts import (
-            install_sample_isolated_grouped_mm_experts,
-            verify_sample_isolated_grouped_mm_experts,
-        )
         from duo_vla.checkpointing import load_lora_checkpoint
         from duo_vla.config import ActionInterfaceConfig
         from duo_vla.data.calvin_stats import load_calvin_state_normalizer
@@ -2041,12 +2207,16 @@ class RealPolicy:
             == self.prefix_geometry["tokenization"]["padding_side"],
             "loaded processor padding side differs from the prefix contract",
         )
-        self.model = load_diffusion_gemma_bf16_tp(local_files_only=True, tp_size=2)
-        install_sample_isolated_grouped_mm_experts(
+        self.model = load_diffusion_gemma_bf16_tp(
+            local_files_only=True,
+            tp_size=int(resolved_config["model"]["tensor_parallel_size"]),
+        )
+        install_experts, verify_experts = expert_backend_functions(self.execution_geometry["expert_batch_isolation"])
+        install_experts(
             self.model,
             physical_batch_size=PHYSICAL_BATCH_SIZE,
         )
-        verify_sample_isolated_grouped_mm_experts(self.model, physical_batch_size=PHYSICAL_BATCH_SIZE)
+        verify_experts(self.model, physical_batch_size=PHYSICAL_BATCH_SIZE)
         backend = DiffusionGemmaActionDecoder.from_block_diffusion_model(self.model)
         self.adapted, _ = load_lora_checkpoint(
             checkpoint_dir,
@@ -2055,7 +2225,7 @@ class RealPolicy:
             validate_decoder_contract=True,
             expected_rank=int(resolved_config["lora"]["rank"]),
         )
-        verify_sample_isolated_grouped_mm_experts(self.model, physical_batch_size=PHYSICAL_BATCH_SIZE)
+        verify_experts(self.model, physical_batch_size=PHYSICAL_BATCH_SIZE)
         action = resolved_config["action"]
         benchmark = resolved_config["benchmark"]
         interface_config = ActionInterfaceConfig(
@@ -2245,7 +2415,11 @@ def run_distributed_server(
     device = torch.device("cuda", local_rank)
     serving_runtime, serving_runtime_sha256 = configure_and_identify_serving_runtime(torch, preflight_report)
     dist.init_process_group("nccl", device_id=device)
-    require(dist.get_world_size() == 2, "real CALVIN policy serving requires TP world size 2")
+    expected_world_size = int(resolved_config["model"]["tensor_parallel_size"])
+    require(
+        dist.get_world_size() == expected_world_size,
+        "real CALVIN policy serving world size differs from the checkpoint topology",
+    )
     rank = dist.get_rank()
     try:
         runtime_hashes: list[str | None] = [None] * dist.get_world_size()

@@ -28,10 +28,21 @@ ORIGINAL_HDF5_CONTENT_SHA256 = "c4976da211c1895914d3d07c956ef48a6a9175367a22ff03
 ORIGINAL_HDF5_FILE_COUNT = 40
 ORIGINAL_HDF5_TOTAL_BYTES = 33_784_856_577
 
-SIMULATOR_STAGE_SCHEMA = "duo-vla-libero-expert-replay-simulator-stage-v1"
-SIMULATOR_TASK_SCHEMA = "duo-vla-libero-expert-replay-simulator-task-v1"
-PARQUET_BINDING_SCHEMA = "duo-vla-libero-expert-replay-parquet-binding-v1"
-PARQUET_TASK_SCHEMA = "duo-vla-libero-expert-replay-parquet-task-v1"
+SIMULATOR_STAGE_SCHEMA = "duo-vla-libero-expert-replay-simulator-stage-v2"
+SIMULATOR_TASK_SCHEMA = "duo-vla-libero-expert-replay-simulator-task-v2"
+PARQUET_BINDING_SCHEMA = "duo-vla-libero-expert-replay-parquet-binding-v2"
+PARQUET_TASK_SCHEMA = "duo-vla-libero-expert-replay-parquet-task-v2"
+SOURCE_PARQUET_ALIGNMENT_SCHEMA = "duo-vla-libero-source-parquet-alignment-v1"
+SOURCE_PARQUET_ALIGNMENT_CONTENT_SHA256 = "8f554538f1fe3c2aeaf6c0f46d2b526f5bfe27589613f8e856c6fcacfdf18714"
+OBSERVATION_ALIGNMENT_FEATURE_SCHEMA = "duo-vla-libero-observation-alignment-features-v1"
+OBSERVATION_ALIGNMENT_GRID_SIZE = 8
+OBSERVATION_ALIGNMENT_IMAGE_MEAN_ABS_MAX = 45.0
+OBSERVATION_ALIGNMENT_IMAGE_MAX_FRAME_MEAN_ABS_MAX = 50.0
+OBSERVATION_ALIGNMENT_IMAGE_CORRELATION_MEAN_MIN = 0.70
+OBSERVATION_ALIGNMENT_IMAGE_CORRELATION_FRAME_MIN = 0.20
+OBSERVATION_ALIGNMENT_STATE_MEAN_ABS_MAX = 0.02
+OBSERVATION_ALIGNMENT_STATE_MAX_ABS_MAX = 0.15
+OBSERVATION_ALIGNMENT_STATE_TEMPORAL_MARGIN_MIN = 0.001
 
 PROTOCOL = "duovla-libero-v1"
 EVIDENCE_SCHEMA = "duo-vla-libero-expert-replay-evidence-v1"
@@ -211,6 +222,67 @@ def load_original_hdf5_inventory(path: Path) -> tuple[dict[str, Any], tuple[dict
     return value, records, hashlib.sha256(raw).hexdigest()
 
 
+def load_source_parquet_alignment(
+    path: Path,
+) -> tuple[dict[str, Any], dict[tuple[str, int], frozenset[int]], str]:
+    raw = path.read_bytes()
+    value = load_strict_json(path, name="source/parquet alignment")
+    require(
+        set(value) == {"content_sha256", "original_hdf5", "schema", "tasks", "training_dataset"},
+        "source/parquet alignment fields differ",
+    )
+    require(value["schema"] == SOURCE_PARQUET_ALIGNMENT_SCHEMA, "source/parquet alignment schema differs")
+    unsigned = {name: item for name, item in value.items() if name != "content_sha256"}
+    require(
+        value["content_sha256"] == canonical_sha256(unsigned) == SOURCE_PARQUET_ALIGNMENT_CONTENT_SHA256,
+        "source/parquet alignment semantic identity differs",
+    )
+    require(
+        value["original_hdf5"]
+        == {
+            "content_sha256": ORIGINAL_HDF5_CONTENT_SHA256,
+            "repository_id": ORIGINAL_HDF5_REPOSITORY_ID,
+            "revision": ORIGINAL_HDF5_REVISION,
+        },
+        "source/parquet alignment original-HDF5 identity differs",
+    )
+    require(
+        value["training_dataset"]
+        == {
+            "content_inventory_sha256": DATASET_CONTENT_INVENTORY_SHA256,
+            "episode_count": 1693,
+            "revision": DATASET_REVISION,
+        },
+        "source/parquet alignment training-dataset identity differs",
+    )
+    tasks = value["tasks"]
+    require(isinstance(tasks, list) and len(tasks) == 40, "source/parquet alignment task count differs")
+    expected = sorted((suite, task_id) for suite in SUITES for task_id in range(10))
+    observed: list[tuple[str, int]] = []
+    mapping: dict[tuple[str, int], frozenset[int]] = {}
+    linked_episode_count = 0
+    for task in tasks:
+        require(
+            isinstance(task, dict) and set(task) == {"suite", "task_id", "training_source_episode_indices"},
+            "source/parquet alignment task fields differ",
+        )
+        identity = (task["suite"], task["task_id"])
+        indices = task["training_source_episode_indices"]
+        require(
+            isinstance(indices, list)
+            and bool(indices)
+            and all(type(index) is int and 0 <= index < 50 for index in indices)
+            and indices == sorted(set(indices)),
+            f"source/parquet alignment indices differ: {identity}",
+        )
+        observed.append(identity)
+        mapping[identity] = frozenset(indices)
+        linked_episode_count += len(indices)
+    require(observed == expected, "source/parquet alignment task order differs")
+    require(linked_episode_count == 1693, "source/parquet alignment episode count differs")
+    return value, mapping, hashlib.sha256(raw).hexdigest()
+
+
 def stable_regular_file_identity(path: Path, *, expected_bytes: int | None = None) -> dict[str, Any]:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -353,6 +425,185 @@ def canonical_proprioceptive_state(observation: Mapping[str, Any]) -> np.ndarray
     return canonical_array(np.concatenate((position, axis_angle, gripper)), dtype="<f4", shape=(STATE_DIM,))
 
 
+def observation_alignment_frame(
+    agentview: Any,
+    wrist: Any,
+    state: Any,
+) -> dict[str, Any]:
+    def block_means(image: Any) -> list[int]:
+        values = canonical_array(image, dtype="|u1", shape=IMAGE_SHAPE)
+        grid = OBSERVATION_ALIGNMENT_GRID_SIZE
+        block = IMAGE_SHAPE[0] // grid
+        require(IMAGE_SHAPE[0] == IMAGE_SHAPE[1] == grid * block, "observation alignment grid is invalid")
+        means = values.reshape(grid, block, grid, block, IMAGE_SHAPE[2]).mean(axis=(1, 3))
+        return np.rint(means).astype(np.uint8).reshape(-1).tolist()
+
+    return {
+        "agentview_block_means": block_means(agentview),
+        "state": canonical_array(state, dtype="<f4", shape=(STATE_DIM,)).tolist(),
+        "wrist_block_means": block_means(wrist),
+    }
+
+
+def observation_alignment_metrics(
+    simulator_features: Mapping[str, Any],
+    dataset_frames: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    require(
+        set(simulator_features) == {"frames", "grid_size", "schema"}
+        and simulator_features["schema"] == OBSERVATION_ALIGNMENT_FEATURE_SCHEMA
+        and simulator_features["grid_size"] == OBSERVATION_ALIGNMENT_GRID_SIZE,
+        "simulator observation-alignment feature header differs",
+    )
+    simulator_frames = simulator_features["frames"]
+    require(
+        isinstance(simulator_frames, list) and len(simulator_frames) == len(dataset_frames) and bool(simulator_frames),
+        "observation-alignment frame count differs",
+    )
+    expected_fields = {"agentview_block_means", "state", "wrist_block_means"}
+    feature_width = OBSERVATION_ALIGNMENT_GRID_SIZE**2 * IMAGE_SHAPE[2]
+    for name, frames in (("simulator", simulator_frames), ("dataset", dataset_frames)):
+        require(
+            all(
+                isinstance(frame, Mapping)
+                and set(frame) == expected_fields
+                and isinstance(frame["agentview_block_means"], list)
+                and len(frame["agentview_block_means"]) == feature_width
+                and isinstance(frame["wrist_block_means"], list)
+                and len(frame["wrist_block_means"]) == feature_width
+                and isinstance(frame["state"], list)
+                and len(frame["state"]) == STATE_DIM
+                for frame in frames
+            ),
+            f"{name} observation-alignment frame shape differs",
+        )
+
+    def image_metrics(field: str) -> dict[str, float]:
+        simulator = np.asarray([frame[field] for frame in simulator_frames], dtype=np.float64)
+        dataset = np.asarray([frame[field] for frame in dataset_frames], dtype=np.float64)
+        difference = np.abs(simulator - dataset)
+        frame_mean_abs = difference.mean(axis=1)
+        simulator_centered = simulator - simulator.mean(axis=1, keepdims=True)
+        dataset_centered = dataset - dataset.mean(axis=1, keepdims=True)
+        denominator = np.sqrt(np.sum(simulator_centered**2, axis=1) * np.sum(dataset_centered**2, axis=1))
+        require(bool(np.all(denominator > 0.0)), f"{field} observation-alignment correlation is undefined")
+        correlations = np.sum(simulator_centered * dataset_centered, axis=1) / denominator
+        return {
+            "correlation_mean": float(correlations.mean()),
+            "correlation_min": float(correlations.min()),
+            "max_frame_mean_abs": float(frame_mean_abs.max()),
+            "mean_abs": float(difference.mean()),
+        }
+
+    agentview = image_metrics("agentview_block_means")
+    wrist = image_metrics("wrist_block_means")
+    simulator_state = np.asarray([frame["state"] for frame in simulator_frames], dtype=np.float64)
+    dataset_state = np.asarray([frame["state"] for frame in dataset_frames], dtype=np.float64)
+    state_difference = np.abs(simulator_state - dataset_state)
+    state_mean_abs = float(state_difference.mean())
+    if len(dataset_frames) > 1:
+        previous_dataset_state = np.concatenate((dataset_state[:1], dataset_state[:-1]), axis=0)
+        next_dataset_state = np.concatenate((dataset_state[1:], dataset_state[-1:]), axis=0)
+        adjacent_shift_mean_abs_min = float(
+            min(
+                np.abs(simulator_state - previous_dataset_state).mean(),
+                np.abs(simulator_state - next_dataset_state).mean(),
+            )
+        )
+        temporal_margin = adjacent_shift_mean_abs_min - state_mean_abs
+    else:
+        adjacent_shift_mean_abs_min = state_mean_abs
+        temporal_margin = 0.0
+    state_metrics = {
+        "adjacent_shift_mean_abs_min": adjacent_shift_mean_abs_min,
+        "max_abs": float(state_difference.max()),
+        "mean_abs": state_mean_abs,
+        "temporal_margin": temporal_margin,
+    }
+    thresholds = {
+        "image_correlation_frame_min": OBSERVATION_ALIGNMENT_IMAGE_CORRELATION_FRAME_MIN,
+        "image_correlation_mean_min": OBSERVATION_ALIGNMENT_IMAGE_CORRELATION_MEAN_MIN,
+        "image_max_frame_mean_abs_max": OBSERVATION_ALIGNMENT_IMAGE_MAX_FRAME_MEAN_ABS_MAX,
+        "image_mean_abs_max": OBSERVATION_ALIGNMENT_IMAGE_MEAN_ABS_MAX,
+        "state_max_abs_max": OBSERVATION_ALIGNMENT_STATE_MAX_ABS_MAX,
+        "state_mean_abs_max": OBSERVATION_ALIGNMENT_STATE_MEAN_ABS_MAX,
+        "state_temporal_margin_min": OBSERVATION_ALIGNMENT_STATE_TEMPORAL_MARGIN_MIN,
+    }
+    passed = (
+        all(
+            camera["mean_abs"] <= thresholds["image_mean_abs_max"]
+            and camera["max_frame_mean_abs"] <= thresholds["image_max_frame_mean_abs_max"]
+            and camera["correlation_mean"] >= thresholds["image_correlation_mean_min"]
+            and camera["correlation_min"] >= thresholds["image_correlation_frame_min"]
+            for camera in (agentview, wrist)
+        )
+        and state_metrics["mean_abs"] <= thresholds["state_mean_abs_max"]
+        and state_metrics["max_abs"] <= thresholds["state_max_abs_max"]
+        and (len(dataset_frames) == 1 or state_metrics["temporal_margin"] >= thresholds["state_temporal_margin_min"])
+    )
+    return {
+        "agentview": agentview,
+        "frames": len(simulator_frames),
+        "passed": passed,
+        "state": state_metrics,
+        "thresholds": thresholds,
+        "wrist": wrist,
+    }
+
+
+def validate_observation_alignment_metrics(value: Any) -> dict[str, Any]:
+    require(
+        isinstance(value, dict) and set(value) == {"agentview", "frames", "passed", "state", "thresholds", "wrist"},
+        "observation-alignment metric fields differ",
+    )
+    expected_thresholds = {
+        "image_correlation_frame_min": OBSERVATION_ALIGNMENT_IMAGE_CORRELATION_FRAME_MIN,
+        "image_correlation_mean_min": OBSERVATION_ALIGNMENT_IMAGE_CORRELATION_MEAN_MIN,
+        "image_max_frame_mean_abs_max": OBSERVATION_ALIGNMENT_IMAGE_MAX_FRAME_MEAN_ABS_MAX,
+        "image_mean_abs_max": OBSERVATION_ALIGNMENT_IMAGE_MEAN_ABS_MAX,
+        "state_max_abs_max": OBSERVATION_ALIGNMENT_STATE_MAX_ABS_MAX,
+        "state_mean_abs_max": OBSERVATION_ALIGNMENT_STATE_MEAN_ABS_MAX,
+        "state_temporal_margin_min": OBSERVATION_ALIGNMENT_STATE_TEMPORAL_MARGIN_MIN,
+    }
+    require(value["thresholds"] == expected_thresholds, "observation-alignment thresholds differ")
+    require(type(value["frames"]) is int and value["frames"] > 0, "observation-alignment frame count differs")
+    for name in ("agentview", "wrist"):
+        camera = value[name]
+        require(
+            isinstance(camera, dict)
+            and set(camera) == {"correlation_mean", "correlation_min", "max_frame_mean_abs", "mean_abs"}
+            and all(
+                isinstance(item, (int, float)) and not isinstance(item, bool) and math.isfinite(float(item))
+                for item in camera.values()
+            ),
+            f"{name} observation-alignment metrics differ",
+        )
+    state = value["state"]
+    require(
+        isinstance(state, dict)
+        and set(state) == {"adjacent_shift_mean_abs_min", "max_abs", "mean_abs", "temporal_margin"}
+        and all(
+            isinstance(item, (int, float)) and not isinstance(item, bool) and math.isfinite(float(item))
+            for item in state.values()
+        ),
+        "state observation-alignment metrics differ",
+    )
+    passed = (
+        all(
+            value[name]["mean_abs"] <= expected_thresholds["image_mean_abs_max"]
+            and value[name]["max_frame_mean_abs"] <= expected_thresholds["image_max_frame_mean_abs_max"]
+            and value[name]["correlation_mean"] >= expected_thresholds["image_correlation_mean_min"]
+            and value[name]["correlation_min"] >= expected_thresholds["image_correlation_frame_min"]
+            for name in ("agentview", "wrist")
+        )
+        and state["mean_abs"] <= expected_thresholds["state_mean_abs_max"]
+        and state["max_abs"] <= expected_thresholds["state_max_abs_max"]
+        and (value["frames"] == 1 or state["temporal_margin"] >= expected_thresholds["state_temporal_margin_min"])
+    )
+    require(value["passed"] is passed, "observation-alignment pass result differs")
+    return value
+
+
 def initial_state_sha256(value: Any) -> str:
     digest = hashlib.sha256(b"duo-vla-libero-initial-simulator-state-v1\0")
     array = np.asarray(value)
@@ -477,7 +728,11 @@ def training_source_tree_sha256(root: Path) -> str:
         path
         for path in (
             root / "scripts/run_libero_train.sh",
+            root / "scripts/run_libero_train_single_gpu.sh",
+            root / "scripts/bootstrap_train_single_gpu_env.sh",
             root / "scripts/train_libero.py",
+            root / "envs/train-single-gpu/pyproject.toml",
+            root / "envs/train-single-gpu/uv.lock",
             root / "pyproject.toml",
             root / "uv.lock",
         )
@@ -489,27 +744,41 @@ def training_source_tree_sha256(root: Path) -> str:
     return digest.hexdigest()
 
 
-def source_identity(project_root: Path) -> dict[str, Any]:
+def source_identity(project_root: Path, *, single_gpu: bool = False) -> dict[str, Any]:
+    binder_launcher = (
+        "run_bind_libero_expert_replay_single_gpu.sh" if single_gpu else "run_bind_libero_expert_replay.sh"
+    )
+    qualification_launcher = (
+        "run_qualify_libero_expert_replay_single_gpu.sh" if single_gpu else "run_qualify_libero_expert_replay.sh"
+    )
+    training_launcher = "run_libero_train_single_gpu.sh" if single_gpu else "run_libero_train.sh"
     named_paths = {
         "data_reader": project_root / "src/duo_vla/data/libero.py",
         "normalization": project_root / "src/duo_vla/data/libero_stats.py",
         "expert_replay_binder": project_root / "scripts/bind_libero_expert_replay.py",
-        "expert_replay_binder_launcher": project_root / "scripts/run_bind_libero_expert_replay.sh",
+        "expert_replay_binder_launcher": project_root / "scripts" / binder_launcher,
         "expert_replay_collector": project_root / "scripts/collect_libero_expert_replay.py",
         "expert_replay_collector_launcher": project_root / "scripts/run_collect_libero_expert_replay.sh",
         "expert_replay_contract": project_root / "src/duo_vla/libero_replay_evidence.py",
         "original_hdf5_inventory": project_root / "configs/libero_original_hdf5_inventory.json",
+        "source_parquet_alignment": project_root / "configs/libero_source_parquet_alignment.json",
         "qualification": project_root / "scripts/qualify_libero_expert_replay.py",
-        "qualification_launcher": project_root / "scripts/run_qualify_libero_expert_replay.sh",
+        "qualification_launcher": project_root / "scripts" / qualification_launcher,
         "simulator_preflight": project_root / "scripts/preflight_libero_env.py",
         "simulator_preflight_launcher": project_root / "scripts/run_libero_preflight.sh",
-        "training_launcher": project_root / "scripts/run_libero_train.sh",
+        "training_launcher": project_root / "scripts" / training_launcher,
         "training_program": project_root / "scripts/train_libero.py",
     }
     source_files = {name: stable_file_sha256(path) for name, path in named_paths.items()}
     configs = {
-        "direct_regression": stable_file_sha256(project_root / "configs/libero_direct_regression.toml"),
-        "rectified_flow": stable_file_sha256(project_root / "configs/libero.toml"),
+        "direct_regression": stable_file_sha256(
+            project_root
+            / "configs"
+            / ("libero_direct_regression_single_gpu.toml" if single_gpu else "libero_direct_regression.toml")
+        ),
+        "rectified_flow": stable_file_sha256(
+            project_root / "configs" / ("libero_single_gpu.toml" if single_gpu else "libero.toml")
+        ),
     }
     return {
         "config_file_sha256": configs,
@@ -722,7 +991,8 @@ def build_expected_inputs(
         original_hdf5_inventory.get("content_sha256") == ORIGINAL_HDF5_CONTENT_SHA256,
         "original HDF5 inventory content identity mismatch",
     )
-    identity = source_identity(project_root)
+    train_venv_root = Path(validated_train_venv["root"])
+    identity = source_identity(project_root, single_gpu=train_venv_root.name == "train-single-gpu")
     return {
         "config_file_sha256": identity["config_file_sha256"],
         "dataset_content_inventory_sha256": DATASET_CONTENT_INVENTORY_SHA256,

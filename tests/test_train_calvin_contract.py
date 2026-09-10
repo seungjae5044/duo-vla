@@ -752,6 +752,26 @@ def test_canonical_calvin_training_launcher_scrubs_injection_and_pins_tp2() -> N
     assert '"LANG=C.UTF-8"' in source and '"LC_ALL=C.UTF-8"' in source and '"TZ=UTC"' in source
 
 
+def test_single_gpu_calvin_configs_and_launcher_pin_tp1_gpu_zero() -> None:
+    for base_name, single_name in (
+        ("calvin_abc_to_d.toml", "calvin_abc_to_d_single_gpu.toml"),
+        ("calvin_abc_to_d_direct.toml", "calvin_abc_to_d_direct_single_gpu.toml"),
+    ):
+        base = load_resolved_toml(ROOT / "configs" / base_name)
+        single = load_resolved_toml(ROOT / "configs" / single_name)
+        assert single["execution_profile"] == "duovla-single-gpu-tp1-v1"
+        assert single["model"]["tensor_parallel_size"] == 1
+        single.pop("execution_profile")
+        single["model"]["tensor_parallel_size"] = 2
+        assert single == base
+
+    source = (ROOT / "scripts/run_calvin_train_single_gpu.sh").read_text(encoding="utf-8")
+    assert "venvs/train-single-gpu" in source
+    assert "--nproc-per-node=1" in source
+    assert '"CUDA_VISIBLE_DEVICES=0"' in source
+    assert "exec /usr/bin/env -i" in source
+
+
 def test_training_runtime_rejects_inherited_pythonpath_before_import_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

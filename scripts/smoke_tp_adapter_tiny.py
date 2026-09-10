@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise DiffusionGemma continuous embeddings and PEFT LoRA under native TP=2 using tiny random weights."""
+"""Exercise DiffusionGemma continuous embeddings and PEFT LoRA under the launched TP topology."""
 
 from __future__ import annotations
 
@@ -72,23 +72,33 @@ def main() -> None:
     torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl")
     device = torch.device("cuda", local_rank)
-    checkpoint = Path("/root/.cache/duo-vla/models/tiny-diffusion-gemma-tp")
+    if dist.get_world_size() not in {1, 2}:
+        raise RuntimeError("tiny adapter smoke supports TP world size one or two")
+    cache_root = Path(os.environ.get("DUO_VLA_CACHE_ROOT", "/root/.cache/duo-vla"))
+    checkpoint = cache_root / "models/tiny-diffusion-gemma-tp"
     try:
         if dist.get_rank() == 0:
             torch.manual_seed(0)
             DiffusionGemmaForBlockDiffusion(_config()).save_pretrained(checkpoint)
         dist.barrier()
         config = DiffusionGemmaConfig.from_pretrained(checkpoint)
+        if dist.get_world_size() == 1:
+            topology_kwargs = {"device_map": {"": local_rank}}
+        else:
+            topology_kwargs = {
+                "distributed_config": DistributedConfig(
+                    tp_size=dist.get_world_size(),
+                    tp_plan=symmetric_diffusion_gemma_tp_plan(config),
+                )
+            }
         model = DiffusionGemmaForBlockDiffusion.from_pretrained(
             checkpoint,
             config=config,
             dtype=torch.bfloat16,
-            distributed_config=DistributedConfig(
-                tp_size=dist.get_world_size(),
-                tp_plan=symmetric_diffusion_gemma_tp_plan(config),
-            ),
             attn_implementation="eager",
+            **topology_kwargs,
         )
+        model._tp_size = dist.get_world_size()
         input_ids = torch.randint(3, 128, (1, 5), device=device)
         prefix_mask = torch.ones_like(input_ids, dtype=torch.bool)
         prefix = encode_diffusion_gemma_prefix(

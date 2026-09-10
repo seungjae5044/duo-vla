@@ -41,7 +41,9 @@ every source action/state sequence, and follows the upstream regeneration semant
 - apply the upstream no-op filter against the previous retained action;
 - record the pre-action observation, rotate both simulator cameras 180 degrees exactly once, and preserve the
   `[agentview, wrist]` order;
-- select the first successful replay and stop examining later demos.
+- authenticate the pinned 1,693-episode source/parquet alignment, then select the first source-order replay that is
+  both present in that regenerated training snapshot and successful in the live simulator; current-only successes
+  that upstream regeneration excluded cannot be substituted for training evidence.
 
 Reset-repeatability and controller impulse probes use separate freshly seeded environments, so they cannot consume the
 replay environment's RNG state. The four mutation checks—zero actions, mismatched language, swapped cameras, and
@@ -72,7 +74,11 @@ Hugging Face snapshot and the complete train virtual environment before reading 
 - requires 40 unique episode indices and the exact 40 task-index inventory;
 - sends every one of the 1,693 episodes through the production action validator, covering all 273,465 actions before
   accepting the exact gripper set;
-- compares every decoded pre-action RGB/state frame against the simulator sequence;
+- compares every decoded pre-action RGB/state frame against the simulator sequence. The exact action digest and exact
+  frame count select the episode; both cameras are compared as 8x8 RGB block means with bounded absolute error,
+  per-frame and sequence-mean correlation floors, while the full eight-dimensional state has bounded error and must
+  be closer at the declared frame than at either adjacent frame. Full-resolution simulator and parquet RGB hashes are
+  retained separately as provenance because EGL/platform rendering is not bitwise portable;
 - runs normalization through `load_libero_normalizers` and the production normalizer classes;
 - obtains a terminal sample through `LiberoParquetDataset.sample(..., horizon=8)` and requires one valid action,
   seven zero-filled positions, and the exact boolean validity mask;
@@ -109,7 +115,8 @@ The manifest contains exactly one successful regenerated demo per canonical task
 3. all positive and negative OSC_POSE translation/rotation impulse directions plus gripper polarity;
 4. production state/action normalization round trip;
 5. production terminal zero-padding/mask with no cross-episode leakage;
-6. exact pre-action `(observation_t, action_t)` alignment, rejecting post-action pairing;
+6. pre-action `(observation_t, action_t)` alignment: exact action/length identity, bounded RGB/state alignment, and a
+   state temporal-margin check rejecting either adjacent-frame pairing;
 7. single 180-degree camera-transform parity, positive-stride `uint8[256,256,3]`, and camera order;
 8. isolated deterministic regeneration-reset probes for all 40 tasks;
 9. pre-dispatch provenance mutation detection for zero actions, mismatched language, swapped cameras, and inverted
@@ -152,8 +159,15 @@ Official pre-registration and checkpoint authentication must preserve those iden
 
 ## Current status
 
-The collector, binder, strict validator, and official-freeze integration are implemented and covered by synthetic,
-adversarial, and real pinned-parquet tests. No real report exists yet because the 40-file original HDF5 corpus is not
-materialized locally and the simulator replay has not been run. Do not hand-author a passing bundle or describe the
-40-task gate as closed. Closure requires provisioning the pinned 31.47-GiB source corpus, completing both stages for
-all 40 tasks, independently recording every handoff hash, and publishing the final qualification report.
+The GPU-0 / TP=1 qualification is closed for the current implementation. The pinned 40-file HDF5 corpus was fully
+authenticated, all 40 simulator replays were bound to 40 unique episodes in the 1,693-episode parquet snapshot, and
+the independent qualifier reported 40/40 successful tasks:
+
+- simulator attestation raw SHA-256: `86b114584f9874dc72c7ac9f61de8b2d23f2700b5206e65d4e578e48ad8bcca1`;
+- simulator-stage SHA-256: `fb73b6b0198db6e4e3e21347c0eb7cac5f7b5b28fc0311085bc4dd6f3c8a26c9`;
+- evidence-manifest SHA-256: `d01b916fa5266b803d60c15cbdb9ebcf409c24535ecadff17fd4af1222ec312b`;
+- qualification-report SHA-256: `9687438e5b4de76e20d3287e8873c2477542b24a39a7056294ea79c726392300`.
+
+The report is stored at
+`/hdd2/hyunbin/vla/cache/reports/g6/libero-expert-replay-qualification-tp1-v2/qualification.json`. This development
+qualification is not the later external freeze token and does not authorize official benchmark calls.

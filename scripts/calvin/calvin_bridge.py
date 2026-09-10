@@ -150,6 +150,7 @@ _EXECUTION_GEOMETRY_FIELDS = {
     "physical_batch_size",
     "prefix_geometry_content_sha256",
 }
+_EXECUTION_TOPOLOGY_FIELDS = {"execution_profile", "tensor_parallel_size"}
 
 
 class BridgeError(RuntimeError):
@@ -579,7 +580,50 @@ def _validate_execution_geometry(value: Any, *, allow_none: bool) -> None:
     if value is None and allow_none:
         return
     require(isinstance(value, Mapping), "execution geometry must be an object")
-    _exact_keys(value, _EXECUTION_GEOMETRY_FIELDS, "execution geometry")
+    if value.get("expert_batch_isolation") == "sample_isolated_grouped_mm_v2":
+        expected_fields = (
+            _EXECUTION_GEOMETRY_FIELDS
+            | _EXECUTION_TOPOLOGY_FIELDS
+            | {
+                "serving_batch_size",
+                "data_parallel_size",
+                "global_batch_size",
+            }
+        )
+        require(set(value) == expected_fields, "optimized execution geometry fields differ")
+        require(value["experts_implementation"] == "grouped_mm", "optimized expert backend mismatch")
+        for key in (
+            "physical_batch_size",
+            "serving_batch_size",
+            "data_parallel_size",
+            "global_batch_size",
+            "tensor_parallel_size",
+            "fixed_physical_prefix_width",
+        ):
+            require(type(value[key]) is int, "optimized geometry sizes must be plain integers")
+        batch, dp = value["physical_batch_size"], value["data_parallel_size"]
+        require(batch in (8, 16, 32, 64) and dp in (1, 2), "optimized training batch/DP size differs")
+        require(
+            value["serving_batch_size"] == 8
+            and value["global_batch_size"] == 64
+            and value["tensor_parallel_size"] == 1,
+            "optimized serving requires TP1/B8, training global B64",
+        )
+        require(dp != 2 or batch == 32, "optimized DP2 requires rank B32")
+        expected_profile = (
+            "duovla-calvin-dp2-tp1-fused-v2-train-b32-serve-b8-v1"
+            if dp == 2
+            else f"duovla-calvin-tp1-fused-v2-train-b{batch}-serve-b8-v1"
+        )
+        require(value["execution_profile"] == expected_profile, "optimized execution profile differs")
+        require(0 < value["fixed_physical_prefix_width"] <= 1024 - ACTION_HORIZON, "invalid prefix width")
+        _validate_sha256(value["prefix_geometry_content_sha256"], "prefix_geometry_content_sha256")
+        return
+    fields = set(value)
+    require(
+        fields in (_EXECUTION_GEOMETRY_FIELDS, _EXECUTION_GEOMETRY_FIELDS | _EXECUTION_TOPOLOGY_FIELDS),
+        "execution geometry fields differ",
+    )
     require(value["experts_implementation"] == EXPERTS_IMPLEMENTATION, "expert backend mismatch")
     require(value["expert_batch_isolation"] == EXPERT_BATCH_ISOLATION, "expert isolation mismatch")
     require(
@@ -592,6 +636,10 @@ def _validate_execution_geometry(value: Any, *, allow_none: bool) -> None:
         "fixed physical prefix width is invalid",
     )
     _validate_sha256(value["prefix_geometry_content_sha256"], "prefix_geometry_content_sha256")
+    if fields != _EXECUTION_GEOMETRY_FIELDS:
+        require(value["tensor_parallel_size"] in {1, 2}, "tensor parallel size must be one or two")
+        expected_profile = "duovla-single-gpu-tp1-v1" if value["tensor_parallel_size"] == 1 else "duovla-tp2-v1"
+        require(value["execution_profile"] == expected_profile, "execution profile differs from tensor topology")
 
 
 def _validate_calvin_identity(value: Any, *, allow_none: bool) -> Optional[Dict[str, Any]]:

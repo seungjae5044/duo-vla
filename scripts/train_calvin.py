@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resumable TP=2 Duo-VLA trainer for pinned CALVIN ABC-to-D data."""
+"""Resumable TP1, TP2, or DP2/TP1 Duo-VLA trainer for pinned CALVIN ABC-to-D data."""
 
 # ruff: noqa: E402 -- authenticate project sources before importing project code.
 
@@ -132,8 +132,20 @@ from duo_vla.backbones.loading import (
 )
 from duo_vla.backbones.sample_isolated_experts import (
     GROUPED_MM_EXPERTS_IMPLEMENTATION,
-    install_sample_isolated_grouped_mm_experts,
-    verify_sample_isolated_grouped_mm_experts,
+)
+from duo_vla.calvin_execution import (
+    EXTENDED_GEOMETRY_FIELDS,
+    OPTIMIZED_SOURCE_PATHS,
+    SUPPORTED_BATCHES,
+    canonical_training_pair,
+    execution_from_config,
+    expert_backend_functions,
+    group_plans,
+    reduce_scalar,
+    sum_gradients_,
+)
+from duo_vla.calvin_execution import (
+    execution_geometry as calvin_execution_geometry,
 )
 from duo_vla.calvin_source_identity import calvin_source_tree_sha256
 from duo_vla.checkpointing import (
@@ -156,7 +168,7 @@ from duo_vla.data.calvin_archive import (
     CALVIN_MEMBER_INDEX_SCHEMA,
     OFFICIAL_CENTRAL_DIRECTORY_SHA256,
 )
-from duo_vla.data.calvin_batching import CalvinBatch, collate_calvin_samples
+from duo_vla.data.calvin_batching import CalvinBatch, coalesce_calvin_batches, collate_calvin_samples
 from duo_vla.data.calvin_stats import (
     CALVIN_ABC_D_ARCHIVE_BYTES,
     CALVIN_ABC_D_ARCHIVE_SHA256,
@@ -171,7 +183,6 @@ from duo_vla.data.calvin_stats import (
 )
 from duo_vla.hf_snapshot import verify_huggingface_snapshot
 from duo_vla.modeling import DuoVLADenoiser
-from duo_vla.objectives import make_seeded_policy_training_pair
 from duo_vla.optimization import (
     OptimizationConfig,
     assert_replicated_parameter_values,
@@ -206,6 +217,7 @@ from duo_vla.run_journal import (
     validate_resume_checkpoint,
 )
 from duo_vla.runtime_integrity import (
+    canonical_visible_cuda_world_size,
     content_address_train_venv,
     static_environment_identity,
     validate_torchrun_rank_environment,
@@ -231,9 +243,19 @@ CALVIN_EXPECTED_SCENES = ("calvin_scene_A", "calvin_scene_B", "calvin_scene_C")
 # NCCL timeout remains unchanged so it can continue to detect training hangs.
 CALVIN_DATASET_AUTHENTICATION_TIMEOUT = timedelta(hours=2)
 _INTEGER_MANIFEST_RUN_CONTRACT_FIELDS = frozenset(
-    {"archive_bytes", "fixed_physical_prefix_width", "member_index_bytes", "physical_batch_size"}
+    {
+        "archive_bytes",
+        "fixed_physical_prefix_width",
+        "member_index_bytes",
+        "physical_batch_size",
+        "tensor_parallel_size",
+        "data_parallel_size",
+        "serving_batch_size",
+        "global_batch_size",
+    }
 )
 TRAIN_LOCK_SHA256 = "0b1fb188747ee99224078b3c40975ca7e6f8e082e22d2860f9b50ee679a67c46"
+SINGLE_GPU_TRAIN_LOCK_SHA256 = "bea1c95bf906ba68bb8065f5329f7f65a67f7bbbca472d870e06bc208333b0c1"
 EXPECTED_TRAIN_PYTHON = "3.11.15"
 EXPECTED_TRAIN_PACKAGES = {
     "accelerate": "1.14.0",
@@ -247,6 +269,11 @@ EXPECTED_TRAIN_PACKAGES = {
     "torch": "2.13.0+cu126",
     "torchvision": "0.28.0+cu126",
     "transformers": "5.15.0",
+}
+SINGLE_GPU_EXPECTED_TRAIN_PACKAGES = {
+    **EXPECTED_TRAIN_PACKAGES,
+    "torch": "2.13.0+cu129",
+    "torchvision": "0.28.0+cu129",
 }
 REQUIRED_TRAIN_ENVIRONMENT = {
     "BLIS_NUM_THREADS": "1",
@@ -325,6 +352,32 @@ _CALVIN_SOURCE_EXPLICIT_RELATIVE_PATHS = (
     "pyproject.toml",
     "uv.lock",
 )
+_CALVIN_SINGLE_GPU_SOURCE_EXPLICIT_RELATIVE_PATHS = (
+    *_CALVIN_SOURCE_EXPLICIT_RELATIVE_PATHS,
+    *OPTIMIZED_SOURCE_PATHS,
+    "configs/calvin_abc_to_d_single_gpu.toml",
+    "configs/calvin_abc_to_d_direct_single_gpu.toml",
+    "envs/train-single-gpu/pyproject.toml",
+    "envs/train-single-gpu/uv.lock",
+    "scripts/bootstrap_train_single_gpu_env.sh",
+    "scripts/run_calvin_train_single_gpu.sh",
+    "scripts/calvin/run_policy_server_single_gpu.sh",
+)
+
+
+def _train_runtime_pins(world_size: int) -> tuple[Path, str, dict[str, str], str]:
+    if world_size == 1:
+        return (
+            Path("envs/train-single-gpu/uv.lock"),
+            SINGLE_GPU_TRAIN_LOCK_SHA256,
+            SINGLE_GPU_EXPECTED_TRAIN_PACKAGES,
+            "12.9",
+        )
+    if world_size == 2:
+        return Path("uv.lock"), TRAIN_LOCK_SHA256, EXPECTED_TRAIN_PACKAGES, "12.6"
+    raise ValueError("training world size must be one or two")
+
+
 _CALVIN_RUN_CONTRACT_FIELDS = frozenset(
     {
         "action_adapter",
@@ -370,6 +423,10 @@ _CALVIN_RUN_CONTRACT_FIELDS = frozenset(
         "validation_episode_sha256",
     }
 )
+_CALVIN_SINGLE_GPU_RUN_CONTRACT_FIELDS = _CALVIN_RUN_CONTRACT_FIELDS | {
+    "execution_profile",
+    "tensor_parallel_size",
+}
 
 _CALVIN_NORMALIZATION_DATASET_FIELDS = frozenset(
     {
@@ -439,12 +496,14 @@ _CALVIN_STORAGE_RUN_CONTRACT_FIELDS = frozenset(
 )
 
 
-def _source_tree_sha256(root: Path) -> str:
+def _source_tree_sha256(root: Path, *, single_gpu: bool = False) -> str:
     """Hash an injectively framed, exact CALVIN training source inventory."""
 
     return calvin_source_tree_sha256(
         root,
-        explicit_relative_paths=_CALVIN_SOURCE_EXPLICIT_RELATIVE_PATHS,
+        explicit_relative_paths=(
+            _CALVIN_SINGLE_GPU_SOURCE_EXPLICIT_RELATIVE_PATHS if single_gpu else _CALVIN_SOURCE_EXPLICIT_RELATIVE_PATHS
+        ),
         magic=_CALVIN_SOURCE_TREE_HASH_MAGIC,
     )
 
@@ -740,7 +799,11 @@ def _validate_training_instruction_coverage(
     return instruction_inventory_sha256(observed)
 
 
-def _configure_and_validate_training_runtime(project_root: Path) -> dict[str, Any]:
+def _configure_and_validate_training_runtime(
+    project_root: Path,
+    *,
+    resolved_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Fail closed on the canonical launcher, lock, imports, and deterministic flags."""
 
     _inventory_project_source_root()
@@ -751,7 +814,13 @@ def _configure_and_validate_training_runtime(project_root: Path) -> dict[str, An
         )
     project_root = project_root.resolve()
     cache_root = Path(os.environ.get("DUO_VLA_CACHE_ROOT", "/root/.cache/duo-vla")).resolve()
-    expected_prefix = (cache_root / "venvs/train").resolve()
+    expected_world_size = canonical_visible_cuda_world_size(os.environ)
+    execution = (
+        None if resolved_config is None else execution_from_config(resolved_config, world_size=expected_world_size)
+    )
+    software_tp_size = expected_world_size if execution is None else execution.tensor_parallel_size
+    environment_name = "train-single-gpu" if software_tp_size == 1 else "train"
+    expected_prefix = (cache_root / f"venvs/{environment_name}").resolve()
     if Path(sys.prefix).resolve() != expected_prefix:
         raise RuntimeError(f"CALVIN training requires the pinned train venv: {expected_prefix}")
     if sys.flags.safe_path != 1:
@@ -778,6 +847,7 @@ def _configure_and_validate_training_runtime(project_root: Path) -> dict[str, An
         raise RuntimeError("CALVIN training requires PYTHONHASHSEED in {0,1,2}")
     expected_environment = {
         **REQUIRED_TRAIN_ENVIRONMENT,
+        "CUDA_VISIBLE_DEVICES": os.environ["CUDA_VISIBLE_DEVICES"],
         "DUO_VLA_CACHE_ROOT": str(cache_root),
         "DUO_VLA_PROJECT_ROOT": str(project_root),
         "DUO_VLA_TRAIN_VENV": str(expected_prefix),
@@ -810,15 +880,23 @@ def _configure_and_validate_training_runtime(project_root: Path) -> dict[str, An
     observed_environment = {name: os.environ.get(name) for name in expected_environment}
     if observed_environment != expected_environment:
         raise RuntimeError(f"CALVIN training environment differs from the canonical launcher: {observed_environment}")
-    lock_path = project_root / "uv.lock"
-    if not lock_path.is_file() or file_sha256(lock_path) != TRAIN_LOCK_SHA256:
+    relative_lock_path, expected_lock_sha256, expected_packages, expected_cuda_runtime = _train_runtime_pins(
+        software_tp_size
+    )
+    lock_path = project_root / relative_lock_path
+    if not lock_path.is_file() or file_sha256(lock_path) != expected_lock_sha256:
         raise RuntimeError("CALVIN training lockfile SHA-256 mismatch")
-    packages = {name: importlib.metadata.version(name) for name in EXPECTED_TRAIN_PACKAGES}
-    if packages != EXPECTED_TRAIN_PACKAGES:
+    packages = {name: importlib.metadata.version(name) for name in expected_packages}
+    if packages != expected_packages:
         raise RuntimeError(f"CALVIN training package pin mismatch: {packages}")
+    if torch.version.cuda != expected_cuda_runtime:
+        raise RuntimeError(
+            f"CALVIN training CUDA runtime differs: expected={expected_cuda_runtime}, observed={torch.version.cuda}"
+        )
     rank_environment = validate_torchrun_rank_environment(
         os.environ,
         required=any(name in os.environ for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE")),
+        expected_world_size=expected_world_size,
     )
     venv_identity = content_address_train_venv(expected_prefix)
 
@@ -868,9 +946,9 @@ def _configure_and_validate_training_runtime(project_root: Path) -> dict[str, An
     torch.set_float32_matmul_precision("highest")
     if not torch.are_deterministic_algorithms_enabled() or torch.is_deterministic_algorithms_warn_only_enabled():
         raise RuntimeError("CALVIN training could not enable strict deterministic algorithms")
-    return {
+    runtime_identity = {
         "environment": dict(sorted(observed_environment.items())),
-        "lock_sha256": TRAIN_LOCK_SHA256,
+        "lock_sha256": expected_lock_sha256,
         "module_origins": module_origins,
         "packages": packages,
         "python": platform.python_version(),
@@ -879,6 +957,9 @@ def _configure_and_validate_training_runtime(project_root: Path) -> dict[str, An
         "torchrun": rank_environment,
         "train_venv": venv_identity,
     }
+    if software_tp_size == 1:
+        runtime_identity["lock_path"] = relative_lock_path.as_posix()
+    return runtime_identity
 
 
 def _execution_environment(runtime_preflight: dict[str, Any]) -> dict[str, Any]:
@@ -913,6 +994,8 @@ def _validate_and_build_interface_config(config: dict[str, Any]) -> ActionInterf
     optimization = config["optimization"]
     training = config["training"]
     reproducibility = config["reproducibility"]
+    execution = execution_from_config(config, world_size=dist.get_world_size())
+    expected_execution_profile = execution.profile
     required_declarations = {
         "model.experts_implementation": (model, "experts_implementation"),
         "model.expert_batch_isolation": (model, "expert_batch_isolation"),
@@ -928,13 +1011,13 @@ def _validate_and_build_interface_config(config: dict[str, Any]) -> ActionInterf
         "model.id": (model["id"], DEFAULT_DIFFUSION_GEMMA_SPEC.model_id),
         "model.revision": (model["revision"], DEFAULT_DIFFUSION_GEMMA_SPEC.revision),
         "model.dtype": (model["dtype"], "bfloat16"),
-        "model.tensor_parallel_size": (int(model["tensor_parallel_size"]), dist.get_world_size()),
+        "model.tensor_parallel_size": (int(model["tensor_parallel_size"]), execution.tensor_parallel_size),
         "model.attention_implementation": (model["attention_implementation"], "sdpa"),
         "model.experts_implementation": (
             model["experts_implementation"],
             GROUPED_MM_EXPERTS_IMPLEMENTATION,
         ),
-        "model.expert_batch_isolation": (model["expert_batch_isolation"], EXPERT_BATCH_ISOLATION),
+        "model.expert_batch_isolation": (model["expert_batch_isolation"], execution.backend),
         "action.horizon": (int(action["horizon"]), 8),
         "action.dimension": (int(action["dimension"]), 7),
         "action.timestep_embedding_dimension": (int(action["timestep_embedding_dimension"]), 256),
@@ -970,12 +1053,12 @@ def _validate_and_build_interface_config(config: dict[str, Any]) -> ActionInterf
         "optimization.global_batch_size": (int(optimization["global_batch_size"]), 64),
         "optimization.physical_batch_size": (
             int(optimization["physical_batch_size"]),
-            PHYSICAL_BATCH_SIZE,
+            execution.physical_batch,
         ),
-        "optimization.microbatch_size": (int(optimization["microbatch_size"]), PHYSICAL_BATCH_SIZE),
+        "optimization.microbatch_size": (int(optimization["microbatch_size"]), execution.physical_batch),
         "optimization.gradient_accumulation_steps": (
             int(optimization["gradient_accumulation_steps"]),
-            8,
+            execution.accumulation,
         ),
         "optimization.ema_decay": (float(optimization["ema_decay"]), 0.0),
         "training.data_loader_workers_per_rank": (int(training["data_loader_workers_per_rank"]), 0),
@@ -991,8 +1074,12 @@ def _validate_and_build_interface_config(config: dict[str, Any]) -> ActionInterf
         ),
     }
     mismatches = [name for name, (observed, expected) in required.items() if observed != expected]
+    if config.get("execution_profile") != expected_execution_profile:
+        mismatches.append("execution_profile")
     if mismatches:
-        details = {name: required[name] for name in mismatches}
+        details = {name: required[name] for name in mismatches if name in required}
+        if "execution_profile" in mismatches:
+            details["execution_profile"] = (config.get("execution_profile"), expected_execution_profile)
         raise ValueError(f"resolved config is unsupported by this trainer: {details}")
     checkpoint_interval = training.get("checkpoint_interval")
     permanent_checkpoint_interval = training.get("permanent_checkpoint_interval")
@@ -1436,9 +1523,10 @@ def _processor_inputs(
     device: torch.device,
     *,
     prefix_geometry: dict[str, Any],
+    expected_batch_size: int = PHYSICAL_BATCH_SIZE,
 ):
-    if len(samples) != PHYSICAL_BATCH_SIZE:
-        raise ValueError(f"CALVIN processor requires physical batch {PHYSICAL_BATCH_SIZE}, observed {len(samples)}")
+    if expected_batch_size not in SUPPORTED_BATCHES or len(samples) != expected_batch_size:
+        raise ValueError(f"CALVIN processor requires physical batch {expected_batch_size}, observed {len(samples)}")
     conversations = [
         [
             {
@@ -1457,7 +1545,7 @@ def _processor_inputs(
         conversations,
         fixed_physical_prefix_width=prefix_geometry["geometry"]["fixed_physical_prefix_width"],
         padding_side=prefix_geometry["tokenization"]["padding_side"],
-        expected_batch_size=PHYSICAL_BATCH_SIZE,
+        expected_batch_size=expected_batch_size,
         images_per_prefix=len(prefix_geometry["ordered_cameras"]),
     )
     expected_lengths = {
@@ -1490,6 +1578,35 @@ def _materialize_batch(
     )
 
 
+def _materialize_plan_batches(dataset, sampler, plan_groups, *, state_normalizer):
+    """Read one rank's planned anchors together; preserve B8 sampling and order."""
+    plans = tuple(plan for group in plan_groups for plan in group)
+    anchors_by_plan = [_fixed_distinct_anchors(sampler, count=8, seed=plan.data_seed) for plan in plans]
+    # The reader requires unique anchors. Deduplicate IO only, then expand the
+    # original multiplicity before per-plan collation; never resample duplicates.
+    unique = {}
+    for anchors in anchors_by_plan:
+        for anchor in anchors:
+            unique.setdefault((anchor.annotation_index, anchor.global_index), anchor)
+    loaded = dataset.sample_many(tuple(unique.values()))
+    by_identity = dict(zip(unique, loaded, strict=True))
+    canonical = tuple(
+        collate_calvin_samples(
+            tuple(by_identity[(anchor.annotation_index, anchor.global_index)] for anchor in anchors),
+            state_normalizer=state_normalizer,
+        )
+        for anchors in anchors_by_plan
+    )
+    result = []
+    offset = 0
+    for group in plan_groups:
+        result.append(
+            coalesce_calvin_batches(canonical[offset : offset + len(group)], physical_batch_size=len(group) * 8)
+        )
+        offset += len(group)
+    return result
+
+
 def _validation_is_due(*, next_update: int, total_updates: int, interval: int) -> bool:
     """Run validation only at its declared cadence and the configured final update.
 
@@ -1518,25 +1635,25 @@ def _run_validation(
     validation_seed: int,
     policy_contract: PolicyContract,
     prefix_geometry: dict[str, Any],
+    data_parallel_size: int = 1,
 ) -> float:
     denoiser.eval()
     adapted.eval()
     model.model.encoder.eval()
     numerators: list[float] = []
     element_count = 0
-    if microbatch_size != PHYSICAL_BATCH_SIZE or samples % PHYSICAL_BATCH_SIZE != 0:
-        raise ValueError("CALVIN validation requires exact physical B=8 with no remainder")
-    microbatches = samples // microbatch_size
+    if microbatch_size not in SUPPORTED_BATCHES or samples % (microbatch_size * data_parallel_size):
+        raise ValueError("CALVIN validation requires complete physical batches on every rank")
+    plans = tuple(make_microbatch_plan(validation_seed, 0, i) for i in range(samples // 8))
+    groups = group_plans(
+        plans,
+        physical_batch=microbatch_size,
+        rank=dist.get_rank() if data_parallel_size == 2 else 0,
+        data_parallel_size=data_parallel_size,
+    )
     with torch.no_grad():
-        for microstep in range(microbatches):
-            plan = make_microbatch_plan(validation_seed, 0, microstep)
-            batch = _materialize_batch(
-                dataset,
-                sampler,
-                count=microbatch_size,
-                seed=plan.data_seed,
-                state_normalizer=state_normalizer,
-            )
+        for group in groups:
+            batch = _materialize_plan_batches(dataset, sampler, (group,), state_normalizer=state_normalizer)[0]
             state = batch.states.to(device)
             clean = batch.clean_actions.to(device)
             valid = batch.action_valid_mask.to(device)
@@ -1545,9 +1662,10 @@ def _run_validation(
                 batch.samples,
                 device,
                 prefix_geometry=prefix_geometry,
+                expected_batch_size=microbatch_size,
             )
             prefix = encode_diffusion_gemma_prefix(model, dict(prefix_inputs))
-            pair = make_seeded_policy_training_pair(clean, policy_contract, seed=plan.flow_seed)
+            pair = canonical_training_pair(clean, policy_contract, group)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 prediction = denoiser(
                     pair.input_actions,
@@ -1563,7 +1681,11 @@ def _run_validation(
     adapted.train()
     denoiser.train()
     model.model.encoder.eval()
-    loss = sum(numerators) / element_count
+    numerator = sum(numerators)
+    if data_parallel_size == 2:
+        numerator = reduce_scalar(numerator, device=device, dtype=torch.float64)
+        element_count = reduce_scalar(element_count, device=device, dtype=torch.int64)
+    loss = numerator / element_count
     replicated = torch.tensor(loss, device=device, dtype=torch.float64)
     assert_replicated_tensor("validation_loss", replicated)
     return loss
@@ -1794,7 +1916,9 @@ def main() -> None:
     parser.add_argument("--checkpoint-interval", type=int)
     parser.add_argument("--permanent-checkpoint-interval", type=int)
     parser.add_argument("--log-interval", type=int)
-    parser.add_argument("--max-cached-frames", type=int, default=512)
+    parser.add_argument(
+        "--max-cached-frames", type=int, help="Bounded decoded-frame LRU; defaults to the recipe or 512"
+    )
     parser.add_argument(
         "--runtime-preflight-only",
         action="store_true",
@@ -1822,7 +1946,10 @@ def main() -> None:
             raise ValueError("resume checkpoint must be inside output_dir") from exc
 
     project_root = Path(__file__).resolve().parents[1]
-    runtime_preflight = _configure_and_validate_training_runtime(project_root)
+    launch_config = load_resolved_toml(args.config)
+    if args.max_cached_frames is None:
+        args.max_cached_frames = launch_config.get("training", {}).get("max_cached_frames", 512)
+    runtime_preflight = _configure_and_validate_training_runtime(project_root, resolved_config=launch_config)
     if args.runtime_preflight_only:
         print(json.dumps(runtime_preflight, indent=2, sort_keys=True))
         return
@@ -1832,8 +1959,12 @@ def main() -> None:
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     dist.init_process_group("nccl", device_id=device)
-    if dist.get_world_size() != 2:
-        raise RuntimeError("CALVIN training requires TP world size 2")
+    expected_world_size = canonical_visible_cuda_world_size(os.environ)
+    if dist.get_world_size() != expected_world_size:
+        raise RuntimeError(
+            f"CALVIN training world size differs from the canonical visible-device topology: "
+            f"expected={expected_world_size}, observed={dist.get_world_size()}"
+        )
     rank = dist.get_rank()
     run_lock = None
     dataset: CalvinNpzDataset | None = None
@@ -1841,6 +1972,8 @@ def main() -> None:
         run_lock = _acquire_run_lock(args.output_dir)
         config = load_resolved_toml(args.config)
         config = copy.deepcopy(config)
+        execution = execution_from_config(config, world_size=dist.get_world_size())
+        is_data_parallel = execution.data_parallel_size == 2
         optimization = config["optimization"]
         training = config["training"]
         declared_batch_contract = {
@@ -1851,9 +1984,9 @@ def main() -> None:
         }
         expected_batch_contract = {
             "global_batch_size": 64,
-            "microbatch_size": PHYSICAL_BATCH_SIZE,
-            "gradient_accumulation_steps": 8,
-            "physical_batch_size": PHYSICAL_BATCH_SIZE,
+            "microbatch_size": execution.physical_batch,
+            "gradient_accumulation_steps": execution.accumulation,
+            "physical_batch_size": execution.physical_batch,
         }
         if declared_batch_contract != expected_batch_contract:
             raise ValueError(
@@ -1916,15 +2049,15 @@ def main() -> None:
         invalid = [name for name, value in positive_values.items() if value <= 0]
         if invalid or not 0 <= warmup_updates < total_updates:
             raise ValueError(f"invalid training schedule fields: {invalid}, warmup={warmup_updates}")
-        if validation_samples % PHYSICAL_BATCH_SIZE != 0:
-            raise ValueError(f"validation_samples must be divisible by the fixed physical batch {PHYSICAL_BATCH_SIZE}")
+        if validation_samples % (execution.physical_batch * execution.data_parallel_size):
+            raise ValueError("validation_samples must form full physical batches on all data-parallel ranks")
         if permanent_checkpoint_interval % checkpoint_interval:
             raise ValueError("permanent_checkpoint_interval must be a multiple of checkpoint_interval")
         optimization["total_updates"] = total_updates
         optimization["warmup_updates"] = warmup_updates
         optimization["microbatch_size"] = microbatch_size
         optimization["gradient_accumulation_steps"] = accumulation_steps
-        optimization["global_batch_size"] = microbatch_size * accumulation_steps
+        optimization["global_batch_size"] = microbatch_size * accumulation_steps * execution.data_parallel_size
         training["validation_interval"] = validation_interval
         training["validation_samples"] = validation_samples
         training["checkpoint_interval"] = checkpoint_interval
@@ -2003,20 +2136,17 @@ def main() -> None:
             prefix_geometry,
             dataset.annotations,
         )
-        execution_geometry = {
-            "expert_batch_isolation": config["model"]["expert_batch_isolation"],
-            "experts_implementation": config["model"]["experts_implementation"],
-            "fixed_physical_prefix_width": config["benchmark"]["fixed_physical_prefix_width"],
-            "physical_batch_size": config["optimization"]["physical_batch_size"],
-            "prefix_geometry_content_sha256": config["benchmark"]["prefix_geometry_content_sha256"],
-        }
+        execution_geometry = calvin_execution_geometry(config)
         execution_environment = _execution_environment(runtime_preflight)
         config["execution_environment"] = execution_environment
         config["artifact_trees"] = {"model_tree_sha256": model_tree_sha256}
         config["calvin_identity"] = calvin_identity
         config["execution_geometry"] = execution_geometry
         config["training_instruction_inventory_sha256"] = training_instruction_inventory_sha256
-        source_sha256 = _source_tree_sha256(project_root)
+        source_sha256 = _source_tree_sha256(
+            project_root,
+            single_gpu=config.get("execution_profile") is not None,
+        )
         config["source_tree_sha256"] = source_sha256
         config_sha256 = canonical_config_sha256(config)
 
@@ -2068,13 +2198,20 @@ def main() -> None:
             "prefix_geometry_content_sha256": prefix_geometry["content_sha256"],
             "fixed_physical_prefix_width": str(prefix_geometry["geometry"]["fixed_physical_prefix_width"]),
             "experts_implementation": GROUPED_MM_EXPERTS_IMPLEMENTATION,
-            "expert_batch_isolation": EXPERT_BATCH_ISOLATION,
-            "physical_batch_size": str(PHYSICAL_BATCH_SIZE),
+            "expert_batch_isolation": execution.backend,
+            "physical_batch_size": str(execution.physical_batch),
             "training_instruction_inventory_sha256": training_instruction_inventory_sha256,
             "policy_contract_sha256": canonical_config_sha256(policy_contract.to_dict()),
             "run_uuid": run_uuid,
             "source_tree_sha256": source_sha256,
         }
+        if config.get("execution_profile") is not None:
+            run_contract.update(
+                execution_profile=str(config["execution_profile"]),
+                tensor_parallel_size=str(execution.tensor_parallel_size),
+            )
+        if execution.optimized:
+            run_contract.update({key: str(execution_geometry[key]) for key in EXTENDED_GEOMETRY_FIELDS})
 
         random.seed(2026 + run_seed)
         np.random.seed((2026 + run_seed) % (1 << 32))
@@ -2089,17 +2226,22 @@ def main() -> None:
             != prefix_geometry["tokenization"]["padding_side"]
         ):
             raise RuntimeError("loaded processor padding side differs from the authenticated prefix geometry")
-        model = load_diffusion_gemma_bf16_tp(local_files_only=True, tp_size=dist.get_world_size())
-        installed_experts = install_sample_isolated_grouped_mm_experts(
+        model = load_diffusion_gemma_bf16_tp(
+            local_files_only=True,
+            tp_size=execution.tensor_parallel_size,
+            **({"replica_mode": "data_parallel"} if is_data_parallel else {}),
+        )
+        install_experts, verify_experts = expert_backend_functions(execution.backend)
+        installed_experts = install_experts(
             model,
-            physical_batch_size=PHYSICAL_BATCH_SIZE,
+            physical_batch_size=execution.physical_batch,
         )
         if (
             installed_experts.experts_implementation != GROUPED_MM_EXPERTS_IMPLEMENTATION
-            or installed_experts.physical_batch_size != PHYSICAL_BATCH_SIZE
+            or installed_experts.physical_batch_size != execution.physical_batch
         ):
             raise RuntimeError("installed expert execution differs from the resolved training contract")
-        verify_sample_isolated_grouped_mm_experts(model, physical_batch_size=PHYSICAL_BATCH_SIZE)
+        verify_experts(model, physical_batch_size=execution.physical_batch)
         backend = DiffusionGemmaActionDecoder.from_block_diffusion_model(model)
         torch.manual_seed(2027 + run_seed)
         resume_manifest = load_checkpoint_manifest(args.resume) if args.resume is not None else None
@@ -2143,7 +2285,7 @@ def main() -> None:
                 validate_decoder_contract=True,
                 expected_rank=int(config["lora"]["rank"]),
             )
-        verify_sample_isolated_grouped_mm_experts(model, physical_batch_size=PHYSICAL_BATCH_SIZE)
+        verify_experts(model, physical_batch_size=execution.physical_batch)
         projector = ActionInputProjector(interface_config).to(device)
         head = VelocityHead(
             interface_config.hidden_size,
@@ -2189,11 +2331,24 @@ def main() -> None:
             optimization_config,
         )
         optimizer_named_parameters = [*lora_named_parameters, *interface_named_parameters]
+        if is_data_parallel:
+            if lora_partition.sharded or {id(p) for _, p in lora_partition.replicated} != {
+                id(p) for p in lora_parameters
+            }:
+                raise RuntimeError("CALVIN DP2 cannot contain TP-sharded or unclassified trainables")
+            assert_replicated_parameter_values(optimizer_named_parameters)
         run_contract["optimizer_parameter_schema_sha256"] = optimizer_parameter_schema_sha256(
             optimizer,
             optimizer_named_parameters,
         )
-        if set(run_contract) != _CALVIN_RUN_CONTRACT_FIELDS:
+        expected_run_contract_fields = (
+            _CALVIN_SINGLE_GPU_RUN_CONTRACT_FIELDS
+            if config.get("execution_profile") is not None
+            else _CALVIN_RUN_CONTRACT_FIELDS
+        )
+        if execution.optimized:
+            expected_run_contract_fields = expected_run_contract_fields | EXTENDED_GEOMETRY_FIELDS
+        if set(run_contract) != expected_run_contract_fields:
             raise RuntimeError("CALVIN training run-contract inventory drifted")
         if args.resume is None:
             trainer_state = TrainerState()
@@ -2213,7 +2368,7 @@ def main() -> None:
                 trainer_state,
                 optimizer=optimizer,
                 scheduler=scheduler,
-                examples_per_update=microbatch_size * accumulation_steps,
+                examples_per_update=64,
                 expected_learning_rates=[
                     optimization_config.lora_learning_rate
                     * learning_rate_scale(trainer_state.next_update, optimization_config),
@@ -2243,17 +2398,14 @@ def main() -> None:
         started = time.perf_counter()
         for update in range(trainer_state.next_update, execution_end):
             update_started = time.perf_counter()
-            plans = make_update_plan(run_seed, update, gradient_accumulation_steps=accumulation_steps)
-            batches = [
-                _materialize_batch(
-                    dataset,
-                    train_sampler,
-                    count=microbatch_size,
-                    seed=plan.data_seed,
-                    state_normalizer=state_normalizer,
-                )
-                for plan in plans
-            ]
+            plans = make_update_plan(run_seed, update, gradient_accumulation_steps=8)
+            plan_groups = group_plans(
+                plans,
+                physical_batch=microbatch_size,
+                rank=rank if is_data_parallel else 0,
+                data_parallel_size=execution.data_parallel_size,
+            )
+            batches = _materialize_plan_batches(dataset, train_sampler, plan_groups, state_normalizer=state_normalizer)
             total_elements = sum(
                 masked_element_count(
                     batch.action_valid_mask,
@@ -2261,9 +2413,11 @@ def main() -> None:
                 )
                 for batch in batches
             )
+            if is_data_parallel:
+                total_elements = reduce_scalar(total_elements, device=device, dtype=torch.int64)
             optimizer.zero_grad(set_to_none=True)
             numerator = 0.0
-            for microstep, (plan, batch) in enumerate(zip(plans, batches, strict=True)):
+            for microstep, (group, batch) in enumerate(zip(plan_groups, batches, strict=True)):
                 state = batch.states.to(device)
                 clean = batch.clean_actions.to(device)
                 valid = batch.action_valid_mask.to(device)
@@ -2272,9 +2426,10 @@ def main() -> None:
                     batch.samples,
                     device,
                     prefix_geometry=prefix_geometry,
+                    expected_batch_size=microbatch_size,
                 )
                 prefix = encode_diffusion_gemma_prefix(model, dict(prefix_inputs))
-                pair = make_seeded_policy_training_pair(clean, policy_contract, seed=plan.flow_seed)
+                pair = canonical_training_pair(clean, policy_contract, group)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     prediction = denoiser(
                         pair.input_actions,
@@ -2287,12 +2442,14 @@ def main() -> None:
                 component = masked_sse(prediction, pair.target, valid)
                 component.loss_for_total(total_elements).backward()
                 numerator += float(component.squared_error_sum.detach())
-                if update == 0 and microstep == 0:
+                if update == 0 and microstep == 0 and not is_data_parallel:
                     _assert_initial_gradients_present(
                         lora_partition,
                         interface_named_parameters,
                     )
             _assert_distributed_gradient_health([*lora_parameters, *interface_parameters])
+            if is_data_parallel:
+                sum_gradients_(optimizer_named_parameters)
             gradient_norm = clip_tensor_parallel_grad_norm_(
                 [*(parameter for _, parameter in lora_partition.replicated), *interface_parameters],
                 [parameter for _, parameter in lora_partition.sharded],
@@ -2304,15 +2461,21 @@ def main() -> None:
             if update == invocation_start_update:
                 _assert_fp32_optimizer_state(optimizer)
             scheduler.step()
-            trainer_state = trainer_state.advance(examples=microbatch_size * accumulation_steps)
+            trainer_state = trainer_state.advance(examples=64)
             if update == 0:
                 assert_replicated_parameter_values(interface_named_parameters)
+            if is_data_parallel:
+                numerator = reduce_scalar(numerator, device=device, dtype=torch.float64)
+                if update == invocation_start_update:
+                    assert_replicated_parameter_values(optimizer_named_parameters)
             train_loss = numerator / total_elements
             assert_replicated_tensor(
                 f"train_loss.{trainer_state.next_update}",
                 torch.tensor(train_loss, device=device, dtype=torch.float64),
             )
             update_seconds = time.perf_counter() - update_started
+            if is_data_parallel:
+                update_seconds = reduce_scalar(update_seconds, device=device, dtype=torch.float64, maximum=True)
             metric: dict[str, Any] = {
                 "examples_seen": trainer_state.examples_seen,
                 "gradient_norm": float(gradient_norm),
@@ -2323,6 +2486,14 @@ def main() -> None:
                 "update": trainer_state.next_update,
                 "update_seconds": update_seconds,
             }
+            if execution.optimized:
+                metric.update(
+                    physical_batch_size=microbatch_size,
+                    data_parallel_size=execution.data_parallel_size,
+                    global_batch_size=64,
+                    canonical_microbatches=8,
+                    physical_forwards_per_rank=len(plan_groups),
+                )
             should_validate = _validation_is_due(
                 next_update=trainer_state.next_update,
                 total_updates=total_updates,
@@ -2343,6 +2514,7 @@ def main() -> None:
                     validation_seed=validation_seed,
                     policy_contract=policy_contract,
                     prefix_geometry=prefix_geometry,
+                    data_parallel_size=execution.data_parallel_size,
                 )
             should_checkpoint = (
                 trainer_state.next_update % checkpoint_interval == 0
@@ -2376,6 +2548,11 @@ def main() -> None:
                     resolved_config_path=resolved_config_path,
                     manifest={
                         **run_contract,
+                        **(
+                            {key: execution_geometry[key] for key in EXTENDED_GEOMETRY_FIELDS}
+                            if execution.optimized
+                            else {}
+                        ),
                         "archive_bytes": calvin_identity["archive_bytes"],
                         "calvin_identity": calvin_identity,
                         "calvin_source_revisions": calvin_source_revisions,
@@ -2399,6 +2576,11 @@ def main() -> None:
                         "platform": platform.platform(),
                         "physical_batch_size": execution_geometry["physical_batch_size"],
                         "policy_contract": policy_contract.to_dict(),
+                        **(
+                            {"tensor_parallel_size": execution_geometry["tensor_parallel_size"]}
+                            if "tensor_parallel_size" in execution_geometry
+                            else {}
+                        ),
                         "prefix_geometry": {
                             "instruction_inventory_sha256": prefix_geometry["instruction_inventory"]["sha256"],
                             "maximum_valid_prefix_length": prefix_geometry["geometry"]["maximum_valid_prefix_length"],

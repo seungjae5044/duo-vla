@@ -838,6 +838,25 @@ def test_manifest_is_last_commit_marker_on_injected_publication_failure(
     assert (stages[0] / CALVIN_MANIFEST_NAME).is_file()
 
 
+def test_manifest_source_does_not_depend_on_o_tmpfile_linkability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture_generation(tmp_path)
+    real_open = archive_module.os.open
+
+    def reject_o_tmpfile(path, flags, *args, **kwargs):
+        if hasattr(os, "O_TMPFILE") and flags & os.O_TMPFILE == os.O_TMPFILE:
+            raise AssertionError("manifest publication must use its private named stage")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(archive_module.os, "open", reject_o_tmpfile)
+    prepared = _prepare(fixture)
+    assert prepared.manifest_path.is_file()
+    with _reader_from_fixture(fixture):
+        pass
+
+
 def test_reader_rejects_exact_schema_partial_predicate_substitution(tmp_path: Path) -> None:
     fixture = _fixture_generation(tmp_path)
     prepared = _prepare(fixture)

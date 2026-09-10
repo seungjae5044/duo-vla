@@ -139,9 +139,11 @@ from libero_bridge import (
     IMAGE_SHAPE,
     PROTOCOL,
     STATE_DIM,
+    expected_training_execution_profile,
     make_error_response,
     make_success_response,
     serve_unix_policy,
+    serving_execution_geometry,
     validate_execution_geometry,
     validate_wire_policy_contract,
 )
@@ -158,6 +160,7 @@ if (
 
 from duo_vla.runtime_determinism import configure_strict_cuda_determinism, deterministic_torch_runtime
 from duo_vla.runtime_integrity import (
+    canonical_visible_cuda_world_size,
     content_address_train_venv,
     require_matching_train_venv,
     static_environment_identity,
@@ -176,6 +179,7 @@ DATASET_FILES_VERIFIED = 382
 DATASET_TOTAL_BYTES = 34_926_155_087
 NORMALIZATION_SHA256 = "a972b5d95a8aaa8ae7582bafcbc071261979cb46c2a3515b4da7a7cf0156ac73"
 TRAIN_LOCK_SHA256 = "0b1fb188747ee99224078b3c40975ca7e6f8e082e22d2860f9b50ee679a67c46"
+SINGLE_GPU_TRAIN_LOCK_SHA256 = "bea1c95bf906ba68bb8065f5329f7f65a67f7bbbca472d870e06bc208333b0c1"
 EXPECTED_TRAIN_PACKAGES = {
     "accelerate": "1.14.0",
     "huggingface-hub": "1.29.0",
@@ -189,9 +193,16 @@ EXPECTED_TRAIN_PACKAGES = {
     "torchvision": "0.28.0+cu126",
     "transformers": "5.15.0",
 }
+SINGLE_GPU_EXPECTED_TRAIN_PACKAGES = {
+    **EXPECTED_TRAIN_PACKAGES,
+    "torch": "2.13.0+cu129",
+    "torchvision": "0.28.0+cu129",
+}
 PHYSICAL_BATCH_SIZE = 8
+SUPPORTED_TRAINING_PHYSICAL_BATCH_SIZES = frozenset({8, 16, 32, 64})
 EXPERTS_IMPLEMENTATION = "grouped_mm"
 EXPERT_BATCH_ISOLATION = "sample_isolated_grouped_mm_v1"
+SUPPORTED_EXPERT_BATCH_ISOLATIONS = frozenset({EXPERT_BATCH_ISOLATION, "sample_isolated_grouped_mm_v2"})
 LIBERO_PREFIX_CAMERA_NAMES = ("agentview", "eye_in_hand")
 REQUIRED_SERVING_ENVIRONMENT = {
     "BLIS_NUM_THREADS": "1",
@@ -263,6 +274,20 @@ _ALLOWED_ALGORITHM_ENVIRONMENT = frozenset(
 )
 
 
+def _train_runtime_pins(world_size: int) -> tuple[Path, str, dict[str, str], str, str]:
+    if world_size == 1:
+        return (
+            Path("envs/train-single-gpu/uv.lock"),
+            SINGLE_GPU_TRAIN_LOCK_SHA256,
+            SINGLE_GPU_EXPECTED_TRAIN_PACKAGES,
+            "12.9",
+            "train-single-gpu",
+        )
+    if world_size == 2:
+        return Path("uv.lock"), TRAIN_LOCK_SHA256, EXPECTED_TRAIN_PACKAGES, "12.6", "train"
+    raise ValueError("training world size must be one or two")
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise RuntimeError(message)
@@ -294,6 +319,13 @@ def _training_source_tree_sha256(root: Path) -> str:
         path
         for path in (
             root / "scripts/run_libero_train.sh",
+            root / "scripts/run_libero_train_single_gpu.sh",
+            root / "scripts/run_libero_train_dp2.sh",
+            root / "scripts/create_libero_dp2_fork.py",
+            root / "scripts/create_libero_topology_fork.py",
+            root / "scripts/bootstrap_train_single_gpu_env.sh",
+            root / "envs/train-single-gpu/pyproject.toml",
+            root / "envs/train-single-gpu/uv.lock",
             root / "scripts/train_libero.py",
             root / "pyproject.toml",
             root / "uv.lock",
@@ -306,6 +338,21 @@ def _training_source_tree_sha256(root: Path) -> str:
     return digest.hexdigest()
 
 
+def _training_launcher_name(execution_geometry: dict[str, Any]) -> str:
+    """Select provenance from training topology, independently of serving topology."""
+
+    if execution_geometry.get("strategy") == "data_parallel":
+        require(
+            execution_geometry.get("world_size") == 2
+            and execution_geometry.get("data_parallel_size") == 2
+            and execution_geometry.get("tensor_parallel_size") == 1,
+            "DP2 training launcher topology differs",
+        )
+        return "scripts/run_libero_train_dp2.sh"
+    tensor_parallel_size = int(execution_geometry.get("tensor_parallel_size", 2))
+    return "scripts/run_libero_train_single_gpu.sh" if tensor_parallel_size == 1 else "scripts/run_libero_train.sh"
+
+
 def _validate_serving_process_environment(project_root: Path) -> dict[str, Any]:
     """Require the canonical launcher environment before any CUDA initialization."""
 
@@ -313,9 +360,12 @@ def _validate_serving_process_environment(project_root: Path) -> dict[str, Any]:
     _validate_project_module_origins({"duo_vla", "duo_vla.runtime_determinism", "duo_vla.runtime_integrity"})
     project_root = project_root.resolve()
     cache_root = Path(os.environ.get("DUO_VLA_CACHE_ROOT", "/root/.cache/duo-vla")).resolve()
-    train_venv = (cache_root / "venvs/train").resolve()
+    expected_world_size = canonical_visible_cuda_world_size(os.environ)
+    _, _, _, _, environment_name = _train_runtime_pins(expected_world_size)
+    train_venv = (cache_root / f"venvs/{environment_name}").resolve()
     expected = {
         **REQUIRED_SERVING_ENVIRONMENT,
+        "CUDA_VISIBLE_DEVICES": os.environ["CUDA_VISIBLE_DEVICES"],
         "DUO_VLA_CACHE_ROOT": str(cache_root),
         "DUO_VLA_PROJECT_ROOT": str(project_root),
         "DUO_VLA_TRAIN_VENV": str(train_venv),
@@ -363,6 +413,7 @@ def _validate_serving_process_environment(project_root: Path) -> dict[str, Any]:
     rank_environment = validate_torchrun_rank_environment(
         os.environ,
         required=any(name in os.environ for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE")),
+        expected_world_size=expected_world_size,
     )
     return {
         "environment": dict(sorted(observed.items())),
@@ -375,9 +426,11 @@ def _driver_and_binary_identity(torch: Any) -> dict[str, Any]:
     """Bind the latency runtime to its driver, device mapping, and loaded binaries."""
 
     try:
+        visible_device_ids = [int(value) for value in os.environ["CUDA_VISIBLE_DEVICES"].split(",")]
         completed = subprocess.run(
             [
                 "/usr/bin/nvidia-smi",
+                f"--id={os.environ['CUDA_VISIBLE_DEVICES']}",
                 "--query-gpu=index,name,uuid,driver_version,compute_cap",
                 "--format=csv,noheader,nounits",
             ],
@@ -401,7 +454,10 @@ def _driver_and_binary_identity(torch: Any) -> dict[str, Any]:
                 "uuid": fields[2],
             }
         )
-    require([row["index"] for row in rows] == [0, 1], "driver query did not report two devices in order")
+    require(
+        [row["index"] for row in rows] == visible_device_ids,
+        "driver query did not report the canonical visible devices in order",
+    )
     logical: list[dict[str, Any]] = []
     for index, physical in enumerate(rows):
         properties = torch.cuda.get_device_properties(index)
@@ -417,6 +473,7 @@ def _driver_and_binary_identity(torch: Any) -> dict[str, Any]:
                 "logical_index": index,
                 "name": name,
                 "physical_index": physical["index"],
+                "total_memory_bytes": int(properties.total_memory),
                 "uuid": uuid,
             }
         )
@@ -461,19 +518,53 @@ def configure_and_identify_serving_runtime(
         "checkpoint report has no training execution-environment identity",
     )
     execution_geometry = validate_execution_geometry(checkpoint_report.get("execution_geometry"))
+    serving_geometry = serving_execution_geometry(execution_geometry)
+    serving_tensor_parallel_size = int(serving_geometry["tensor_parallel_size"])
+    single_gpu = serving_tensor_parallel_size == 1
+    data_parallel_training = execution_geometry.get("strategy") == "data_parallel"
+    _, expected_lock_sha256, expected_packages, expected_cuda_runtime, _ = _train_runtime_pins(
+        serving_tensor_parallel_size
+    )
     train_venv = checkpoint_report.get("train_venv")
     require(isinstance(train_venv, dict), "checkpoint report has no authenticated train-venv identity")
     hardware = _driver_and_binary_identity(torch)
+    training_environment = checkpoint_report.get("training_execution_environment")
+    training_reuse_required = not data_parallel_training
+    if (
+        training_reuse_required
+        and isinstance(training_environment, dict)
+        and (
+            training_environment.get("gpu_uuids") is not None
+            or training_environment.get("gpu_total_memory_bytes") is not None
+        )
+    ):
+        live_gpu_uuids = [row["uuid"] for row in hardware["logical_cuda_devices"]]
+        live_gpu_total_memory_bytes = [row["total_memory_bytes"] for row in hardware["logical_cuda_devices"]]
+        require(
+            training_environment.get("gpu_uuids") == live_gpu_uuids,
+            "serving GPU UUIDs differ from checkpoint training GPUs",
+        )
+        require(
+            training_environment.get("gpu_total_memory_bytes") == live_gpu_total_memory_bytes,
+            "serving GPU memory differs from checkpoint training GPUs",
+        )
     payload = {
         "authenticated_software": {
             "bridge_sha256": sha256_file(project_root / "scripts/libero_bridge.py"),
             "checkpoint_source_tree_sha256": source_tree_sha256,
             "live_source_tree_sha256": live_source_tree_sha256,
-            "packages": EXPECTED_TRAIN_PACKAGES,
-            "policy_launcher_sha256": sha256_file(project_root / "scripts/run_libero_policy_server.sh"),
+            "packages": expected_packages,
+            "policy_launcher_sha256": sha256_file(
+                project_root
+                / (
+                    "scripts/run_libero_policy_server_single_gpu.sh"
+                    if single_gpu
+                    else "scripts/run_libero_policy_server.sh"
+                )
+            ),
             "serve_policy_sha256": sha256_file(Path(__file__)),
-            "train_launcher_sha256": sha256_file(project_root / "scripts/run_libero_train.sh"),
-            "train_lock_sha256": TRAIN_LOCK_SHA256,
+            "train_launcher_sha256": sha256_file(project_root / _training_launcher_name(execution_geometry)),
+            "train_lock_sha256": expected_lock_sha256,
             "train_venv_content_inventory_sha256": train_venv["content_inventory_sha256"],
             "train_venv_root_sha256": train_venv["root_sha256"],
             "train_venv_tree_metadata_sha256": train_venv["tree_metadata_sha256"],
@@ -501,10 +592,16 @@ def configure_and_identify_serving_runtime(
             "math": torch.backends.cuda.math_sdp_enabled(),
             "memory_efficient": torch.backends.cuda.mem_efficient_sdp_enabled(),
         },
+        "serving_execution_geometry": serving_geometry,
+        "training_execution_geometry": execution_geometry,
         "training_execution_environment_sha256": training_environment_sha256,
     }
-    require(len(payload["gpu_names"]) == 2, "LIBERO serving runtime must expose exactly two GPUs")
-    require(all(payload["gpu_uuids"]), "LIBERO serving runtime could not identify both GPU UUIDs")
+    require(
+        len(payload["gpu_names"]) == serving_tensor_parallel_size,
+        "LIBERO serving runtime GPU count differs from the serving topology",
+    )
+    require(torch.version.cuda == expected_cuda_runtime, "LIBERO serving CUDA runtime differs from topology pin")
+    require(all(payload["gpu_uuids"]), "LIBERO serving runtime could not identify every GPU UUID")
     return payload, _canonical_sha256(payload)
 
 
@@ -523,6 +620,8 @@ def latency_runtime_identity(serving_runtime: dict[str, Any]) -> tuple[dict[str,
         "platform",
         "schema",
         "sdpa_backends",
+        "serving_execution_geometry",
+        "training_execution_geometry",
         "training_execution_environment_sha256",
     }
     require(set(serving_runtime) == expected, "serving runtime fields changed before latency identity derivation")
@@ -530,7 +629,13 @@ def latency_runtime_identity(serving_runtime: dict[str, Any]) -> tuple[dict[str,
     identity = {
         name: value
         for name, value in serving_runtime.items()
-        if name not in {"schema", "training_execution_environment_sha256"}
+        if name
+        not in {
+            "execution_geometry",
+            "schema",
+            "training_execution_environment_sha256",
+            "training_execution_geometry",
+        }
     }
     identity["schema"] = "duovla-libero-latency-runtime-v2"
     return identity, _canonical_sha256(identity)
@@ -580,6 +685,8 @@ def model_snapshot_preflight() -> dict[str, Any]:
 
 
 def _execution_geometry_from_config(config: dict[str, Any]) -> dict[str, str | int]:
+    """Recover and validate training geometry without substituting serving B8."""
+
     model = config.get("model")
     optimization = config.get("optimization")
     benchmark = config.get("benchmark")
@@ -595,29 +702,126 @@ def _execution_geometry_from_config(config: dict[str, Any]) -> dict[str, str | i
     )
     fixed_width = benchmark.get("fixed_physical_prefix_width")
     require(type(fixed_width) is int and fixed_width > 0, "resolved fixed physical prefix width is invalid")
-    expected = {
-        "experts_implementation": EXPERTS_IMPLEMENTATION,
-        "expert_batch_isolation": EXPERT_BATCH_ISOLATION,
-        "physical_batch_size": PHYSICAL_BATCH_SIZE,
-        "fixed_physical_prefix_width": fixed_width,
-        "prefix_geometry_content_sha256": content_sha256,
-    }
-    observed = {
-        "experts_implementation": model.get("experts_implementation"),
-        "expert_batch_isolation": model.get("expert_batch_isolation"),
-        "physical_batch_size": optimization.get("physical_batch_size"),
-        "fixed_physical_prefix_width": fixed_width,
-        "prefix_geometry_content_sha256": content_sha256,
-    }
-    mismatches = {
-        name: {"expected": value, "observed": observed[name]}
-        for name, value in expected.items()
-        if observed[name] != value
-    }
-    require(not mismatches, f"resolved fixed-batch execution geometry differs: {mismatches}")
-    require(optimization.get("microbatch_size") == PHYSICAL_BATCH_SIZE, "resolved microbatch size must be 8")
-    require(optimization.get("gradient_accumulation_steps") == 8, "resolved accumulation steps must be 8")
+    training_batch_size = optimization.get("physical_batch_size")
+    require(
+        type(training_batch_size) is int and training_batch_size in SUPPORTED_TRAINING_PHYSICAL_BATCH_SIZES,
+        "resolved training physical batch is unsupported",
+    )
+    expert_batch_isolation = model.get("expert_batch_isolation")
+    require(
+        expert_batch_isolation in SUPPORTED_EXPERT_BATCH_ISOLATIONS,
+        "resolved expert batch isolation is unsupported",
+    )
+    require(model.get("experts_implementation") == EXPERTS_IMPLEMENTATION, "resolved experts implementation differs")
+    serving_batch_size = optimization.get("serving_batch_size", PHYSICAL_BATCH_SIZE)
+    extended_training_geometry = (
+        training_batch_size != PHYSICAL_BATCH_SIZE or expert_batch_isolation != EXPERT_BATCH_ISOLATION
+    )
+    require(
+        not extended_training_geometry or "serving_batch_size" in optimization,
+        "noncanonical training geometry must explicitly configure serving batch eight",
+    )
+    require(
+        type(serving_batch_size) is int and serving_batch_size == PHYSICAL_BATCH_SIZE,
+        "resolved serving batch size must be eight",
+    )
+    require(
+        optimization.get("microbatch_size") == training_batch_size,
+        "resolved microbatch size must equal training physical batch",
+    )
     require(optimization.get("global_batch_size") == 64, "resolved global batch size must be 64")
+    distributed = config.get("distributed")
+    data_parallel_size = 1
+    if distributed is not None:
+        require(isinstance(distributed, dict), "resolved distributed section must be a table")
+        expected_distributed = {
+            "canonical_plan_partition": "contiguous-b8-chunks-by-rank",
+            "data_parallel_size": 2,
+            "gradient_reduction": "sum_globally_normalized_sse_gradients",
+            "rank_physical_batch_size": 32,
+            "strategy": "data_parallel",
+            "tensor_parallel_size": 1,
+            "world_size": 2,
+        }
+        require(distributed == expected_distributed, "resolved DP2 training topology differs")
+        require(training_batch_size == distributed["rank_physical_batch_size"], "resolved DP2 rank batch differs")
+        data_parallel_size = int(distributed["data_parallel_size"])
+        require(
+            config.get("serving")
+            == {
+                "checkpoint_artifact_layout": "consolidated-tp1-trainables",
+                "hardware_identity_scope": "serving-runtime-attestation",
+                "physical_batch_size": 8,
+                "strategy": "single_gpu",
+                "tensor_parallel_size": 1,
+                "training_gpu_identity_reuse_required": False,
+                "world_size": 1,
+            },
+            "resolved DP2 serving topology differs",
+        )
+    require(
+        optimization.get("gradient_accumulation_steps") == 64 // (training_batch_size * data_parallel_size),
+        "resolved accumulation does not match training physical batch",
+    )
+
+    expected: dict[str, str | int] = {
+        "experts_implementation": str(model["experts_implementation"]),
+        "expert_batch_isolation": str(expert_batch_isolation),
+        "physical_batch_size": int(training_batch_size),
+        "fixed_physical_prefix_width": fixed_width,
+        "prefix_geometry_content_sha256": content_sha256,
+    }
+    declared_geometry = config.get("execution_geometry")
+    require(
+        not extended_training_geometry or isinstance(declared_geometry, dict),
+        "noncanonical training config has no authenticated execution geometry",
+    )
+    include_serving_batch = "serving_batch_size" in optimization or (
+        isinstance(declared_geometry, dict) and "serving_batch_size" in declared_geometry
+    )
+    if include_serving_batch:
+        expected["serving_batch_size"] = int(serving_batch_size)
+    tensor_parallel_size = model.get("tensor_parallel_size")
+    execution_profile = config.get("execution_profile")
+    require(tensor_parallel_size in {1, 2}, "resolved tensor parallel size must be one or two")
+    if execution_profile is None:
+        require(tensor_parallel_size == 2, "legacy execution geometry is restricted to tensor parallel size two")
+        require(
+            not extended_training_geometry,
+            "legacy TP=2 execution geometry is restricted to sequential-v1 training batch eight",
+        )
+    else:
+        expected_profile = expected_training_execution_profile(
+            tensor_parallel_size=int(tensor_parallel_size),
+            expert_batch_isolation=str(expert_batch_isolation),
+            physical_batch_size=int(training_batch_size),
+            serving_batch_size=int(serving_batch_size),
+            strategy=None if distributed is None else str(distributed["strategy"]),
+            world_size=None if distributed is None else int(distributed["world_size"]),
+            data_parallel_size=data_parallel_size,
+            rank_physical_batch_size=(None if distributed is None else int(distributed["rank_physical_batch_size"])),
+        )
+        require(execution_profile == expected_profile, "execution profile differs from tensor topology")
+        expected.update(
+            execution_profile=str(execution_profile),
+            tensor_parallel_size=int(tensor_parallel_size),
+        )
+        if distributed is not None:
+            expected.update(
+                strategy=str(distributed["strategy"]),
+                world_size=int(distributed["world_size"]),
+                data_parallel_size=int(distributed["data_parallel_size"]),
+                rank_physical_batch_size=int(distributed["rank_physical_batch_size"]),
+                canonical_plan_partition=str(distributed["canonical_plan_partition"]),
+                gradient_reduction=str(distributed["gradient_reduction"]),
+            )
+    if expert_batch_isolation == "sample_isolated_grouped_mm_v2":
+        kernel_path = Path(__file__).resolve().parents[1] / "src/duo_vla/backbones/shared_weight_grouped_mm_triton.py"
+        require(kernel_path.is_file(), "shared-weight grouped-MM kernel source is missing")
+        expected["shared_weight_kernel_sha256"] = sha256_file(kernel_path)
+    if declared_geometry is not None:
+        require(isinstance(declared_geometry, dict), "resolved execution geometry is not a table")
+        require(declared_geometry == expected, "resolved execution geometry differs from its training tables")
     require(
         benchmark.get("camera_order") == list(LIBERO_PREFIX_CAMERA_NAMES),
         "resolved LIBERO camera order differs from the prefix contract",
@@ -631,6 +835,7 @@ def _authenticated_training_environment(
     *,
     project_root: Path,
     train_seed: int,
+    training_execution_geometry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Require a checkpoint produced under the strict deterministic trainer contract."""
 
@@ -684,18 +889,60 @@ def _authenticated_training_environment(
         "training environment contains unpinned NCCL overrides",
     )
     expected_venv = authenticated_runtime.get("train_venv")
+    model = resolved_config.get("model")
+    require(isinstance(model, dict), "resolved config has no model table")
+    tensor_parallel_size = model.get("tensor_parallel_size")
+    require(tensor_parallel_size in {1, 2}, "resolved tensor-parallel size is invalid")
+    distributed = resolved_config.get("distributed")
+    data_parallel = isinstance(distributed, dict) and distributed.get("strategy") == "data_parallel"
+    if data_parallel:
+        require(
+            distributed.get("world_size") == 2
+            and distributed.get("data_parallel_size") == 2
+            and distributed.get("tensor_parallel_size") == 1,
+            "resolved DP2 training topology is invalid",
+        )
+    training_world_size = int(distributed["world_size"]) if data_parallel else int(tensor_parallel_size)
+    gpu_uuids = environment.get("gpu_uuids")
+    gpu_total_memory_bytes = environment.get("gpu_total_memory_bytes")
+    hardware_identity_required = training_execution_geometry is not None and (
+        training_execution_geometry.get("physical_batch_size") != PHYSICAL_BATCH_SIZE
+        or training_execution_geometry.get("expert_batch_isolation") != EXPERT_BATCH_ISOLATION
+    )
+    if hardware_identity_required or gpu_uuids is not None or gpu_total_memory_bytes is not None:
+        require(
+            isinstance(gpu_uuids, list)
+            and len(gpu_uuids) == training_world_size
+            and all(isinstance(value, str) and value for value in gpu_uuids),
+            "checkpoint training GPU UUID inventory is invalid",
+        )
+        require(
+            isinstance(gpu_total_memory_bytes, list)
+            and len(gpu_total_memory_bytes) == training_world_size
+            and all(type(value) is int and value > 0 for value in gpu_total_memory_bytes),
+            "checkpoint training GPU memory inventory is invalid",
+        )
+    _, _, _, _, environment_name = _train_runtime_pins(tensor_parallel_size)
     train_venv = Path(os.environ.get("DUO_VLA_TRAIN_VENV", ""))
     require(train_venv.is_absolute(), "serving process has no canonical train-venv path")
     require(
-        train_venv.resolve() == (Path(os.environ["DUO_VLA_CACHE_ROOT"]) / "venvs/train").resolve(),
+        train_venv.resolve() == (Path(os.environ["DUO_VLA_CACHE_ROOT"]) / f"venvs/{environment_name}").resolve(),
         "serving train-venv path differs from the cache-root contract",
     )
     live_venv = content_address_train_venv(train_venv)
     require_matching_train_venv(expected_venv, live_venv)
     expected_environment = authenticated_runtime.get("environment")
     require(isinstance(expected_environment, dict), "training environment has no static process environment")
+    visible_devices = expected_environment.get("CUDA_VISIBLE_DEVICES")
+    if data_parallel:
+        require(visible_devices == "0,1", "DP2 checkpoint did not select the sealed physical GPUs")
+    elif tensor_parallel_size == 1:
+        require(visible_devices in {"0", "1"}, "single-GPU checkpoint selected an unsupported physical GPU")
+    else:
+        require(visible_devices == "0,1", "TP=2 checkpoint selected an unsupported GPU topology")
     expected_training_environment = {
         **REQUIRED_SERVING_ENVIRONMENT,
+        "CUDA_VISIBLE_DEVICES": visible_devices,
         "DUO_VLA_CACHE_ROOT": str(Path(os.environ["DUO_VLA_CACHE_ROOT"]).resolve()),
         "DUO_VLA_PROJECT_ROOT": str(project_root.resolve()),
         "DUO_VLA_TRAIN_VENV": str(train_venv.resolve()),
@@ -720,9 +967,9 @@ def _authenticated_training_environment(
         == {
             "group_world_size": 1,
             "local_rank_equals_rank": True,
-            "local_world_size": 2,
-            "role_world_size": 2,
-            "world_size": 2,
+            "local_world_size": training_world_size,
+            "role_world_size": training_world_size,
+            "world_size": training_world_size,
         },
         "checkpoint training torchrun topology differs",
     )
@@ -746,9 +993,18 @@ def resolve_checkpoint(
 ]:
     from duo_vla.checkpointing import load_checkpoint_manifest
     from duo_vla.data.libero_stats import load_libero_normalizers
+    from duo_vla.dp2_fork import (
+        dp2_semantic_recipe_sha256,
+        has_dp2_checkpoint_lineage,
+        validate_dp2_checkpoint_lineage,
+    )
     from duo_vla.policy_contract import validate_manifest_policy_contract
     from duo_vla.prefix_geometry import CameraGeometry, SnapshotTreeIdentity, load_prefix_geometry_contract
     from duo_vla.run_config import canonical_config_sha256, load_verified_resolved_config
+    from duo_vla.topology_fork import (
+        has_topology_fork_lineage,
+        validate_topology_checkpoint_lineage,
+    )
 
     checkpoint_dir = checkpoint_dir.resolve()
     manifest = load_checkpoint_manifest(checkpoint_dir, verify_hashes=True)
@@ -851,6 +1107,28 @@ def resolve_checkpoint(
         not manifest_geometry_mismatches,
         f"checkpoint fixed-batch execution geometry differs: {manifest_geometry_mismatches}",
     )
+    if has_topology_fork_lineage(manifest):
+        _, topology_lineage = validate_topology_checkpoint_lineage(manifest)
+        require(
+            dp2_semantic_recipe_sha256(resolved_config) == topology_lineage["semantic_recipe_sha256"],
+            "checkpoint semantic recipe differs from its authenticated topology fork lineage",
+        )
+    elif execution_geometry.get("strategy") == "data_parallel":
+        _, fork_lineage = validate_dp2_checkpoint_lineage(manifest)
+        require(
+            dp2_semantic_recipe_sha256(resolved_config) == fork_lineage["semantic_recipe_sha256"],
+            "DP2 checkpoint semantic recipe differs from its authenticated fork lineage",
+        )
+    else:
+        require(
+            not has_dp2_checkpoint_lineage(manifest),
+            "non-DP checkpoint unexpectedly carries DP2 fork lineage",
+        )
+    if "execution_geometry" in resolved_config or "execution_geometry" in manifest:
+        require(
+            manifest.get("execution_geometry") == execution_geometry,
+            "checkpoint nested training execution geometry differs from the resolved config",
+        )
 
     prefix_artifact = manifest.get("artifacts", {}).get("prefix_geometry")
     require(
@@ -908,6 +1186,7 @@ def resolve_checkpoint(
         manifest,
         project_root=Path(__file__).resolve().parents[1],
         train_seed=train_seed,
+        training_execution_geometry=execution_geometry,
     )
     checkpoint_report = {
         **expected_dataset_identity,
@@ -952,12 +1231,19 @@ def train_runtime_preflight(
     dict[str, Any],
 ]:
     require(sys.version_info[:2] == (3, 11), f"policy server requires Python 3.11, found {sys.version.split()[0]}")
-    package_versions = {name: importlib.metadata.version(name) for name in EXPECTED_TRAIN_PACKAGES}
-    require(package_versions == EXPECTED_TRAIN_PACKAGES, f"train package pin mismatch: {package_versions}")
-    lock_path = project_root / "uv.lock"
+    world_size = canonical_visible_cuda_world_size(os.environ)
+    relative_lock_path, expected_lock_sha256, expected_packages, expected_cuda_runtime, _ = _train_runtime_pins(
+        world_size
+    )
+    package_versions = {name: importlib.metadata.version(name) for name in expected_packages}
+    require(package_versions == expected_packages, f"train package pin mismatch: {package_versions}")
+    lock_path = project_root / relative_lock_path
     require(lock_path.is_file(), f"missing train lockfile: {lock_path}")
     lock_sha256 = sha256_file(lock_path)
-    require(lock_sha256 == TRAIN_LOCK_SHA256, f"train lockfile SHA-256 mismatch: {lock_sha256}")
+    require(lock_sha256 == expected_lock_sha256, f"train lockfile SHA-256 mismatch: {lock_sha256}")
+    import torch
+
+    require(torch.version.cuda == expected_cuda_runtime, "train CUDA runtime mismatch")
     snapshot_report = model_snapshot_preflight()
     (
         manifest,
@@ -977,6 +1263,7 @@ def train_runtime_preflight(
         "checkpoint": checkpoint_report,
         "dataset": {"id": DATASET_ID, "revision": DATASET_REVISION},
         "execution_geometry": checkpoint_report["execution_geometry"],
+        "lock_path": relative_lock_path.as_posix(),
         "lock_sha256": lock_sha256,
         "model": snapshot_report,
         "normalization_content_sha256": NORMALIZATION_SHA256,
@@ -1021,12 +1308,21 @@ def _health_payload(
             )
         else:
             require(value is None, f"fake policy cannot claim {name}")
+    training_geometry = None
+    serving_geometry = None
+    if mode == "real":
+        require(isinstance(checkpoint_report, dict), "real policy has no checkpoint report")
+        training_geometry = validate_execution_geometry(checkpoint_report.get("execution_geometry"))
+        serving_geometry = serving_execution_geometry(training_geometry)
     return {
         "action_dim": ACTION_DIM,
         "action_horizon": ACTION_HORIZON,
         "checkpoint": checkpoint_report,
         "dataset_revision": DATASET_REVISION,
-        "execution_geometry": checkpoint_report["execution_geometry"] if mode == "real" else None,
+        # Keep execution_geometry as the compatibility alias for authenticated
+        # checkpoint training geometry.  The two explicit fields prevent a B8
+        # serving replica batch from being mistaken for the training batch.
+        "execution_geometry": training_geometry,
         "latency_runtime_sha256": latency_runtime_sha256,
         "mode": mode,
         "model_revision": MODEL_REVISION if mode == "real" else None,
@@ -1035,7 +1331,9 @@ def _health_payload(
         "protocol": PROTOCOL,
         "state_dim": STATE_DIM,
         "serving_runtime_sha256": serving_runtime_sha256,
+        "serving_execution_geometry": serving_geometry,
         "train_seed": train_seed,
+        "training_execution_geometry": training_geometry,
         **wire_contract,
     }
 
@@ -1099,6 +1397,26 @@ class FakePolicy:
         }
 
 
+def _expert_backend_functions(expert_batch_isolation: str) -> tuple[Any, Any]:
+    """Resolve the checkpoint-selected isolation backend without silent fallback."""
+
+    if expert_batch_isolation == "sample_isolated_grouped_mm_v1":
+        from duo_vla.backbones.sample_isolated_experts import (
+            install_sample_isolated_grouped_mm_experts,
+            verify_sample_isolated_grouped_mm_experts,
+        )
+
+        return install_sample_isolated_grouped_mm_experts, verify_sample_isolated_grouped_mm_experts
+    if expert_batch_isolation == "sample_isolated_grouped_mm_v2":
+        from duo_vla.backbones.sample_isolated_experts_v2 import (
+            install_sample_isolated_grouped_mm_experts_v2,
+            verify_sample_isolated_grouped_mm_experts_v2,
+        )
+
+        return install_sample_isolated_grouped_mm_experts_v2, verify_sample_isolated_grouped_mm_experts_v2
+    raise RuntimeError(f"unsupported checkpoint expert batch isolation: {expert_batch_isolation!r}")
+
+
 class RealPolicy:
     """TP-sharded DiffusionGemma plus the trained Duo-VLA action interface."""
 
@@ -1122,10 +1440,6 @@ class RealPolicy:
             encode_diffusion_gemma_prefix,
         )
         from duo_vla.backbones.loading import DEFAULT_DIFFUSION_GEMMA_SPEC, load_diffusion_gemma_bf16_tp
-        from duo_vla.backbones.sample_isolated_experts import (
-            install_sample_isolated_grouped_mm_experts,
-            verify_sample_isolated_grouped_mm_experts,
-        )
         from duo_vla.checkpointing import load_interface_state_dict, load_lora_checkpoint
         from duo_vla.config import ActionInterfaceConfig
         from duo_vla.data.libero_stats import load_libero_normalizers
@@ -1140,7 +1454,9 @@ class RealPolicy:
         self.apply_fixed_prefix_chat_template = apply_fixed_prefix_chat_template
         self.device = device
         self.policy_contract = policy_contract
-        self.execution_geometry = _execution_geometry_from_config(resolved_config)
+        self.training_execution_geometry = _execution_geometry_from_config(resolved_config)
+        self.serving_execution_geometry = serving_execution_geometry(self.training_execution_geometry)
+        self.execution_geometry = self.training_execution_geometry
         self.prefix_geometry = prefix_geometry
         self.prefix_valid_lengths = {
             record["instruction"]: int(record["valid_prefix_length"])
@@ -1151,12 +1467,18 @@ class RealPolicy:
             revision=DEFAULT_DIFFUSION_GEMMA_SPEC.revision,
             local_files_only=True,
         )
-        self.model = load_diffusion_gemma_bf16_tp(local_files_only=True, tp_size=2)
-        install_sample_isolated_grouped_mm_experts(
+        self.model = load_diffusion_gemma_bf16_tp(
+            local_files_only=True,
+            tp_size=int(resolved_config["model"]["tensor_parallel_size"]),
+        )
+        install_experts, verify_experts = _expert_backend_functions(
+            str(self.training_execution_geometry["expert_batch_isolation"])
+        )
+        install_experts(
             self.model,
             physical_batch_size=PHYSICAL_BATCH_SIZE,
         )
-        verify_sample_isolated_grouped_mm_experts(
+        verify_experts(
             self.model,
             physical_batch_size=PHYSICAL_BATCH_SIZE,
         )
@@ -1168,7 +1490,7 @@ class RealPolicy:
             validate_decoder_contract=True,
             expected_rank=int(resolved_config["lora"]["rank"]),
         )
-        verify_sample_isolated_grouped_mm_experts(
+        verify_experts(
             self.model,
             physical_batch_size=PHYSICAL_BATCH_SIZE,
         )
@@ -1395,7 +1717,11 @@ def run_distributed_server(
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     dist.init_process_group("nccl", device_id=device)
-    require(dist.get_world_size() == 2, "real LIBERO policy serving requires TP world size 2")
+    expected_world_size = int(resolved_config["model"]["tensor_parallel_size"])
+    require(
+        dist.get_world_size() == expected_world_size,
+        "real LIBERO policy serving world size differs from the checkpoint topology",
+    )
     rank = dist.get_rank()
     try:
         runtime_hashes: list[str | None] = [None] * dist.get_world_size()
@@ -1470,6 +1796,8 @@ def run_distributed_server(
                             "nfe": policy_contract["nfe"],
                             "objective": policy_contract["objective"],
                             **checkpoint_report["execution_geometry"],
+                            "serving_execution_geometry": policy.serving_execution_geometry,
+                            "training_execution_geometry": policy.training_execution_geometry,
                             "latency_runtime_sha256": latency_runtime_sha256,
                             "sampler": policy_contract["sampler"],
                             "serving_runtime": serving_runtime,

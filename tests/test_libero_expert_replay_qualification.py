@@ -27,8 +27,48 @@ SPEC.loader.exec_module(QUALIFY)
 
 def test_authenticated_shared_contract_matches_qualification_contract() -> None:
     assert SHARED_CONTRACT.source_identity(ROOT) == QUALIFY.source_identity(ROOT)
+    assert SHARED_CONTRACT.source_identity(ROOT, single_gpu=True) == QUALIFY.source_identity(ROOT, single_gpu=True)
     assert SHARED_CONTRACT.canonical_gate_results() == QUALIFY.canonical_gate_results()
     assert inspect.signature(SHARED_CONTRACT.build_expected_inputs) == inspect.signature(QUALIFY.build_expected_inputs)
+
+
+def test_expected_inputs_select_single_gpu_source_from_train_venv(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed_profiles: list[bool] = []
+    source = {
+        "config_file_sha256": {"direct_regression": _sha("direct"), "rectified_flow": _sha("flow")},
+        "project_source_tree_sha256": _sha("tree"),
+        "source_files_sha256": {"qualification": _sha("qualification")},
+    }
+    monkeypatch.setattr(QUALIFY, "_task_identities", lambda _value: [])
+    monkeypatch.setattr(QUALIFY, "_validate_dataset_tree", lambda _value: None)
+    monkeypatch.setattr(QUALIFY, "_validate_normalization", lambda _value: None)
+    monkeypatch.setattr(QUALIFY, "_validate_dataset_snapshot_report", lambda _value: None)
+    monkeypatch.setattr(QUALIFY, "_validate_train_venv_identity", lambda value: value)
+    monkeypatch.setattr(QUALIFY, "validate_original_hdf5_inventory", lambda _value: ((), _sha("inventory")))
+    monkeypatch.setattr(QUALIFY, "canonical_sha256", lambda _value: _sha("semantic"))
+    monkeypatch.setattr(QUALIFY, "simulator_runtime_sha256", lambda _value: _sha("runtime"))
+
+    def record_source_identity(_root: Path, *, single_gpu: bool = False) -> dict[str, Any]:
+        observed_profiles.append(single_gpu)
+        return source
+
+    monkeypatch.setattr(QUALIFY, "source_identity", record_source_identity)
+    result = QUALIFY.build_expected_inputs(
+        ROOT,
+        simulator_attestation={},
+        simulator_attestation_raw_sha256=_sha("attestation-raw"),
+        dataset_tree={},
+        dataset_tree_raw_sha256=QUALIFY.DATASET_TREE_METADATA_SHA256,
+        normalization={},
+        normalization_raw_sha256=QUALIFY.NORMALIZATION_RAW_SHA256,
+        dataset_snapshot={},
+        train_venv_identity={"root": "/cache/venvs/train-single-gpu"},
+        original_hdf5_inventory={"content_sha256": QUALIFY.ORIGINAL_HDF5_CONTENT_SHA256},
+        original_hdf5_inventory_raw_sha256=_sha("inventory-raw"),
+    )
+
+    assert observed_profiles == [True]
+    assert result["config_file_sha256"] == source["config_file_sha256"]
 
 
 def _sha(label: str) -> str:
@@ -342,6 +382,9 @@ def _valid_bundle(
     binding_dir.mkdir()
     inventory = json.loads((ROOT / "configs/libero_original_hdf5_inventory.json").read_text(encoding="utf-8"))
     inventory_by_task = {(item["suite"], item["task_id"]): item for item in inventory["files"]}
+    alignment, training_source_indices, alignment_raw_sha256 = SHARED_CONTRACT.load_source_parquet_alignment(
+        ROOT / "configs/libero_source_parquet_alignment.json"
+    )
 
     def write_json(relative: str, value: dict[str, Any]) -> dict[str, Any]:
         path = evidence_root / relative
@@ -358,6 +401,7 @@ def _valid_bundle(
         suite = task["suite"]
         task_id = task["task_id"]
         slug = QUALIFY.task_slug(suite, task_id)
+        source_episode_index = min(training_source_indices[(suite, task_id)])
         action_sha256 = _sha(f"actions:{slug}")
         initial_sha256 = _sha(f"initial:{slug}")
         observation_sha256 = _sha(f"observations:{slug}")
@@ -366,10 +410,27 @@ def _valid_bundle(
                 "action_sequence_sha256": action_sha256,
                 "initial_state_sha256": initial_sha256,
                 "observation_sequence_sha256": observation_sha256,
-                "source_episode_index": 0,
+                "source_episode_index": source_episode_index,
                 "suite": suite,
                 "task_id": task_id,
             }
+        )
+        alignment_width = SHARED_CONTRACT.OBSERVATION_ALIGNMENT_GRID_SIZE**2 * 3
+        alignment_features = {
+            "frames": [
+                {
+                    "agentview_block_means": list(range(alignment_width)),
+                    "state": [0.01 * frame_index] * SHARED_CONTRACT.STATE_DIM,
+                    "wrist_block_means": list(reversed(range(alignment_width))),
+                }
+                for frame_index in range(10)
+            ],
+            "grid_size": SHARED_CONTRACT.OBSERVATION_ALIGNMENT_GRID_SIZE,
+            "schema": SHARED_CONTRACT.OBSERVATION_ALIGNMENT_FEATURE_SCHEMA,
+        }
+        alignment_metrics = SHARED_CONTRACT.observation_alignment_metrics(
+            alignment_features,
+            alignment_features["frames"],
         )
         selected = {
             "action_sequence_sha256": action_sha256,
@@ -381,39 +442,51 @@ def _valid_bundle(
             },
             "initial_state_sha256": initial_sha256,
             "inverted_gripper_action_sequence_sha256": _sha(f"inverted:{slug}"),
+            "observation_alignment_features": alignment_features,
             "observation_sequence_sha256": observation_sha256,
-            "source_episode_index": 0,
+            "source_episode_index": source_episode_index,
             "step_count": 10,
             "success": True,
             "swapped_observation_sequence_sha256": _sha(f"swapped:{slug}"),
             "trajectory_sha256": trajectory_sha256,
             "zero_action_sequence_sha256": _sha(f"zero:{slug}"),
         }
-        attempt = {
-            "action_sequence_sha256": action_sha256,
-            "source_episode_index": 0,
-            "step_count": 10,
-            "success": True,
-        }
+        attempts = [
+            {
+                "action_sequence_sha256": (
+                    action_sha256 if index == source_episode_index else _sha(f"actions:{slug}:{index}")
+                ),
+                "source_episode_index": index,
+                "step_count": 10,
+                "success": index == source_episode_index,
+                "training_linked": index in training_source_indices[(suite, task_id)],
+            }
+            for index in range(source_episode_index + 1)
+        ]
         controls = {name: {"mutation_detected": True} for name in QUALIFY.PRE_DISPATCH_MUTATIONS}
         source_scan = {
             "demonstrations": [
                 {
-                    "action_sequence_sha256": action_sha256,
-                    "initial_state_sha256": initial_sha256,
+                    "action_sequence_sha256": (
+                        action_sha256 if index == source_episode_index else _sha(f"actions:{slug}:{index}")
+                    ),
+                    "initial_state_sha256": (
+                        initial_sha256 if index == source_episode_index else _sha(f"initial:{slug}:{index}")
+                    ),
                     "raw_transition_count": 10,
                     "retained_transition_count": 10,
                     "source_action_dtype": "<f8",
-                    "source_episode_index": 0,
-                    "source_state_sequence_sha256": _sha(f"source-states:{slug}"),
+                    "source_episode_index": index,
+                    "source_state_sequence_sha256": _sha(f"source-states:{slug}:{index}"),
                 }
+                for index in range(source_episode_index + 1)
             ],
             "gripper_counts": {"-1": 5, "1": 5},
-            "raw_transition_count": 10,
-            "retained_transition_count": 10,
+            "raw_transition_count": (source_episode_index + 1) * 10,
+            "retained_transition_count": (source_episode_index + 1) * 10,
         }
         simulator_task = {
-            "attempts": [attempt],
+            "attempts": attempts,
             "collector_source_sha256": expected["source_files_sha256"]["expert_replay_collector"],
             "pre_dispatch_integrity_controls": controls,
             "reset_determinism": {
@@ -445,8 +518,8 @@ def _valid_bundle(
             {
                 "gripper_counts": source_scan["gripper_counts"],
                 "path": inventory_by_task[(suite, task_id)]["path"],
-                "raw_transition_count": 10,
-                "retained_transition_count": 10,
+                "raw_transition_count": source_scan["raw_transition_count"],
+                "retained_transition_count": source_scan["retained_transition_count"],
                 "suite": suite,
                 "task_id": task_id,
             }
@@ -454,14 +527,16 @@ def _valid_bundle(
 
         parquet_task = {
             "action_sequence_sha256": action_sha256,
+            "dataset_observation_sequence_sha256": _sha(f"dataset-observations:{slug}"),
             "dataset_episode_index": dataset_task_index,
             "dataset_global_start": dataset_task_index * 10,
             "dataset_global_stop": dataset_task_index * 10 + 10,
             "dataset_task_index": dataset_task_index,
             "instruction": task["instruction"],
+            "observation_alignment_metrics": alignment_metrics,
             "observation_sequence_sha256": observation_sha256,
             "schema": QUALIFY.PARQUET_TASK_SCHEMA,
-            "source_episode_index": 0,
+            "source_episode_index": source_episode_index,
             "step_count": 10,
             "suite": suite,
             "task_id": task_id,
@@ -475,13 +550,13 @@ def _valid_bundle(
         demonstrations.append(
             {
                 "action_sequence_sha256": action_sha256,
-                "demonstration_id": f"{slug}-source-0000",
+                "demonstration_id": f"{slug}-source-{source_episode_index:04d}",
                 "initial_state_sha256": initial_sha256,
                 "instruction": task["instruction"],
                 "observation_sequence_sha256": observation_sha256,
                 "raw_evidence_ids": sorted([parquet_id, simulator_id]),
                 "regenerated": True,
-                "source_episode_index": 0,
+                "source_episode_index": source_episode_index,
                 "step_count": 10,
                 "success": True,
                 "suite": suite,
@@ -495,6 +570,8 @@ def _valid_bundle(
         "collector": {
             "path": "scripts/collect_libero_expert_replay.py",
             "sha256": expected["source_files_sha256"]["expert_replay_collector"],
+            "source_parquet_alignment_content_sha256": alignment["content_sha256"],
+            "source_parquet_alignment_raw_sha256": alignment_raw_sha256,
             "shared_contract_sha256": expected["source_files_sha256"]["expert_replay_contract"],
         },
         "inputs": {
@@ -859,12 +936,18 @@ def test_report_rejects_validator_startup_flag_mutation(
 
 
 def test_qualification_launcher_is_closed() -> None:
-    launcher = (ROOT / "scripts/run_qualify_libero_expert_replay.sh").read_text(encoding="utf-8")
-    assert launcher.startswith("#!/bin/bash -p\nset -euo pipefail\n")
-    assert 'export PATH="/usr/bin:/bin"' in launcher
-    assert "exec /usr/bin/env -i" in launcher
-    assert "PYTHONPATH" not in launcher
-    assert '"PYTHONSAFEPATH=1"' in launcher
-    assert '"PYTHONDONTWRITEBYTECODE=1"' in launcher
-    assert " -P -B -X pycache_prefix=/dev/null " in launcher
-    assert os.access(ROOT / "scripts/run_qualify_libero_expert_replay.sh", os.X_OK)
+    for name in (
+        "run_qualify_libero_expert_replay.sh",
+        "run_qualify_libero_expert_replay_single_gpu.sh",
+    ):
+        launcher = (ROOT / "scripts" / name).read_text(encoding="utf-8")
+        assert launcher.startswith("#!/bin/bash -p\nset -euo pipefail\n")
+        assert 'export PATH="/usr/bin:/bin"' in launcher
+        assert "exec /usr/bin/env -i" in launcher
+        assert "PYTHONPATH" not in launcher
+        assert '"PYTHONSAFEPATH=1"' in launcher
+        assert '"PYTHONDONTWRITEBYTECODE=1"' in launcher
+        assert " -P -B -X pycache_prefix=/dev/null " in launcher
+        assert os.access(ROOT / "scripts" / name, os.X_OK)
+    single_gpu = (ROOT / "scripts/run_qualify_libero_expert_replay_single_gpu.sh").read_text(encoding="utf-8")
+    assert "--train-venv-profile single-gpu-tp1" in single_gpu

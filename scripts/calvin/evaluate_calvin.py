@@ -234,6 +234,7 @@ MAX_ACTIONS_PER_SUBTASK = 360
 CONTROL_FREQUENCY_HZ = 30
 VALIDATION_SCENE = "calvin_scene_D"
 PREREGISTRATION_SCHEMA = "duovla-calvin-official-preregistration-v8"
+SINGLE_GPU_PREREGISTRATION_SCHEMA = "duovla-calvin-official-preregistration-single-gpu-tp1-v1"
 RUN_SCHEMA = "duovla-calvin-official-run-v5"
 EPISODE_SCHEMA = "duovla-calvin-official-sequence-v1"
 SUMMARY_SCHEMA = "duovla-calvin-official-summary-v2"
@@ -347,6 +348,7 @@ _EXECUTION_GEOMETRY_FIELDS = {
     "physical_batch_size",
     "prefix_geometry_content_sha256",
 }
+_EXECUTION_TOPOLOGY_FIELDS = {"execution_profile", "tensor_parallel_size"}
 _CALVIN_IDENTITY_FIELDS = {
     "archive_bytes",
     "archive_sha256",
@@ -415,7 +417,50 @@ def _require_sha256(value: Any, name: str) -> None:
 
 def _validate_execution_geometry(value: Any, name: str) -> Dict[str, Any]:
     require(isinstance(value, Mapping), f"{name} must be an object")
-    _require_exact_keys(value, _EXECUTION_GEOMETRY_FIELDS, name)
+    if value.get("expert_batch_isolation") == "sample_isolated_grouped_mm_v2":
+        expected_fields = (
+            _EXECUTION_GEOMETRY_FIELDS
+            | _EXECUTION_TOPOLOGY_FIELDS
+            | {
+                "serving_batch_size",
+                "data_parallel_size",
+                "global_batch_size",
+            }
+        )
+        require(set(value) == expected_fields, "optimized execution geometry fields differ")
+        require(value["experts_implementation"] == "grouped_mm", "optimized expert backend mismatch")
+        for key in (
+            "physical_batch_size",
+            "serving_batch_size",
+            "data_parallel_size",
+            "global_batch_size",
+            "tensor_parallel_size",
+            "fixed_physical_prefix_width",
+        ):
+            require(type(value[key]) is int, "optimized geometry sizes must be plain integers")
+        batch, dp = value["physical_batch_size"], value["data_parallel_size"]
+        require(batch in (8, 16, 32, 64) and dp in (1, 2), "optimized training batch/DP size differs")
+        require(
+            value["serving_batch_size"] == 8
+            and value["global_batch_size"] == 64
+            and value["tensor_parallel_size"] == 1,
+            "optimized serving requires TP1/B8, training global B64",
+        )
+        require(dp != 2 or batch == 32, "optimized DP2 requires rank B32")
+        expected_profile = (
+            "duovla-calvin-dp2-tp1-fused-v2-train-b32-serve-b8-v1"
+            if dp == 2
+            else f"duovla-calvin-tp1-fused-v2-train-b{batch}-serve-b8-v1"
+        )
+        require(value["execution_profile"] == expected_profile, "optimized execution profile differs")
+        require(0 < value["fixed_physical_prefix_width"] <= 1024 - ACTION_HORIZON, "invalid prefix width")
+        _require_sha256(value["prefix_geometry_content_sha256"], "prefix geometry SHA-256")
+        return dict(value)
+    fields = set(value)
+    require(
+        fields in (_EXECUTION_GEOMETRY_FIELDS, _EXECUTION_GEOMETRY_FIELDS | _EXECUTION_TOPOLOGY_FIELDS),
+        f"{name} fields differ",
+    )
     require(value["experts_implementation"] == "grouped_mm", f"{name} expert backend mismatch")
     require(
         value["expert_batch_isolation"] == "sample_isolated_grouped_mm_v1",
@@ -431,6 +476,10 @@ def _validate_execution_geometry(value: Any, name: str) -> Dict[str, Any]:
         f"{name} fixed physical prefix width is invalid",
     )
     _require_sha256(value["prefix_geometry_content_sha256"], f"{name} prefix geometry SHA-256")
+    if fields != _EXECUTION_GEOMETRY_FIELDS:
+        require(value["tensor_parallel_size"] in {1, 2}, f"{name} tensor parallel size must be one or two")
+        expected_profile = "duovla-single-gpu-tp1-v1" if value["tensor_parallel_size"] == 1 else "duovla-tp2-v1"
+        require(value["execution_profile"] == expected_profile, f"{name} execution profile mismatch")
     return dict(value)
 
 
@@ -1748,7 +1797,10 @@ def validate_preregistration_manifest(
 
     require(isinstance(manifest, dict), "pre-registration manifest must be an object")
     _require_exact_keys(manifest, _PREREGISTRATION_FIELDS, "pre-registration manifest")
-    require(manifest["schema"] == PREREGISTRATION_SCHEMA, "pre-registration schema mismatch")
+    require(
+        manifest["schema"] in {PREREGISTRATION_SCHEMA, SINGLE_GPU_PREREGISTRATION_SCHEMA},
+        "pre-registration schema mismatch",
+    )
     roots = validate_official_output_roots(manifest["official_output_roots"])
     require(
         manifest["aggregation_python_version"] == PYTHON_VERSION,
@@ -1866,6 +1918,9 @@ def validate_preregistration_manifest(
         len({canonical_json_bytes(candidate["execution_geometry"]) for candidate in checked_cells}) == 1,
         "all official cells must share one execution geometry",
     )
+    single_gpu = checked_cells[0]["execution_geometry"].get("tensor_parallel_size", 2) == 1
+    expected_schema = SINGLE_GPU_PREREGISTRATION_SCHEMA if single_gpu else PREREGISTRATION_SCHEMA
+    require(manifest["schema"] == expected_schema, "pre-registration schema differs from execution topology")
     require(
         len({candidate["serving_runtime_sha256"] for candidate in checked_cells}) == 1,
         "all official cells must share one evaluation serving runtime",

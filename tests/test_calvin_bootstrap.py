@@ -732,10 +732,51 @@ def test_official_attestation_authenticates_dataset_before_calvin_module_imports
 
 @pytest.mark.parametrize(
     "script",
-    ["checkout.sh", "bootstrap_env.sh", "run_official_evaluator.sh", "run_preflight.sh"],
+    [
+        "checkout.sh",
+        "bootstrap_env.sh",
+        "download_archive_hf_mirror.sh",
+        "run_official_evaluator.sh",
+        "run_preflight.sh",
+    ],
 )
 def test_calvin_shell_scripts_parse(script: str) -> None:
     subprocess.run(["bash", "-n", str(ROOT / "scripts" / "calvin" / script)], check=True)
+
+
+def test_calvin_bootstrap_keeps_python_and_package_caches_under_cache_root() -> None:
+    bootstrap = (ROOT / "scripts" / "calvin" / "bootstrap_env.sh").read_text(encoding="utf-8")
+    for fragment in (
+        "uv_python_root=${UV_PYTHON_INSTALL_DIR:-$cache_root/uv-python}",
+        "uv_cache_root=${UV_CACHE_DIR:-$cache_root/uv-cache}",
+        "pip_cache_root=${PIP_CACHE_DIR:-$cache_root/pip-cache}",
+        'export UV_PYTHON_INSTALL_DIR="$uv_python_root"',
+        'export UV_CACHE_DIR="$uv_cache_root"',
+        'export PIP_CACHE_DIR="$pip_cache_root"',
+    ):
+        assert fragment in bootstrap
+
+
+def test_calvin_hf_mirror_is_revision_part_and_official_archive_hash_pinned() -> None:
+    mirror = (ROOT / "scripts/calvin/download_archive_hf_mirror.sh").read_text(encoding="utf-8")
+    for fragment in (
+        'mirror_revision="cab96dbc6432795736dd718ec3b927a50bb6f924"',
+        "expected_archive_bytes=555309812705",
+        'expected_archive_sha256="c2036c67eb4c06966af1d1e1665bdb572c69e1404f5e77ffd46b384ff2b79f74"',
+        'download_names+=("${name}")',
+        '"${hf_cli}" download "${mirror_repo}" "${download_names[@]}"',
+        "if digest.hexdigest() != expected_sha256:",
+        '"${script_dir}/download_dataset.sh" archive-direct',
+    ):
+        assert fragment in mirror
+    assert mirror.count("BlobLfsInfo") == 0
+    assert "--include 'task_ABC_D.zip.part*'" not in mirror
+    part_hash_lines = [
+        line.strip()
+        for line in mirror.splitlines()
+        if len(line.strip()) == 64 and set(line.strip()) <= set("0123456789abcdef")
+    ]
+    assert len(part_hash_lines) == 10
 
 
 def test_unified_evaluator_launcher_owns_closed_runtime_and_egl_contract() -> None:

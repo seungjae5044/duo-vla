@@ -1,0 +1,14 @@
+extends = "calvin_abc_to_d_fused_v2_b32.toml"
+execution_profile = "duovla-calvin-dp2-tp1-fused-v2-train-b32-serve-b8-v1"
+
+[optimization]
+gradient_accumulation_steps = 1
+
+[distributed]
+strategy = "data_parallel"
+world_size = 2
+data_parallel_size = 2
+tensor_parallel_size = 1
+rank_physical_batch_size = 32
+canonical_plan_partition = "contiguous-b8-chunks-by-rank"
+gradient_reduction = "sum_globally_normalized_sse_gradients"

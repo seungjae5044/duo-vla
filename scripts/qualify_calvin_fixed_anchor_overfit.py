@@ -658,10 +658,16 @@ def _evaluate_fixed_loss(
 
 
 def _qualification_source_identity(project_root: Path) -> dict[str, str]:
+    single_gpu = os.environ.get("CUDA_VISIBLE_DEVICES") == "0"
+    launcher = (
+        "scripts/calvin/run_fixed_anchor_overfit_single_gpu.sh"
+        if single_gpu
+        else "scripts/calvin/run_fixed_anchor_overfit.sh"
+    )
     files = {
-        "qualification_launcher_sha256": file_sha256(project_root / "scripts/calvin/run_fixed_anchor_overfit.sh"),
+        "qualification_launcher_sha256": file_sha256(project_root / launcher),
         "qualification_script_sha256": file_sha256(Path(__file__).resolve()),
-        "production_source_tree_sha256": TRAIN._source_tree_sha256(project_root),
+        "production_source_tree_sha256": TRAIN._source_tree_sha256(project_root, single_gpu=single_gpu),
     }
     return {**files, "qualification_source_sha256": canonical_config_sha256(files)}
 
@@ -760,12 +766,13 @@ def main() -> None:
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     dist.init_process_group("nccl", device_id=device)
-    if dist.get_world_size() != 2:
-        raise RuntimeError("CALVIN fixed-anchor qualification requires native TP world size two")
+    if dist.get_world_size() not in {1, 2}:
+        raise RuntimeError("CALVIN fixed-anchor qualification requires TP world size one or two")
     rank = dist.get_rank()
     dataset: CalvinNpzDataset | None = None
     try:
-        config_path = (project_root / "configs/calvin_abc_to_d.toml").resolve(strict=True)
+        config_name = "calvin_abc_to_d_single_gpu.toml" if dist.get_world_size() == 1 else "calvin_abc_to_d.toml"
+        config_path = (project_root / "configs" / config_name).resolve(strict=True)
         config = TRAIN.load_resolved_toml(config_path)
         interface_config = TRAIN._validate_and_build_interface_config(config)
         policy_contract = TRAIN.policy_contract_from_config(config)
@@ -1187,6 +1194,7 @@ def main() -> None:
                 "calvin_storage": storage_report,
                 "calvin_source_revisions": calvin_source_revisions,
                 "execution_environment": TRAIN._execution_environment(runtime_preflight),
+                "execution_profile": ("duovla-single-gpu-tp1-v1" if dist.get_world_size() == 1 else "duovla-tp2-v1"),
                 "kind": QUALIFICATION_KIND,
                 "metrics": {
                     "best_pre_update_loss": best_pre_update_loss,

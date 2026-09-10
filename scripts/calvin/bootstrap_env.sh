@@ -5,6 +5,17 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cache_root=${DUO_VLA_CACHE_ROOT:-/root/.cache/duo-vla}
 source_root=${CALVIN_SOURCE_ROOT:-$cache_root/simulators/calvin}
 venv_root=${CALVIN_VENV_ROOT:-$cache_root/venvs/calvin-eval}
+uv_python_root=${UV_PYTHON_INSTALL_DIR:-$cache_root/uv-python}
+uv_cache_root=${UV_CACHE_DIR:-$cache_root/uv-cache}
+pip_cache_root=${PIP_CACHE_DIR:-$cache_root/pip-cache}
+pip_timeout=${PIP_DEFAULT_TIMEOUT:-600}
+pip_retries=${PIP_RETRIES:-10}
+
+export UV_PYTHON_INSTALL_DIR="$uv_python_root"
+export UV_CACHE_DIR="$uv_cache_root"
+export PIP_CACHE_DIR="$pip_cache_root"
+export PIP_DEFAULT_TIMEOUT="$pip_timeout"
+export PIP_RETRIES="$pip_retries"
 
 if [[ ! -d "$source_root/.git" ]]; then
   echo "CALVIN source is absent; run $script_dir/checkout.sh first" >&2
@@ -16,7 +27,7 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 if [[ ! -x "$venv_root/bin/python" ]]; then
-  mkdir -p "$(dirname -- "$venv_root")"
+  mkdir -p "$(dirname -- "$venv_root")" "$uv_python_root" "$uv_cache_root" "$pip_cache_root"
   uv python install 3.8.20
   uv venv --python 3.8.20 --seed "$venv_root"
 fi

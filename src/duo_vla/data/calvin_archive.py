@@ -1802,43 +1802,18 @@ def _publication_file_from_named(
 
 
 def _write_manifest_source(
-    root_descriptor: int,
+    _root_descriptor: int,
     stage_descriptor: int,
     stage_path: Path,
     payload: Mapping[str, Any],
 ) -> _PublicationFile:
     raw = (json.dumps(payload, allow_nan=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    descriptor: int | None = None
-    if hasattr(os, "O_TMPFILE"):
-        try:
-            descriptor = os.open(
-                ".",
-                os.O_RDWR | os.O_TMPFILE | os.O_CLOEXEC,
-                0o600,
-                dir_fd=root_descriptor,
-            )
-        except OSError as exc:
-            if exc.errno not in (errno.EINVAL, errno.EISDIR, errno.ENOSYS, errno.EOPNOTSUPP):
-                raise CalvinArchivePublicationError("cannot create anonymous manifest source") from exc
-    if descriptor is not None:
-        try:
-            _write_all(descriptor, raw, label="anonymous manifest source")
-            os.fchmod(descriptor, 0o444)
-            os.fsync(descriptor)
-            identity = FileIdentity.from_stat(os.fstat(descriptor))
-            if not stat.S_ISREG(identity.mode) or identity.link_count != 0 or identity.size != len(raw):
-                raise CalvinArchivePublicationError("anonymous manifest source identity is invalid")
-            return _PublicationFile(
-                descriptor=descriptor,
-                identity=identity,
-                sha256=hashlib.sha256(raw).hexdigest(),
-                display_path=stage_path / "<anonymous-manifest>",
-                source_parent_descriptor=None,
-                source_name=None,
-            )
-        except BaseException:
-            os.close(descriptor)
-            raise
+    # Some filesystems accept O_TMPFILE creation but reject the later
+    # linkat(AT_EMPTY_PATH) with ENOENT.  Discovering that incompatibility at
+    # the final commit point is too late: the projection and index have
+    # already been published.  The stage is private, pinned, and exclusively
+    # created, so a named source inside it has the same no-overwrite commit
+    # semantics while remaining portable across those filesystems.
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
     try:
         named_descriptor = os.open(CALVIN_MANIFEST_NAME, flags, 0o600, dir_fd=stage_descriptor)

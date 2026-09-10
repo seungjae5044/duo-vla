@@ -19,6 +19,41 @@ CALVIN_SCRIPTS = ROOT / "scripts/calvin"
 sys.path.insert(0, str(CALVIN_SCRIPTS))
 
 SCRIPT = CALVIN_SCRIPTS / "serve_policy_dev.py"
+
+
+def test_development_server_bootstraps_only_its_resolved_sibling_directory() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    insertion = "_SCRIPT_ROOT = Path(__file__).resolve().parent"
+    assert insertion in source
+    assert source.index(insertion) < source.index("import serve_policy as official_policy")
+    assert "sys.path.insert(0, _SCRIPT_ROOT_TEXT)" in source
+    removal = "sys.path.remove(_SCRIPT_ROOT_TEXT)"
+    assert removal in source
+    assert source.index(removal) < source.index("from duo_vla.data.calvin_dev_states import")
+
+
+@pytest.mark.parametrize(
+    ("objective", "tensor_parallel_size", "expected"),
+    [
+        ("rectified_flow", 2, "calvin_abc_to_d.toml"),
+        ("direct_regression", 2, "calvin_abc_to_d_direct.toml"),
+        ("rectified_flow", 1, "calvin_abc_to_d_single_gpu.toml"),
+        ("direct_regression", 1, "calvin_abc_to_d_direct_single_gpu.toml"),
+    ],
+)
+def test_development_recipe_name_is_bound_to_objective_and_topology(
+    objective: str,
+    tensor_parallel_size: int,
+    expected: str,
+) -> None:
+    assert SERVER._canonical_development_recipe_name(objective, tensor_parallel_size) == expected
+
+
+def test_development_resolver_selects_source_inventory_from_checkpoint_topology() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert "single_gpu=tensor_parallel_size == 1" in source
+
+
 SPEC = importlib.util.spec_from_file_location("calvin_dev_policy_server", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 SERVER = importlib.util.module_from_spec(SPEC)
@@ -595,6 +630,7 @@ def test_full_resolver_accepts_only_total_and_progress_relaxations(
     assert resolved["optimization"]["total_updates"] == 500
     assert report["checkpoint_progress"]["selected_update"] == 120
     assert report["benchmark_status"] == SERVER.DEVELOPMENT_STATUS
+    assert report["train_venv"] == report["training_execution_environment"]["authenticated_runtime"]["train_venv"]
     assert contract["objective"] == "rectified_flow"
     assert identities["checkpoint_manifest_sha256"] == manifest_sha256
 
@@ -616,8 +652,11 @@ def test_full_resolver_accepts_only_total_and_progress_relaxations(
 def test_launcher_is_closed_and_uses_tp2_dev_executable() -> None:
     launcher = (CALVIN_SCRIPTS / "run_policy_server_dev.sh").read_text(encoding="utf-8")
     assert "unset BASH_ENV CDPATH ENV GLOBIGNORE" in launcher
-    assert 'export PYTHONSAFEPATH="1"' in launcher
-    assert 'export CUDA_VISIBLE_DEVICES="0,1"' in launcher
+    assert '"PYTHONSAFEPATH=1"' in launcher
+    assert '"PYTHONPYCACHEPREFIX=/dev/null"' in launcher
+    assert '"CUDA_VISIBLE_DEVICES=0,1"' in launcher
+    assert "exec /usr/bin/env -i" in launcher
+    assert "-P -B -X pycache_prefix=/dev/null" in launcher
     assert "--nproc-per-node=2" in launcher
     assert 'scripts/calvin/serve_policy_dev.py"' in launcher
     assert "scripts/calvin/evaluate_calvin.py" not in launcher

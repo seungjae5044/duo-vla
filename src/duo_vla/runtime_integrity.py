@@ -533,15 +533,20 @@ def validate_torchrun_rank_environment(
     environment: Mapping[str, str],
     *,
     required: bool,
+    expected_world_size: int = 2,
 ) -> dict[str, Any]:
     """Validate only torchrun-created rank state; caller rank variables are scrubbed by launchers."""
+
+    if type(expected_world_size) is not int or expected_world_size <= 0:
+        raise ValueError("expected_world_size must be a positive integer")
+    world_size = str(expected_world_size)
 
     topology = {
         "group_world_size": 1,
         "local_rank_equals_rank": True,
-        "local_world_size": 2,
-        "role_world_size": 2,
-        "world_size": 2,
+        "local_world_size": expected_world_size,
+        "role_world_size": expected_world_size,
+        "world_size": expected_world_size,
     }
     present = _TORCHRUN_ENVIRONMENT_FIELDS & set(environment)
     if not present:
@@ -556,21 +561,25 @@ def validate_torchrun_rank_environment(
     required_values = {
         "GROUP_RANK": "0",
         "GROUP_WORLD_SIZE": "1",
-        "LOCAL_WORLD_SIZE": "2",
+        "LOCAL_WORLD_SIZE": world_size,
         "ROLE_NAME": "default",
         "ROLE_RANK": rank,
-        "ROLE_WORLD_SIZE": "2",
+        "ROLE_WORLD_SIZE": world_size,
         "TORCHELASTIC_MAX_RESTARTS": "0",
         "TORCHELASTIC_RESTART_COUNT": "0",
-        "WORLD_SIZE": "2",
+        "WORLD_SIZE": world_size,
     }
     mismatches = {
         name: {"expected": value, "observed": environment.get(name)}
         for name, value in required_values.items()
         if environment.get(name) != value
     }
-    if rank not in {"0", "1"} or local_rank != rank:
-        mismatches["rank"] = {"expected": "RANK=LOCAL_RANK in {0,1}", "observed": [rank, local_rank]}
+    expected_ranks = {str(index) for index in range(expected_world_size)}
+    if rank not in expected_ranks or local_rank != rank:
+        mismatches["rank"] = {
+            "expected": f"RANK=LOCAL_RANK in {sorted(expected_ranks)}",
+            "observed": [rank, local_rank],
+        }
     port = environment["MASTER_PORT"]
     if not port.isdecimal() or not 1 <= int(port) <= 65535:
         mismatches["MASTER_PORT"] = {"expected": "1..65535", "observed": port}
@@ -589,8 +598,27 @@ def validate_torchrun_rank_environment(
     if not environment["TORCHELASTIC_SIGNALS_TO_HANDLE"]:
         mismatches["TORCHELASTIC_SIGNALS_TO_HANDLE"] = {"expected": "non-empty", "observed": ""}
     if mismatches:
-        raise RuntimeError(f"torchrun rank environment differs from TP=2 standalone launch: {mismatches}")
+        raise RuntimeError(
+            f"torchrun rank environment differs from TP={expected_world_size} standalone launch: {mismatches}"
+        )
     return topology
+
+
+def canonical_visible_cuda_world_size(environment: Mapping[str, str]) -> int:
+    """Resolve the only supported logical CUDA topologies from the closed launcher environment."""
+
+    visible_devices = environment.get("CUDA_VISIBLE_DEVICES")
+    # A single-GPU process may be sealed onto either qualified physical GPU.
+    # The value is deliberately still explicit: UUID lists, reordered TP
+    # devices, ranges, and inherited scheduler masks remain fail-closed.
+    supported = {"0": 1, "1": 1, "0,1": 2}
+    try:
+        return supported[visible_devices]
+    except KeyError as exc:
+        raise RuntimeError(
+            "canonical launcher requires CUDA_VISIBLE_DEVICES in {0,1} for TP=1 "
+            "or CUDA_VISIBLE_DEVICES=0,1 for TP=2"
+        ) from exc
 
 
 def static_environment_identity(environment: Mapping[str, str]) -> dict[str, Any]:

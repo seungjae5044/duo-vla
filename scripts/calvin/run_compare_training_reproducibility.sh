@@ -10,7 +10,7 @@ unset DUO_VLA_CLOSED_LAUNCHER_ENTRY
 readonly launcher_path="$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}")"
 readonly script_dir="$(cd -- "$(/usr/bin/dirname -- "${launcher_path}")" && pwd)"
 readonly project_dir="$(cd -- "${script_dir}/../.." && pwd)"
-readonly cache_root="/root/.cache/duo-vla"
+readonly cache_root="/hdd2/hyunbin/vla/cache"
 readonly environment_path="${cache_root}/venvs/train"
 readonly comparator_path="${project_dir}/scripts/compare_calvin_training_reproducibility.py"
 
