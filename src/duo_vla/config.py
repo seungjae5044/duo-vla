@@ -34,6 +34,7 @@ class ActionInterfaceConfig:
     timestep_scale: float = 1000.0
     timestep_max_period: float = 10_000.0
     output_init_std: float = 1e-3
+    self_conditioning: str = "none"
 
     def __post_init__(self) -> None:
         for name in ("hidden_size", "state_dim", "action_horizon", "action_dim", "timestep_embedding_dim"):
@@ -47,3 +48,5 @@ class ActionInterfaceConfig:
             raise ValueError("timestep_max_period must be greater than one")
         if self.output_init_std <= 0:
             raise ValueError("output_init_std must be positive")
+        if self.self_conditioning not in {"none", "action_endpoint_v1"}:
+            raise ValueError("unsupported action self-conditioning architecture")

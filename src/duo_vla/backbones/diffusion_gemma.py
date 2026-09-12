@@ -157,6 +157,18 @@ def encode_diffusion_gemma_prefix(
 ) -> DiffusionGemmaPrefix:
     """Encode processor output once and return a detached, read-only conditioning cache."""
 
+    return encode_diffusion_gemma_prefix_trainable(model, processor_inputs)
+
+
+def encode_diffusion_gemma_prefix_trainable(
+    model: nn.Module,
+    processor_inputs: Mapping[str, Any],
+) -> DiffusionGemmaPrefix:
+    """Explicit opt-in differentiable prefill; preserve gradients through the prefix KV cache.
+
+    The existing frozen entry point above remains the default for all qualified recipes.
+    """
+
     if "input_ids" not in processor_inputs or "attention_mask" not in processor_inputs:
         raise ValueError("processor_inputs must include input_ids and attention_mask")
     try:

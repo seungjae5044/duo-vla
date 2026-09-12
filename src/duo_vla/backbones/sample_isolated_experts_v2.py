@@ -37,7 +37,7 @@ from duo_vla.backbones.sample_isolated_experts import (
 )
 
 SAMPLE_ISOLATED_GROUPED_MM_V2 = "sample_isolated_grouped_mm_v2"
-SUPPORTED_PHYSICAL_BATCH_SIZES = frozenset({8, 16, 32, 64})
+SUPPORTED_PHYSICAL_BATCH_SIZES = frozenset({8, 16, 32, 64, 72, 80})
 EXPECTED_NUM_EXPERTS = 128
 EXPECTED_TOP_K = 8
 

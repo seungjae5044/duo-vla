@@ -199,6 +199,8 @@ from duo_vla.runtime_integrity import (
     static_environment_identity,
     validate_torchrun_rank_environment,
 )
+from duo_vla.self_conditioning import bootstrap_for_update, training_velocity
+from duo_vla.self_conditioning import enabled as sc_enabled
 from duo_vla.topology_fork import (
     TOPOLOGY_FORK_CHECKPOINT_FIELDS,
     authenticate_topology_child_environment,
@@ -1638,8 +1640,10 @@ def _processor_inputs(
     prefix_geometry: dict[str, Any],
     *,
     expected_batch_size: int = PHYSICAL_BATCH_SIZE,
+    experimental_sc_batch: bool = False,
 ):
-    if expected_batch_size not in SUPPORTED_PHYSICAL_BATCH_SIZES:
+    allowed = SUPPORTED_PHYSICAL_BATCH_SIZES | ({72, 80} if experimental_sc_batch else set())
+    if expected_batch_size not in allowed:
         raise ValueError("LIBERO processor received an unsupported physical batch size")
     if len(samples) != expected_batch_size:
         raise ValueError(f"LIBERO processor requires physical batch {expected_batch_size}, observed {len(samples)}")
@@ -1819,10 +1823,12 @@ def _coalesce_canonical_batches(
     batches: Sequence[LiberoBatch],
     *,
     physical_batch_size: int,
+    experimental_sc_batch: bool = False,
 ) -> LiberoBatch:
     values = tuple(batches)
     expected_chunks = physical_batch_size // CANONICAL_STREAM_BATCH_SIZE
-    if physical_batch_size not in SUPPORTED_PHYSICAL_BATCH_SIZES or len(values) != expected_chunks:
+    allowed = SUPPORTED_PHYSICAL_BATCH_SIZES | ({72, 80} if experimental_sc_batch else set())
+    if physical_batch_size not in allowed or len(values) != expected_chunks:
         raise ValueError("physical forward must contain the exact number of canonical B8 batches")
     if any(batch.batch_size != CANONICAL_STREAM_BATCH_SIZE for batch in values):
         raise ValueError("only complete canonical B8 batches may be coalesced")
@@ -1899,6 +1905,7 @@ def _run_validation(
     policy_contract: PolicyContract,
     prefix_geometry: dict[str, Any],
     data_parallel_size: int = 1,
+    self_conditioning_bootstrap: bool = False,
 ) -> float:
     denoiser.eval()
     adapted.eval()
@@ -1956,13 +1963,15 @@ def _run_validation(
             prefix = encode_diffusion_gemma_prefix(model, dict(prefix_inputs))
             pair = _canonical_training_pair(clean, policy_contract, plans)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                prediction = denoiser(
+                prediction = training_velocity(
+                    denoiser,
                     pair.input_actions,
                     pair.timesteps,
                     state,
                     prefix_cache=prefix.past_key_values,
                     prefix_attention_mask=prefix.attention_mask,
                     action_valid_mask=valid,
+                    bootstrap=self_conditioning_bootstrap,
                 )
             component = masked_sse(prediction, pair.target, valid)
             numerators.append(float(component.squared_error_sum))
@@ -2925,13 +2934,15 @@ def main() -> None:
                 prefix = encode_diffusion_gemma_prefix(model, dict(prefix_inputs))
                 pair = _canonical_training_pair(clean, policy_contract, plans)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    prediction = denoiser(
+                    prediction = training_velocity(
+                        denoiser,
                         pair.input_actions,
                         pair.timesteps,
                         state,
                         prefix_cache=prefix.past_key_values,
                         prefix_attention_mask=prefix.attention_mask,
                         action_valid_mask=valid,
+                        bootstrap=sc_enabled(denoiser) and bootstrap_for_update(run_seed, update),
                     )
                 component = masked_sse(prediction, pair.target, valid)
                 component.loss_for_total(total_elements).backward()

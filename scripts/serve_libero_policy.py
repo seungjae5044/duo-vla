@@ -1577,6 +1577,8 @@ class RealPolicy:
             require(torch.equal(replica, reference), f"{name} replica {index} differs bitwise from row 0")
 
     def predict(self, request: dict[str, Any]) -> dict[str, Any]:
+        from duo_vla.self_conditioning import enabled, sample_action_flow
+
         torch = self.torch
         torch.cuda.synchronize(self.device)
         started = time.perf_counter()
@@ -1614,11 +1616,23 @@ class RealPolicy:
 
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             if objective == "rectified_flow":
-                raw_normalized = self.euler_sample(
-                    velocity,
-                    initial_noise=noise,
-                    num_steps=self.policy_contract["nfe"],
-                )
+                if enabled(self.denoiser):
+                    raw_normalized = sample_action_flow(
+                        self.denoiser,
+                        noise,
+                        normalized_state,
+                        num_steps=self.policy_contract["nfe"],
+                        prefix_cache=prefix.past_key_values,
+                        prefix_attention_mask=prefix.attention_mask,
+                        action_valid_mask=valid,
+                        after_velocity=lambda value: self._require_bitwise_replicas(value, name="flow velocity"),
+                    )
+                else:
+                    raw_normalized = self.euler_sample(
+                        velocity,
+                        initial_noise=noise,
+                        num_steps=self.policy_contract["nfe"],
+                    )
             else:
                 raw_normalized = self.denoiser(
                     torch.zeros(

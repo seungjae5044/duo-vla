@@ -65,6 +65,59 @@ def decode_image(value: str) -> np.ndarray:
     return np.frombuffer(data, dtype=np.uint8).reshape(256, 256, 3).copy()
 
 
+def episode_matrix(resets_per_task: int, *, shard_index: int = 0, num_shards: int = 1) -> list[tuple[int, int]]:
+    """Partition reset identities, never repeat or drop a requested episode."""
+    if not 1 <= resets_per_task <= 50 or not 0 <= shard_index < num_shards:
+        raise ValueError("invalid Spatial reset count or shard")
+    full = [(task, reset) for task in range(10) for reset in range(resets_per_task)]
+    result = full[shard_index::num_shards]
+    if not result:
+        raise ValueError("empty evaluation shard")
+    return result
+
+
+def reset_physics_snapshot(environment: Any) -> dict[str, Any]:
+    """Read-only free-object measurements; no extra physics steps or reset filtering."""
+    model, data = environment.sim.model, environment.sim.data
+    if not np.isfinite(data.qpos).all() or not np.isfinite(data.qvel).all():
+        raise FloatingPointError("nonfinite initial simulator state")
+    objects = {}
+    for index in range(model.njnt):
+        if model.jnt_type[index] != 0:  # MuJoCo free joint
+            continue
+        qp, qv = int(model.jnt_qposadr[index]), int(model.jnt_dofadr[index])
+        objects[model.joint_id2name(index)] = {
+            "position": np.asarray(data.qpos[qp : qp + 3]).tolist(),
+            "linear_speed": float(np.linalg.norm(data.qvel[qv : qv + 3])),
+        }
+    state = np.asarray(environment.get_sim_state(), dtype="<f8")
+    return {"objects": objects, "state_sha256": hashlib.sha256(state.tobytes()).hexdigest()}
+
+
+def summarize_reset_physics(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    first = samples[0]
+    if any(set(sample["objects"]) != set(first["objects"]) for sample in samples):
+        raise ValueError("dynamic object topology changed during settling")
+    displacement = max(
+        (
+            float(np.linalg.norm(np.asarray(value["position"]) - first["objects"][name]["position"]))
+            for sample in samples
+            for name, value in sample["objects"].items()
+        ),
+        default=0.0,
+    )
+    speed = max((value["linear_speed"] for sample in samples for value in sample["objects"].values()), default=0.0)
+    return {
+        "initial_state_sha256": first["state_sha256"],
+        "settled_state_sha256": samples[-1]["state_sha256"],
+        "max_free_object_displacement_m": displacement,
+        "max_free_object_linear_speed_m_s": speed,
+        "warning": displacement > 0.1 or speed > 3.0,
+        "samples": samples,
+        "note": "diagnostic only; no rejection, replacement, or extra settling",
+    }
+
+
 class SpatialPolicy:
     """Keep each tied encoder/decoder layer pair on the same one of two GPUs."""
 
@@ -285,17 +338,31 @@ class SpatialPolicy:
             action_mask = torch.ones((BATCH_SIZE, 8), dtype=torch.bool, device=self.device)
             self.valid_mask = np.ones((BATCH_SIZE, 8), dtype=bool)
             self.valid_mask[active:] = False
-            for step in range(self.nfe):
-                self.phase = f"denoise_{step}" if record else "disabled"
-                velocity = self.denoiser(
+            from duo_vla.self_conditioning import enabled, sample_action_flow
+
+            if enabled(self.denoiser):
+                actions = sample_action_flow(
+                    self.denoiser,
                     actions,
-                    torch.full((BATCH_SIZE,), step / self.nfe, device=self.device),
                     state,
+                    num_steps=self.nfe,
                     prefix_cache=prefix.past_key_values,
                     prefix_attention_mask=prefix.attention_mask,
                     action_valid_mask=action_mask,
+                    before_step=lambda step: setattr(self, "phase", f"denoise_{step}" if record else "disabled"),
                 )
-                actions = actions + velocity.float() / self.nfe
+            else:
+                for step in range(self.nfe):
+                    self.phase = f"denoise_{step}" if record else "disabled"
+                    velocity = self.denoiser(
+                        actions,
+                        torch.full((BATCH_SIZE,), step / self.nfe, device=self.device),
+                        state,
+                        prefix_cache=prefix.past_key_values,
+                        prefix_attention_mask=prefix.attention_mask,
+                        action_valid_mask=action_mask,
+                    )
+                    actions = actions + velocity.float() / self.nfe
             self.phase = "disabled"
             if not bool(torch.isfinite(actions).all()):
                 raise FloatingPointError("policy generated nonfinite normalized actions")
@@ -377,7 +444,8 @@ def run_evaluation(args: argparse.Namespace) -> None:
 
     args.output.mkdir(parents=True, exist_ok=False)
     suite = benchmark.get_benchmark_dict()["libero_spatial"]()
-    matrix = [(task_id, reset_id) for task_id in range(10) for reset_id in range(args.resets_per_task)]
+    shard_index, num_shards = getattr(args, "shard_index", 0), getattr(args, "num_shards", 1)
+    matrix = episode_matrix(args.resets_per_task, shard_index=shard_index, num_shards=num_shards)
     write_json(
         args.output / "experiment.json",
         {
@@ -391,8 +459,11 @@ def run_evaluation(args: argparse.Namespace) -> None:
             "settle_steps": 10,
             "episode_matrix": matrix,
             "target_episodes": len(matrix),
-            "routing_instrumented": True,
+            "routing_instrumented": getattr(args, "routing_instrumented", True),
             "reset_source": "published official initial states",
+            "shard_index": shard_index,
+            "num_shards": num_shards,
+            "reset_audit": getattr(args, "reset_audit", False),
         },
     )
     pending = deque(matrix)
@@ -409,8 +480,19 @@ def run_evaluation(args: argparse.Namespace) -> None:
         environment.seed(7)
         environment.reset()
         observation = environment.set_init_state(initial_state)
+        samples = [reset_physics_snapshot(environment)] if getattr(args, "reset_audit", False) else []
         for _ in range(10):
             observation, _, _, _ = environment.step(np.array([0, 0, 0, 0, 0, 0, -1], dtype=np.float32))
+            if samples:
+                samples.append(reset_physics_snapshot(environment))
+        if samples:
+            with (args.output / "reset_audit.jsonl").open("a") as log:
+                log.write(
+                    json.dumps(
+                        {"task_id": task_id, "reset_id": reset_id, **summarize_reset_physics(samples)}, allow_nan=False
+                    )
+                    + "\n"
+                )
         return {
             "task_id": task_id,
             "reset_id": reset_id,
@@ -463,12 +545,19 @@ def run_evaluation(args: argparse.Namespace) -> None:
                     first, repeated, reversed_batch = [np.asarray(value["actions"]) for value in warmup]
                     np.testing.assert_array_equal(first, repeated)
                     np.testing.assert_allclose(first, reversed_batch[::-1], rtol=0, atol=1e-5)
+                    singleton_error = None
+                    if getattr(args, "verify_singleton", False):
+                        send(connection, {"operation": "predict", "rows": rows[:1], "record": False})
+                        singleton = np.asarray(receive(connection)["actions"])
+                        np.testing.assert_allclose(first[:1], singleton, rtol=0, atol=1e-5)
+                        singleton_error = float(np.abs(first[:1] - singleton).max())
                     write_json(
                         args.output / "inference_validation.json",
                         {
                             "repeat_max_abs_error": float(np.abs(first - repeated).max()),
                             "permutation_max_abs_error": float(np.abs(first - reversed_batch[::-1]).max()),
-                            "warmup_calls": 3,
+                            "warmup_calls": 3 + int(singleton_error is not None),
+                            "singleton_max_abs_error": singleton_error,
                             "warmup_included_in_routing": False,
                         },
                     )
@@ -512,6 +601,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
                             {
                                 "execution_horizon": args.execution_horizon,
                                 "nfe": args.nfe,
+                                "shard_index": shard_index,
                                 "elapsed_seconds": time.perf_counter() - episode["started"],
                                 "normalized_clip_fraction": float(np.mean(episode["normalized_clip_fractions"])),
                             }
@@ -538,6 +628,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
                         "wilson95": wilson95(successes, len(completed)),
                         "execution_horizon": args.execution_horizon,
                         "nfe": args.nfe,
+                        "shard_index": shard_index,
                         "elapsed_seconds": time.perf_counter() - started,
                         "batch_calls": batch_calls,
                         "mean_instrumented_batch_seconds": float(np.mean(batch_seconds)),

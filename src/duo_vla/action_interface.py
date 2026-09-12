@@ -60,6 +60,11 @@ class ActionInputProjector(nn.Module):
         self.horizon_embedding = nn.Parameter(torch.empty(config.action_horizon, config.hidden_size))
         self.action_type_embedding = nn.Parameter(torch.empty(config.hidden_size))
         self.reset_parameters()
+        if config.self_conditioning == "action_endpoint_v1":
+            # Do not perturb initialization of subsequent legacy modules/noise streams.
+            with torch.random.fork_rng(devices=[]):
+                self.sc_projection = nn.Linear(config.action_dim + 1, config.hidden_size, bias=False)
+            nn.init.zeros_(self.sc_projection.weight)
 
     def reset_parameters(self) -> None:
         nn.init.xavier_uniform_(self.action_projection.weight)
@@ -74,6 +79,8 @@ class ActionInputProjector(nn.Module):
         state: Tensor,
         *,
         valid_mask: Tensor | None = None,
+        sc_actions: Tensor | None = None,
+        sc_present: bool | Tensor = False,
     ) -> Tensor:
         expected = (noisy_actions.shape[0], self.config.action_horizon, self.config.action_dim)
         if noisy_actions.shape != expected:
@@ -98,11 +105,40 @@ class ActionInputProjector(nn.Module):
         type_embedding = self.action_type_embedding.to(dtype=action_embedding.dtype)[None, None]
         output = action_embedding + time_embedding + state_embedding + horizon_embedding + type_embedding
 
+        if self.config.self_conditioning == "action_endpoint_v1":
+            features = self_conditioning_features(noisy_actions, sc_actions, sc_present)
+            # Always execute, including absent candidates, so reduction sees a zero grad tensor.
+            output = output + self.sc_projection(features.to(self.sc_projection.weight.dtype)).to(output.dtype)
+        elif sc_actions is not None or not (type(sc_present) is bool and sc_present is False):
+            raise ValueError("self-conditioning inputs require action_endpoint_v1")
+
         if valid_mask is not None:
             if valid_mask.shape != noisy_actions.shape[:2]:
                 raise ValueError("valid_mask must have shape [batch, horizon]")
             output = output * valid_mask.to(device=output.device, dtype=output.dtype)[..., None]
         return output
+
+
+def self_conditioning_features(reference: Tensor, candidate: Tensor | None, present: bool | Tensor) -> Tensor:
+    """Encode a detached endpoint and a per-sample presence bit without conflating zero and absent."""
+    batch, horizon, _ = reference.shape
+    if type(present) is bool:
+        mask = torch.full((batch,), present, device=reference.device, dtype=torch.bool)
+    elif isinstance(present, Tensor) and present.dtype == torch.bool and present.shape == (batch,):
+        mask = present.to(reference.device)
+    else:
+        raise ValueError("sc_present must be a bool or boolean [batch] tensor")
+    if candidate is None:
+        if bool(mask.any()):
+            raise ValueError("present self-conditioning requires a candidate")
+        candidate = torch.zeros_like(reference)
+    if candidate.shape != reference.shape or not candidate.is_floating_point():
+        raise ValueError("self-conditioning candidate must match the floating action chunk")
+    candidate = candidate.detach().to(device=reference.device, dtype=torch.float32)
+    selected = torch.where(mask[:, None, None], candidate, torch.zeros_like(candidate))
+    if not bool(selected.isfinite().all()):
+        raise ValueError("present self-conditioning candidate must be finite")
+    return torch.cat((selected, mask[:, None, None].expand(batch, horizon, 1).float()), dim=-1)
 
 
 class VelocityHead(nn.Module):

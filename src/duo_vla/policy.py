@@ -9,6 +9,7 @@ from torch import Tensor, nn
 
 from duo_vla.config import FlowConfig
 from duo_vla.flow import euler_sample, make_flow_training_pair, masked_velocity_mse
+from duo_vla.self_conditioning import bootstrap_for_update, enabled, sample_action_flow, training_velocity
 
 
 class RectifiedFlowPolicy(nn.Module):
@@ -26,15 +27,24 @@ class RectifiedFlowPolicy(nn.Module):
         prefix_attention_mask: Tensor,
         action_valid_mask: Tensor,
         generator: torch.Generator | None = None,
+        optimizer_update: int | None = None,
+        sc_seed: int = 0,
+        sc_bootstrap: bool | None = None,
     ) -> Tensor:
+        if enabled(self.denoiser) and sc_bootstrap is None:
+            if optimizer_update is None:
+                raise ValueError("SC training requires optimizer_update or an explicit sc_bootstrap decision")
+            sc_bootstrap = bootstrap_for_update(sc_seed, optimizer_update)
         pair = make_flow_training_pair(clean_actions, generator=generator)
-        prediction = self.denoiser(
+        prediction = training_velocity(
+            self.denoiser,
             pair.noisy_actions,
             pair.timesteps,
             state,
             prefix_cache=prefix_cache,
             prefix_attention_mask=prefix_attention_mask,
             action_valid_mask=action_valid_mask,
+            bootstrap=False if sc_bootstrap is None else sc_bootstrap,
         )
         return masked_velocity_mse(prediction, pair.target_velocity, action_valid_mask)
 
@@ -68,6 +78,16 @@ class RectifiedFlowPolicy(nn.Module):
                 generator=generator,
             )
         steps = self.config.inference_steps if num_steps is None else num_steps
+        if enabled(self.denoiser):
+            return sample_action_flow(
+                self.denoiser,
+                initial_noise,
+                state,
+                num_steps=steps,
+                prefix_cache=prefix_cache,
+                prefix_attention_mask=prefix_attention_mask,
+                action_valid_mask=action_valid_mask,
+            ).clamp(-1.0, 1.0)
 
         def velocity(actions: Tensor, timesteps: Tensor) -> Tensor:
             return self.denoiser(

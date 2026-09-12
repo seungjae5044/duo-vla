@@ -108,7 +108,7 @@ def test_v2_install_supports_candidate_physical_batches_without_changing_registr
 
 @pytest.mark.parametrize("physical_batch_size", [1, 2, 4, 7, 9, 128])
 def test_v2_install_rejects_unqualified_physical_batches(physical_batch_size: int) -> None:
-    with pytest.raises(ValueError, match=r"must be one of \{8, 16, 32, 64\}"):
+    with pytest.raises(ValueError, match=r"must be one of \{8, 16, 32, 64, 72, 80\}"):
         install_sample_isolated_grouped_mm_experts_v2(
             _FakeModel(),
             physical_batch_size=physical_batch_size,

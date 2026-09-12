@@ -719,6 +719,7 @@ def _evaluate_real(args: argparse.Namespace) -> None:
     from duo_vla.flow import euler_sample
     from duo_vla.objectives import make_seeded_policy_training_pair
     from duo_vla.runtime_determinism import configure_strict_cuda_determinism, deterministic_torch_runtime
+    from duo_vla.self_conditioning import enabled, sample_action_flow, training_velocity
     from duo_vla.training import masked_sse
 
     project_root = Path(__file__).resolve().parents[1]
@@ -822,15 +823,17 @@ def _evaluate_real(args: argparse.Namespace) -> None:
             "timesteps": _tensor_record(pair.timesteps),
         }
 
-        def objective_forward() -> Any:
+        def objective_forward(bootstrap: bool = False) -> Any:
             with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                return denoiser(
+                return training_velocity(
+                    denoiser,
                     pair.input_actions,
                     pair.timesteps,
                     states,
                     prefix_cache=prefix.past_key_values,
                     prefix_attention_mask=prefix.attention_mask,
                     action_valid_mask=valid,
+                    bootstrap=bootstrap,
                 )
 
         torch.cuda.reset_peak_memory_stats(device)
@@ -853,6 +856,14 @@ def _evaluate_real(args: argparse.Namespace) -> None:
             "squared_error_sum_fp32": float(objective_component.squared_error_sum.detach().item()),
             "target_semantics": contract_dict["training_target"],
         }
+        if enabled(denoiser):
+            candidate_prediction, candidate_seconds = _cuda_timed(device, lambda: objective_forward(True))
+            candidate_component = masked_sse(candidate_prediction, pair.target, valid)
+            objective_specific["bootstrap_candidate"] = {
+                "masked_mse": float(candidate_component.mean.detach().item()),
+                "latency_seconds": candidate_seconds,
+                "definition": "same-pair detached endpoint bootstrap velocity MSE",
+            }
 
         common_results: dict[str, Any] = {}
         common_memory: dict[str, Any] = {}
@@ -871,6 +882,16 @@ def _evaluate_real(args: argparse.Namespace) -> None:
 
                 def sample(selected_nfe: int = nfe) -> Any:
                     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        if enabled(denoiser):
+                            return sample_action_flow(
+                                denoiser,
+                                initial_epsilon,
+                                states,
+                                num_steps=selected_nfe,
+                                prefix_cache=prefix.past_key_values,
+                                prefix_attention_mask=prefix.attention_mask,
+                                action_valid_mask=valid,
+                            )
                         return euler_sample(
                             velocity,
                             initial_noise=initial_epsilon.clone(),

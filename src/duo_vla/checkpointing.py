@@ -300,6 +300,8 @@ def load_lora_checkpoint(
     is_trainable: bool = False,
     validate_decoder_contract: bool = False,
     expected_rank: int = 16,
+    allow_encoder_adapter: bool = False,
+    allow_action_self_conditioning: bool = False,
 ) -> tuple[nn.Module, dict[str, Any]]:
     """Verify and attach a saved PEFT adapter to an already TP-sharded base model."""
 
@@ -308,6 +310,10 @@ def load_lora_checkpoint(
     checkpoint_path = Path(checkpoint_dir).resolve()
     manifest = load_checkpoint_manifest(checkpoint_path)
     artifacts = manifest["artifacts"]
+    if "encoder_adapter" in artifacts and not allow_encoder_adapter:
+        raise ValueError("encoder-adapted checkpoint requires an explicit encoder-aware loader")
+    if manifest.get("action_self_conditioning", "none") != "none" and not allow_action_self_conditioning:
+        raise ValueError("self-conditioned checkpoint requires an explicit action-SC-aware loader")
     canonical_lora_artifacts = {
         "lora_config": "lora/adapter_config.json",
         "lora_weights": "lora/adapter_model.safetensors",
@@ -343,6 +349,10 @@ def load_lora_checkpoint(
             base_model,
             str(checkpoint_path / "lora"),
             is_trainable=is_trainable,
+            # PEFT otherwise infers generic "cuda". Safetensors resolves that
+            # to GPU 0, creating an unwanted context on nonzero DP/TP ranks.
+            # CPU staging copies into the already rank-local adapter parameters.
+            torch_device="cpu",
         )
     if validate_decoder_contract:
         if caught_warnings:

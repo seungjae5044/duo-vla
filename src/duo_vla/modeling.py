@@ -43,12 +43,16 @@ class DuoVLADenoiser(nn.Module):
         prefix_cache: Any,
         prefix_attention_mask: Tensor,
         action_valid_mask: Tensor,
+        sc_actions: Tensor | None = None,
+        sc_present: bool | Tensor = False,
     ) -> Tensor:
         action_embeddings = self.action_projector(
             noisy_actions,
             timesteps,
             state,
             valid_mask=action_valid_mask,
+            sc_actions=sc_actions,
+            sc_present=sc_present,
         )
         hidden_states = self.decoder_backend.decode_actions(
             action_embeddings,

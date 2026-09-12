@@ -59,6 +59,18 @@ class FailingAdapter(FakeAdapter):
         raise OSError("simulated adapter write failure")
 
 
+def test_legacy_loader_rejects_action_self_conditioning_explicitly(tmp_path):
+    checkpoint = tmp_path / "sc"
+    save_trainable_checkpoint(
+        checkpoint,
+        adapted_model=FakeAdapter(),
+        interface_modules={"head": nn.Linear(2, 2)},
+        manifest={"action_self_conditioning": "action_endpoint_v1"},
+    )
+    with pytest.raises(ValueError, match="action-SC-aware"):
+        load_lora_checkpoint(checkpoint, nn.Linear(2, 2))
+
+
 def test_interface_state_roundtrip_is_strict(tmp_path: Path) -> None:
     source = {"projector": nn.Linear(3, 4), "velocity_head": nn.Linear(4, 2)}
     state = interface_state_dict(source)
@@ -144,6 +156,45 @@ def test_trainable_checkpoint_has_hash_verified_manifest(tmp_path: Path) -> None
     weights.write_bytes(weights.read_bytes() + b"corruption")
     with pytest.raises(ValueError, match="wrong size"):
         load_checkpoint_manifest(output)
+
+
+def test_decoder_only_loader_refuses_to_silently_drop_encoder_adapter(tmp_path: Path) -> None:
+    encoder = tmp_path / "encoder.safetensors"
+    save_file({"encoder.adapter_a": torch.ones(2, 3)}, encoder)
+    output = tmp_path / "adapted"
+    save_trainable_checkpoint(
+        output,
+        adapted_model=FakeAdapter(),
+        interface_modules={"projector": nn.Linear(3, 4)},
+        manifest={},
+        additional_artifacts={"encoder_adapter": encoder},
+    )
+    with pytest.raises(ValueError, match="explicit encoder-aware loader"):
+        load_lora_checkpoint(output, nn.Linear(3, 4))
+
+
+def test_lora_restore_stages_weights_on_cpu_without_implicit_gpu_zero(tmp_path: Path, monkeypatch) -> None:
+    from peft import PeftModel
+
+    output = tmp_path / "checkpoint"
+    save_trainable_checkpoint(
+        output,
+        adapted_model=FakeAdapter(),
+        interface_modules={"projector": nn.Linear(3, 4)},
+        manifest={},
+    )
+    observed = {}
+    model = nn.Linear(3, 4)
+
+    def load(base, path, **kwargs):
+        observed.update(kwargs)
+        assert base is model
+        return model
+
+    monkeypatch.setattr(PeftModel, "from_pretrained", load)
+    restored, _ = load_lora_checkpoint(output, model, is_trainable=True)
+    assert restored is model
+    assert observed == {"is_trainable": True, "torch_device": "cpu"}
 
 
 def test_checkpoint_refuses_overwrite_and_incomplete_load(tmp_path: Path) -> None:
